@@ -14,7 +14,7 @@ use crate::{
     keymap::HELP,
     model::{
         ActivityItem, ActivityKind, AppState, ApprovalModalState, DiffPreviewPaneState, FocusPane,
-        SessionRunState, TaskOutputDetailState, task_state_label,
+        SessionRunState, SessionView, TaskOutputDetailState, task_state_label,
     },
     theme::Palette,
 };
@@ -304,6 +304,15 @@ fn render_transcript(app: &AppState, palette: Palette, area_height: u16) -> Para
             }
         }
 
+        if app
+            .approval
+            .as_ref()
+            .is_some_and(|approval| approval.visible)
+            && let Some(prompt) = latest_user_message(session)
+        {
+            push_recent_user_context(&mut lines, palette, prompt);
+        }
+
         if let Some(approval) = app.approval.as_ref().filter(|approval| approval.visible) {
             push_inline_approval_card(&mut lines, palette, approval);
         }
@@ -342,6 +351,24 @@ fn render_transcript(app: &AppState, palette: Palette, area_height: u16) -> Para
         )
         .scroll((scroll_top, 0))
         .wrap(Wrap { trim: false })
+}
+
+fn latest_user_message(session: &SessionView) -> Option<&str> {
+    session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role.as_str() == "user")
+        .map(|message| message.content.as_str())
+        .filter(|content| !content.trim().is_empty())
+}
+
+fn push_recent_user_context(lines: &mut Vec<Line<'static>>, palette: Palette, content: &str) {
+    if !lines.is_empty() && !line_is_blank(lines.last()) {
+        lines.push(Line::from(""));
+    }
+    let bg = chat_message_bg(palette, "user");
+    push_formatted_body(lines, palette, content, "  › ", Some(bg));
 }
 
 fn push_message_block(lines: &mut Vec<Line<'static>>, palette: Palette, role: &str, content: &str) {
@@ -2469,7 +2496,10 @@ mod tests {
                 id: SessionKey("local:test".into()),
                 title: "test".into(),
                 profile_id: Some("coding".into()),
-                messages: vec![Message::system("ready")],
+                messages: vec![
+                    Message::system("ready"),
+                    Message::user("complete m9 contract"),
+                ],
                 tasks: vec![],
                 live_reply: None,
             }],
@@ -2494,12 +2524,66 @@ mod tests {
 
         let text = rendered_text(&app);
 
+        assert!(text.contains("complete m9 contract"));
         assert!(text.contains("Approval Requested"));
         assert!(text.contains("Run command"));
         assert!(text.contains("shell"));
         assert!(text.contains("y approve once"));
         assert!(text.contains("s approve session"));
         assert!(text.contains("n deny"));
+    }
+
+    #[test]
+    fn render_blocked_turn_keeps_latest_user_prompt_visible_near_approval() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("older prompt"),
+                    Message::assistant("older answer"),
+                    Message::user("complete m9 contract"),
+                ],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: TurnId::new(),
+                    text: "Planning a safe M9 scaffold over mock transport.".into(),
+                }),
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        for idx in 0..8 {
+            app.push_activity(
+                ActivityItem::new(ActivityKind::Tool, "read_file", "complete")
+                    .with_detail(format!("Hydrating prototype context {idx}"))
+                    .with_output_preview("1 | pub fn demo() {}")
+                    .with_success(true)
+                    .with_duration_ms(420),
+            );
+        }
+        app.approval = Some(ApprovalModalState {
+            session_id: SessionKey("local:test".into()),
+            approval_id: ApprovalId::new(),
+            turn_id: TurnId::new(),
+            tool_name: "shell".into(),
+            title: "Mock approval boundary".into(),
+            body: "approve?".into(),
+            approval_kind: Some("command".into()),
+            risk: Some("low".into()),
+            typed_details: None,
+            render_hints: None,
+            visible: true,
+        });
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("complete m9 contract"));
+        assert!(text.contains("Approval Requested"));
+        assert!(text.contains("Mock approval boundary"));
     }
 
     #[test]
