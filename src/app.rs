@@ -1455,7 +1455,6 @@ fn render_composer(app: &AppState, palette: Palette) -> Paragraph<'static> {
     lines.push(Line::from(vec![
         Span::styled(" › ", palette.selected().bg(palette.surface)),
         Span::styled(app.composer.clone(), palette.text().bg(palette.surface)),
-        Span::styled("▌", palette.selected().bg(palette.surface)),
         if app.composer.is_empty() {
             Span::styled(
                 " Ask Octos to change code...",
@@ -2280,7 +2279,8 @@ mod tests {
             .collect::<String>();
 
         assert_eq!(composer_height(&app), 5);
-        assert!(text.contains("fix tests▌"));
+        assert!(text.contains("fix tests"));
+        assert!(!text.contains("▌"));
         assert_eq!(
             cursor,
             composer_cursor_position(&app, Rect::new(0, 36, 120, 5)).expect("cursor")
@@ -2311,7 +2311,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(text.contains("› ▌ Ask Octos to change code"));
+        assert!(text.contains("›  Ask Octos to change code"));
+        assert!(!text.contains("▌"));
         assert_eq!(
             cursor,
             composer_cursor_position(&app, Rect::new(0, 36, 120, 5)).expect("cursor")
