@@ -2,30 +2,345 @@
 
 Standalone terminal UI client for the Octos AppUi/UI Protocol.
 
-This repo is intentionally separate from `octos-cli`. The Octos repo owns the
-server/runtime and shared `octos-core` protocol types; this repo owns the TUI
-binary and connects over the UI Protocol WebSocket.
+`octos-tui` is intentionally separate from `octos-cli`. The `octos` repo owns
+the server/runtime and shared `octos-core` protocol types; this repo owns the
+terminal client and connects to `octos serve` over the UI Protocol WebSocket.
 
-## Local Development
+## Repository Layout
+
+For source builds, keep `octos` and `octos-tui` as sibling directories:
 
 ```bash
-cargo run -- --mode mock
-cargo run -- --mode protocol --endpoint ws://127.0.0.1:50080/api/ui-protocol/ws --session local:demo
+mkdir octos-m9-test
+cd octos-m9-test
+
+git clone -b coding-green-m9-test-20260428 https://github.com/octos-org/octos.git
+git clone -b coding-green-m9-test-20260428 https://github.com/octos-org/octos-tui.git
 ```
 
-The local dependency on `../octos/crates/octos-core` is the development contract
-boundary. For release, pin `octos-core` to the matching git tag or published
-crate version.
+The sibling layout is required while `octos-tui` depends on:
 
-## M9.17 Pane Data Status
+```text
+../octos/crates/octos-core
+```
 
-`octos-tui` consumes AppUi/UI Protocol fields instead of inventing local wire
-extensions. Live task updates hydrate the Tasks pane, and `task/output/read`
-metadata such as `output_files` and limitations is retained in the task-output
-viewer even when the read window omits those lines.
+For release packaging, pin `octos-core` to the matching Octos git tag or
+published crate version.
 
-Artifact, workspace, and git pane hydration is governed by accepted
-`UPCR-2026-002`. In protocol mode the client requests `pane.snapshots.v1` and
-hydrates those panes from optional `session/open.panes` payloads when the server
-supports them. When the field is absent, the TUI keeps the explicit fallback
-data from snapshot sessions, task tails, launch target, and status.
+## Prerequisites
+
+- Rust 1.85 or newer
+- `cargo`
+- `tmux` for live visual/E2E tests
+- a configured Octos provider key for live coding sessions, for example
+  `DEEPSEEK_API_KEY`
+
+Useful terminal defaults:
+
+```bash
+export TERM=xterm-256color
+export RUST_LOG=off
+```
+
+## Quick Local Smoke Test
+
+Mock mode does not need an Octos server. Use it for render, keyboard, and theme
+smoke tests:
+
+```bash
+cd octos-tui
+
+CARGO_TARGET_DIR=/tmp/octos-tui-target cargo test
+CARGO_TARGET_DIR=/tmp/octos-tui-target cargo run -- --mode mock
+CARGO_TARGET_DIR=/tmp/octos-tui-target cargo run -- --mode mock --theme claude
+```
+
+`CARGO_TARGET_DIR=/tmp/octos-tui-target` is optional. It avoids target directory
+lock/permission issues on shared test hosts. On a normal checkout, `cargo test`
+and `cargo run -- --mode mock` are enough.
+
+## Run Octos Server
+
+`octos-tui --mode protocol` needs a running `octos serve` process. The TUI does
+not create the backend server.
+
+From the sibling `octos` repo:
+
+```bash
+cd ../octos
+
+export DEEPSEEK_API_KEY=...
+export OCTOS_AUTH_TOKEN=local-dev-token
+
+cargo run -p octos-cli --features api --bin octos -- serve \
+  --host 127.0.0.1 \
+  --port 50080 \
+  --cwd "$PWD/e2e/fixtures/coding-agent-compare-multifile" \
+  --data-dir /tmp/octos-tui-dev-data \
+  --provider deepseek \
+  --model deepseek-v4-pro \
+  --auth-token "$OCTOS_AUTH_TOKEN"
+```
+
+The server prints the dashboard URL:
+
+```text
+Dashboard: http://127.0.0.1:50080/admin/
+```
+
+Important server settings:
+
+| Setting | Purpose |
+|---|---|
+| `--cwd` | Workspace the coding agent can read/edit. This is the TUI session cwd. |
+| `--data-dir` | Runtime state, sessions, auth, logs, and config. |
+| `--provider` | LLM provider override. Example: `deepseek`. |
+| `--model` | Model override. Example: `deepseek-v4-pro`. |
+| `--auth-token` | Bearer token used by the dashboard and UI Protocol WebSocket. |
+
+If you omit `--provider` and `--model`, `octos serve` loads them from config
+under the selected `--data-dir` or workspace `.octos/config.json`.
+
+## Run octos-tui Against the Server
+
+Open a second terminal:
+
+```bash
+cd octos-tui
+
+export OCTOS_AUTH_TOKEN=local-dev-token
+
+CARGO_TARGET_DIR=/tmp/octos-tui-target cargo run -- \
+  --mode protocol \
+  --endpoint ws://127.0.0.1:50080/api/ui-protocol/ws \
+  --session coding:local:readme-demo \
+  --profile-id coding \
+  --theme codex
+```
+
+You can also pass the token explicitly:
+
+```bash
+cargo run -- \
+  --mode protocol \
+  --endpoint ws://127.0.0.1:50080/api/ui-protocol/ws \
+  --session coding:local:readme-demo \
+  --profile-id coding \
+  --auth-token local-dev-token
+```
+
+Read-only viewer mode opens a protocol session without sending turns:
+
+```bash
+cargo run -- \
+  --mode protocol \
+  --readonly \
+  --endpoint ws://127.0.0.1:50080/api/ui-protocol/ws \
+  --session coding:local:readme-demo \
+  --profile-id coding
+```
+
+Available themes:
+
+```text
+codex, claude, slate, solarized
+```
+
+## Dashboard and Server Startup
+
+The dashboard is served by `octos serve`, so it cannot start the parent
+`octos serve` process from nothing. Something outside the dashboard must start
+the server first:
+
+- a shell command such as `octos serve ...`
+- the install script's OS service
+- a launchd, systemd, or Windows Scheduled Task configuration
+
+Once `octos serve` is running, the dashboard can configure profiles, provider
+settings, API keys, channels, and gateway child processes. It can start,
+stop, and restart those gateway profiles through the admin/user APIs, and the
+server watches profile changes for gateway restarts.
+
+For `octos-tui` coding sessions, the AppUi backend agent is created when
+`octos serve` starts. If you add or change the provider/model in the dashboard
+after the server is already running, restart `octos serve` before using
+`octos-tui` for a live coding session.
+
+Installed service controls:
+
+```bash
+# macOS, installed LaunchDaemon
+sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist
+sudo launchctl load /Library/LaunchDaemons/io.octos.serve.plist
+
+# Linux, installed systemd unit
+sudo systemctl restart octos-serve
+
+# Windows PowerShell, installed scheduled task
+Stop-ScheduledTask -TaskName OctosServe
+Start-ScheduledTask -TaskName OctosServe
+```
+
+## Cwd Behavior
+
+The coding cwd belongs to `octos serve`, not the terminal where `octos-tui` is
+launched. To test a project, start the server with that project as `--cwd`:
+
+```bash
+octos serve --cwd /path/to/project ...
+```
+
+Launching `octos-tui` from another directory does not change the backend
+workspace.
+
+## Tmux AppUi Smoke Tests
+
+The Octos repo contains the tmux harness because it starts both the server and
+the standalone TUI:
+
+```bash
+cd ../octos
+
+export OCTOS_TUI_DIR="$PWD/../octos-tui"
+bash e2e/tmux/run.sh default
+```
+
+The default tmux lane checks help output, mock TUI rendering, bad endpoint
+handling, read-only protocol bootstrap, approval cards, and basic protocol UI
+states. It stores captures under:
+
+```text
+e2e/test-results-tmux/
+```
+
+## Live Codex-Parity E2E Test
+
+Use the live parity harness to compare `octos-tui` with Codex on the same
+multi-file Rust coding fixture and the same model label:
+
+```bash
+cd ../octos
+
+export DEEPSEEK_API_KEY=...
+export DEEPSEEK_MODEL=deepseek-v4-pro
+export OCTOS_TUI_DIR="$PWD/../octos-tui"
+export OCTOS_TUI_UX_KEEP_SESSIONS=1
+export OCTOS_TMUX_KEEP=1
+export OCTOS_TUI_UX_EXIT_HOLD_SECS=1800
+
+scripts/compare-tui-coding-ux-tmux.sh
+```
+
+The runner launches:
+
+- real `octos serve`
+- real `octos-tui --mode protocol`
+- Codex in a separate tmux session
+- independent fixture workspaces for each lane
+
+It prints session names like:
+
+```text
+[tui-ux] octos-tui session: octos-tmux-<run-id>-octos-tui-client
+[tui-ux] codex session: octos-tmux-<run-id>-codex-client
+```
+
+Watch them live:
+
+```bash
+tmux attach -r -t <octos-tui-client-session>
+tmux attach -r -t <codex-client-session>
+```
+
+For remote hosts:
+
+```bash
+ssh -t cloud@<host> 'tmux attach -r -t <octos-tui-client-session>'
+ssh -t cloud@<host> 'tmux attach -r -t <codex-client-session>'
+```
+
+Analyze a completed run:
+
+```bash
+scripts/analyze-coding-ux-transcripts.sh e2e/test-results-tui-coding-ux/<run-id>
+```
+
+Expected artifacts:
+
+```text
+summary.env
+ux-summary.env
+prompts.txt
+octos-tui-transcript.log
+octos_tui-worktree.diff
+octos_tui-cargo-test.log
+octos_tui-git-status.txt
+codex-transcript.log
+codex-worktree.diff
+codex-cargo-test.log
+codex-git-status.txt
+```
+
+## What To Check Visually
+
+During live review, `octos-tui` should show:
+
+- chat-first layout with a stable composer
+- user and assistant messages visually distinguished
+- live progress while the model is working
+- exact command/tool cards with command, cwd, status, elapsed time, and output
+- inline approval cards for command/sandbox/network/diff requests
+- inline colored diffs in the chat flow, not only modal overlays
+- final session summary with files changed, validation, and next steps
+- no raw tracing logs, protocol frames, timestamps, or API keys in the UI
+
+## Configuration Reference
+
+`octos-tui` flags:
+
+```text
+--mode mock|protocol
+--endpoint ws://127.0.0.1:50080/api/ui-protocol/ws
+--session <session-id>
+--profile-id <profile-id>
+--auth-token <token>
+--readonly
+--theme codex|claude|slate|solarized
+```
+
+Environment variables:
+
+| Variable | Purpose |
+|---|---|
+| `OCTOS_AUTH_TOKEN` | Fallback bearer token for the UI Protocol WebSocket. |
+| `RUST_LOG=off` | Keeps terminal output clean for live visual runs. |
+| `TERM=xterm-256color` | Avoids missing terminfo/color issues on remote hosts. |
+| `OCTOS_TUI_DIR` | Points Octos harness scripts at this standalone TUI repo. |
+| `OCTOS_TUI_BIN` | Forces a specific built `octos-tui` binary. |
+| `OCTOS_TUI_UX_KEEP_SESSIONS=1` | Keeps live parity tmux sessions open for inspection. |
+| `OCTOS_TMUX_KEEP=1` | Keeps tmux sessions/artifacts after harness runs. |
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `octos-core` dependency not found | Keep `octos` and `octos-tui` as sibling directories. |
+| `target` lock or permission error | Run with `CARGO_TARGET_DIR=/tmp/octos-tui-target`. |
+| Endpoint rejected | Use `ws://` or `wss://`; HTTP URLs are rejected by the CLI. |
+| Auth failure | Use the same token for `octos serve --auth-token` and `octos-tui --auth-token` or `OCTOS_AUTH_TOKEN`. |
+| TUI opens but no live answer | Confirm `octos serve` has a provider/model/key and restart it after dashboard config changes. |
+| Wrong workspace | Start `octos serve` with the desired `--cwd`. |
+| `can't find terminfo database` | Set `TERM=xterm-256color` or install terminfo on the host. |
+| Raw logs or timestamps appear in the UI | Start both server and TUI with `RUST_LOG=off`. |
+
+## Protocol Contract
+
+`octos-tui` consumes AppUi/UI Protocol fields from `octos-core`. It must not
+invent local wire extensions. Any protocol behavior change must land through a
+formal UI Protocol change request, shared protocol types, server tests, golden
+protocol tests, and TUI reducer/rendering tests.
+
+`octos-tui` currently requests `pane.snapshots.v1` in protocol mode and hydrates
+optional pane data from `session/open.panes` when the server supports it. When
+the field is absent, it falls back to session snapshots, task tails, launch
+target, and status.
