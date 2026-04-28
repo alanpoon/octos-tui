@@ -11,7 +11,7 @@ use crate::{
     client_event::ClientEvent,
     model::{
         ActivityItem, ActivityKind, AppState, ApprovalModalAction, ApprovalModalState,
-        DiffPreviewGetResult, FocusPane, LiveReply, SessionView, TaskView,
+        DiffHunkContext, DiffPreviewGetResult, FocusPane, LiveReply, SessionView, TaskView,
     },
 };
 
@@ -246,6 +246,53 @@ impl Store {
         self.state.status =
             "Diff preview unavailable: protocol does not expose preview ids/content to the TUI yet"
                 .into();
+    }
+
+    pub fn select_next_diff_hunk(&mut self) {
+        self.state.diff_preview.select_next_hunk();
+        if let Some(context) = self.state.diff_preview.selected_hunk_context() {
+            self.state.status = format!(
+                "Selected diff hunk: {} {}",
+                context.path, context.hunk_header
+            );
+        } else {
+            self.state.status = "No diff hunk is available to select".into();
+        }
+    }
+
+    pub fn select_prev_diff_hunk(&mut self) {
+        self.state.diff_preview.select_prev_hunk();
+        if let Some(context) = self.state.diff_preview.selected_hunk_context() {
+            self.state.status = format!(
+                "Selected diff hunk: {} {}",
+                context.path, context.hunk_header
+            );
+        } else {
+            self.state.status = "No diff hunk is available to select".into();
+        }
+    }
+
+    pub fn stage_selected_diff_context(&mut self) {
+        let Some(context) = self.state.diff_preview.selected_hunk_context() else {
+            self.state.status = "No selected diff hunk context to stage".into();
+            return;
+        };
+        let path = context.path.clone();
+        let prompt = diff_hunk_context_prompt(&context);
+
+        if self.state.active_turn().is_some() {
+            self.state.pending_messages.push(prompt);
+            self.state.status = format!("Staged selected diff hunk context for next turn: {path}");
+        } else {
+            if !self.state.composer.trim().is_empty() {
+                self.state.composer.push_str("\n\n");
+            }
+            self.state.composer.push_str(&prompt);
+            self.state.status = format!("Added selected diff hunk context to composer: {path}");
+        }
+
+        self.state.focus = FocusPane::Composer;
+        self.state.scroll_transcript_to_latest();
     }
 
     pub fn apply_client_event(&mut self, event: ClientEvent) -> Option<AppUiCommand> {
@@ -831,6 +878,32 @@ fn compact_preview(value: &str) -> String {
         preview.push_str("...");
     }
     preview
+}
+
+fn diff_hunk_context_prompt(context: &DiffHunkContext) -> String {
+    let path = match &context.old_path {
+        Some(old_path) if old_path != &context.path => format!("{old_path} -> {}", context.path),
+        _ => context.path.clone(),
+    };
+    let mut text = format!(
+        "Use this selected diff hunk as context for the next coding turn.\nfile: {path}\nstatus: {}\nhunk: {}\n```diff\n",
+        context.file_status, context.hunk_header
+    );
+    for line in &context.lines {
+        text.push_str(diff_context_line_prefix(&line.kind));
+        text.push_str(&line.content);
+        text.push('\n');
+    }
+    text.push_str("```");
+    text
+}
+
+fn diff_context_line_prefix(kind: &str) -> &'static str {
+    match kind {
+        "added" | "add" | "addition" => "+",
+        "removed" | "delete" | "deleted" | "deletion" => "-",
+        _ => " ",
+    }
 }
 
 fn progress_status(event: &UiProgressEvent) -> String {
@@ -1529,6 +1602,55 @@ mod tests {
         assert_eq!(
             store.state.status,
             "Diff preview requires_refresh: Patch (1 files)"
+        );
+    }
+
+    #[test]
+    fn selected_diff_hunk_context_can_be_staged_for_next_turn() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id, "working");
+        let preview_id = PreviewId::new();
+        store.apply_client_event(ClientEvent::DiffPreview(DiffPreviewGetResult {
+            status: "ready".into(),
+            source: "cache".into(),
+            preview: crate::model::DiffPreview {
+                session_id: store.state.sessions[0].id.clone(),
+                preview_id,
+                title: Some("Patch".into()),
+                files: vec![crate::model::DiffPreviewFile {
+                    path: "src/lib.rs".into(),
+                    old_path: None,
+                    status: "modified".into(),
+                    hunks: vec![crate::model::DiffPreviewHunk {
+                        header: "@@ -1 +1 @@".into(),
+                        lines: vec![
+                            crate::model::DiffPreviewLine {
+                                kind: "removed".into(),
+                                content: "old".into(),
+                                old_line: Some(1),
+                                new_line: None,
+                            },
+                            crate::model::DiffPreviewLine {
+                                kind: "added".into(),
+                                content: "new".into(),
+                                old_line: None,
+                                new_line: Some(1),
+                            },
+                        ],
+                    }],
+                }],
+            },
+        }));
+
+        store.stage_selected_diff_context();
+
+        assert_eq!(store.state.pending_messages.len(), 1);
+        assert!(store.state.pending_messages[0].contains("file: src/lib.rs"));
+        assert!(store.state.pending_messages[0].contains("-old"));
+        assert!(store.state.pending_messages[0].contains("+new"));
+        assert_eq!(
+            store.state.status,
+            "Staged selected diff hunk context for next turn: src/lib.rs"
         );
     }
 

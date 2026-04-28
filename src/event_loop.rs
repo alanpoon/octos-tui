@@ -187,6 +187,17 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
                 return KeyAction::Send(command);
             }
         }
+        KeyCode::Char(']') if store.state.focus != FocusPane::Composer => {
+            store.select_next_diff_hunk();
+        }
+        KeyCode::Char('[') if store.state.focus != FocusPane::Composer => {
+            store.select_prev_diff_hunk();
+        }
+        KeyCode::Char('c')
+            if store.state.focus != FocusPane::Composer && store.state.diff_preview.active =>
+        {
+            store.stage_selected_diff_context();
+        }
         KeyCode::Char(ch) => {
             store.state.composer.push(ch);
             store.state.focus = FocusPane::Composer;
@@ -617,6 +628,63 @@ mod tests {
         assert_eq!(params.preview_id, preview_id);
         assert!(store.state.diff_preview.active);
         assert_eq!(store.state.status, "Requested diff preview");
+    }
+
+    #[test]
+    fn diff_hunk_keys_select_and_stage_context() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Transcript;
+        store
+            .state
+            .diff_preview
+            .apply_result(crate::model::DiffPreviewGetResult {
+                status: "ready".into(),
+                source: "cache".into(),
+                preview: crate::model::DiffPreview {
+                    session_id: store.state.sessions[0].id.clone(),
+                    preview_id: PreviewId::new(),
+                    title: Some("Patch".into()),
+                    files: vec![crate::model::DiffPreviewFile {
+                        path: "src/lib.rs".into(),
+                        old_path: None,
+                        status: "modified".into(),
+                        hunks: vec![
+                            crate::model::DiffPreviewHunk {
+                                header: "@@ -1 +1 @@".into(),
+                                lines: vec![crate::model::DiffPreviewLine {
+                                    kind: "removed".into(),
+                                    content: "old".into(),
+                                    old_line: Some(1),
+                                    new_line: None,
+                                }],
+                            },
+                            crate::model::DiffPreviewHunk {
+                                header: "@@ -9 +9 @@".into(),
+                                lines: vec![crate::model::DiffPreviewLine {
+                                    kind: "added".into(),
+                                    content: "new".into(),
+                                    old_line: None,
+                                    new_line: Some(9),
+                                }],
+                            },
+                        ],
+                    }],
+                },
+            });
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char(']'))),
+            KeyAction::Continue
+        ));
+        assert_eq!(store.state.diff_preview.selected_hunk, 1);
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('c'))),
+            KeyAction::Continue
+        ));
+        assert!(store.state.composer.contains("file: src/lib.rs"));
+        assert!(store.state.composer.contains("@@ -9 +9 @@"));
+        assert_eq!(store.state.focus, FocusPane::Composer);
     }
 
     #[test]

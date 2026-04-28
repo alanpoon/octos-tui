@@ -146,6 +146,20 @@ Available themes:
 codex, claude, slate, solarized
 ```
 
+Diff context controls:
+
+```text
+[` / `]` select previous/next inline diff hunk
+`c` stages the selected hunk as next-turn context
+```
+
+The current AppUi/UI Protocol v1 bridge stages selected diff context as prompt
+text. Structured context attachments are tracked as a formal UPCR in
+`docs/M9_31_CONTEXT_ATTACHMENTS_UPCR.md`.
+
+The visual parity harness assertions for Codex-vs-Octos tmux comparison are
+tracked in `docs/M9_33_VISUAL_PARITY_HARNESS.md`.
+
 ## Dashboard and Server Startup
 
 The dashboard is served by `octos serve`, so it cannot start the parent

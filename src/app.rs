@@ -1018,8 +1018,25 @@ fn push_inline_diff_preview(
             ]));
         }
 
-        for file in &preview.files {
-            push_diff_file_lines(lines, palette, file);
+        if !preview.files.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("    ", palette.muted()),
+                Span::styled(
+                    "[/] select hunk | c stage selected diff context",
+                    palette.selected(),
+                ),
+            ]));
+        }
+
+        for (file_idx, file) in preview.files.iter().enumerate() {
+            push_diff_file_lines(
+                lines,
+                palette,
+                file_idx,
+                diff.selected_file,
+                diff.selected_hunk,
+                file,
+            );
         }
     } else if diff.loading {
         lines.push(Line::from(vec![
@@ -1042,6 +1059,9 @@ fn push_inline_diff_preview(
 fn push_diff_file_lines(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
+    file_idx: usize,
+    selected_file: usize,
+    selected_hunk: usize,
     file: &crate::model::DiffPreviewFile,
 ) {
     let path = match &file.old_path {
@@ -1065,9 +1085,11 @@ fn push_diff_file_lines(
         ]));
     }
 
-    for hunk in &file.hunks {
+    for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
+        let selected = file_idx == selected_file && hunk_idx == selected_hunk;
+        let marker = if selected { "  › " } else { "    " };
         lines.push(Line::from(vec![
-            Span::styled("    ", palette.muted()),
+            Span::styled(marker, palette.selected()),
             Span::styled(hunk.header.clone(), diff_hunk_style(palette)),
         ]));
         for line in &hunk.lines {

@@ -471,6 +471,8 @@ pub struct DiffPreviewPaneState {
     pub preview: Option<DiffPreview>,
     pub error: Option<String>,
     pub scroll: usize,
+    pub selected_file: usize,
+    pub selected_hunk: usize,
 }
 
 impl DiffPreviewPaneState {
@@ -484,6 +486,8 @@ impl DiffPreviewPaneState {
             preview: None,
             error: None,
             scroll: 0,
+            selected_file: 0,
+            selected_hunk: 0,
         };
     }
 
@@ -496,6 +500,7 @@ impl DiffPreviewPaneState {
         self.preview = Some(result.preview);
         self.error = None;
         self.scroll = 0;
+        self.clamp_selection();
     }
 
     pub fn close(&mut self) {
@@ -509,6 +514,91 @@ impl DiffPreviewPaneState {
     pub fn scroll_down(&mut self, lines: usize) {
         self.scroll = self.scroll.saturating_sub(lines);
     }
+
+    pub fn select_next_hunk(&mut self) {
+        let hunks = self.hunk_locations();
+        if hunks.is_empty() {
+            return;
+        }
+        let current = self.selected_location_index(&hunks).unwrap_or(0);
+        let (file_idx, hunk_idx) = hunks[(current + 1) % hunks.len()];
+        self.selected_file = file_idx;
+        self.selected_hunk = hunk_idx;
+    }
+
+    pub fn select_prev_hunk(&mut self) {
+        let hunks = self.hunk_locations();
+        if hunks.is_empty() {
+            return;
+        }
+        let current = self.selected_location_index(&hunks).unwrap_or(0);
+        let next = if current == 0 {
+            hunks.len() - 1
+        } else {
+            current - 1
+        };
+        let (file_idx, hunk_idx) = hunks[next];
+        self.selected_file = file_idx;
+        self.selected_hunk = hunk_idx;
+    }
+
+    pub fn selected_hunk_context(&self) -> Option<DiffHunkContext> {
+        let preview = self.preview.as_ref()?;
+        let file = preview.files.get(self.selected_file)?;
+        let hunk = file.hunks.get(self.selected_hunk)?;
+        Some(DiffHunkContext {
+            path: file.path.clone(),
+            old_path: file.old_path.clone(),
+            file_status: file.status.clone(),
+            hunk_header: hunk.header.clone(),
+            lines: hunk.lines.clone(),
+        })
+    }
+
+    fn clamp_selection(&mut self) {
+        let hunks = self.hunk_locations();
+        if let Some((file_idx, hunk_idx)) = hunks.first().copied() {
+            self.selected_file = file_idx;
+            self.selected_hunk = hunk_idx;
+        } else {
+            self.selected_file = 0;
+            self.selected_hunk = 0;
+        }
+    }
+
+    fn hunk_locations(&self) -> Vec<(usize, usize)> {
+        self.preview
+            .as_ref()
+            .map(|preview| {
+                preview
+                    .files
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(file_idx, file)| {
+                        file.hunks
+                            .iter()
+                            .enumerate()
+                            .map(move |(hunk_idx, _)| (file_idx, hunk_idx))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn selected_location_index(&self, hunks: &[(usize, usize)]) -> Option<usize> {
+        hunks.iter().position(|(file_idx, hunk_idx)| {
+            *file_idx == self.selected_file && *hunk_idx == self.selected_hunk
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffHunkContext {
+    pub path: String,
+    pub old_path: Option<String>,
+    pub file_status: String,
+    pub hunk_header: String,
+    pub lines: Vec<DiffPreviewLine>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
