@@ -408,9 +408,31 @@ impl Store {
     fn apply_notification(&mut self, notification: UiNotification) -> Option<AppUiCommand> {
         match notification {
             UiNotification::SessionOpened(event) => {
-                let session_id = event.session_id;
+                let session_id = event.session_id.clone();
                 if let Some(panes) = event.panes {
                     self.state.apply_pane_snapshot(panes);
+                }
+                if let Some(workspace_root) = event.workspace_root {
+                    self.state.workspace.root = workspace_root;
+                }
+                if let Some(index) = self
+                    .state
+                    .sessions
+                    .iter()
+                    .position(|session| session.id == session_id)
+                {
+                    self.state.selected_session = index;
+                    self.state.sessions[index].profile_id = event.active_profile_id.clone();
+                } else {
+                    self.state.sessions.push(SessionView {
+                        id: session_id.clone(),
+                        title: session_id.0.clone(),
+                        profile_id: event.active_profile_id.clone(),
+                        messages: Vec::new(),
+                        tasks: Vec::new(),
+                        live_reply: None,
+                    });
+                    self.state.selected_session = self.state.sessions.len().saturating_sub(1);
                 }
                 if self.state.active_turn().is_none() {
                     self.state.set_run_state_idle();
