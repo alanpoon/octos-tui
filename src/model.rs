@@ -1,8 +1,7 @@
-use octos_core::app_ui::{APP_UI_API_V1, AppUiLiveReply, AppUiSession, AppUiSnapshot, AppUiTask};
+use octos_core::app_ui::{AppUiLiveReply, AppUiSession, AppUiSnapshot, AppUiTask, APP_UI_API_V1};
 use octos_core::ui_protocol::{
-    ApprovalDecision, ApprovalId, ApprovalRenderHints, ApprovalRequestedEvent,
+    approval_scopes, ApprovalDecision, ApprovalId, ApprovalRenderHints, ApprovalRequestedEvent,
     ApprovalTypedDetails, OutputCursor, PreviewId, TaskRuntimeState, TurnId, UiPaneSnapshot,
-    approval_scopes,
 };
 use octos_core::{SessionKey, TaskId};
 use serde::{Deserialize, Serialize};
@@ -1347,11 +1346,16 @@ pub struct SelectedTaskContext {
 }
 
 pub fn task_state_label(state: TaskRuntimeState) -> &'static str {
-    match state {
-        TaskRuntimeState::Pending => "pending",
-        TaskRuntimeState::Running => "running",
-        TaskRuntimeState::Completed => "done",
-        TaskRuntimeState::Failed => "failed",
+    let wire = serde_json::to_value(state)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned));
+    match wire.as_deref() {
+        Some("pending") => "pending",
+        Some("running") => "running",
+        Some("completed") => "done",
+        Some("failed") => "failed",
+        Some("cancelled") => "cancelled",
+        _ => "unknown",
     }
 }
 
@@ -1376,11 +1380,11 @@ fn preview_id_from_text(text: &str) -> Option<PreviewId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use octos_core::Message;
     use octos_core::ui_protocol::{
         UiArtifactPaneItem, UiArtifactPaneSnapshot, UiGitHistoryItem, UiGitPaneSnapshot,
         UiGitStatusItem, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
     };
+    use octos_core::Message;
 
     fn state_with_task(task: TaskView) -> AppState {
         AppState::new(
@@ -1428,39 +1432,31 @@ mod tests {
         assert!(state.artifacts.items.iter().any(|item| {
             item.title == "AppUi bootstrap snapshot" && item.source == "local mock snapshot"
         }));
-        assert!(
-            state
-                .artifacts
-                .items
-                .iter()
-                .any(|item| item.title == "protocol spike output tail"
-                    && item.status == "bootstrap: seeded mock session")
-        );
+        assert!(state
+            .artifacts
+            .items
+            .iter()
+            .any(|item| item.title == "protocol spike output tail"
+                && item.status == "bootstrap: seeded mock session"));
         assert!(state.artifacts.items.iter().any(|item| {
             item.title == "protocol spike diff preview" && item.status == preview_id.0.to_string()
         }));
-        assert!(
-            state
-                .workspace
-                .contract
-                .iter()
-                .any(|line| line.contains(APP_UI_API_V1))
-        );
-        assert!(
-            state
-                .workspace
-                .entries
-                .iter()
-                .any(|entry| entry.label == "protocol spike" && entry.detail == "running")
-        );
+        assert!(state
+            .workspace
+            .contract
+            .iter()
+            .any(|line| line.contains(APP_UI_API_V1)));
+        assert!(state
+            .workspace
+            .entries
+            .iter()
+            .any(|entry| entry.label == "protocol spike" && entry.detail == "running"));
         assert_eq!(state.git.branch, "m9.7/mock-snapshot");
-        assert!(
-            state
-                .git
-                .history
-                .iter()
-                .any(|entry| entry.summary == "seed missing pane snapshots")
-        );
+        assert!(state
+            .git
+            .history
+            .iter()
+            .any(|entry| entry.summary == "seed missing pane snapshots"));
     }
 
     #[test]
@@ -1480,28 +1476,22 @@ mod tests {
                 && item.status == "waiting for artifact payloads"
         }));
         assert_eq!(state.workspace.root, "wss://example.test/ui-protocol");
-        assert!(
-            state
-                .workspace
-                .contract
-                .iter()
-                .any(|line| line.contains("pane.snapshots.v1"))
-        );
-        assert!(
-            state
-                .workspace
-                .contract
-                .iter()
-                .any(|line| line == "readonly launch: commands disabled")
-        );
+        assert!(state
+            .workspace
+            .contract
+            .iter()
+            .any(|line| line.contains("pane.snapshots.v1")));
+        assert!(state
+            .workspace
+            .contract
+            .iter()
+            .any(|line| line == "readonly launch: commands disabled"));
         assert_eq!(state.git.branch, "not supplied");
-        assert!(
-            state
-                .git
-                .status
-                .iter()
-                .any(|item| item.detail.contains("protocol snapshot"))
-        );
+        assert!(state
+            .git
+            .status
+            .iter()
+            .any(|item| item.detail.contains("protocol snapshot")));
     }
 
     #[test]
