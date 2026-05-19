@@ -2733,6 +2733,7 @@ impl MockAppUiBackend {
         self.enqueue_protocol(UiNotification::TaskUpdated(TaskUpdatedEvent {
             session_id: session_id.clone(),
             task_id: build_task_id.clone(),
+            tool_call_id: None,
             title: "mock background synthesis".into(),
             state: TaskRuntimeState::Running,
             runtime_detail: Some("Synthesizing task output stream".into()),
@@ -2760,6 +2761,7 @@ impl MockAppUiBackend {
         self.enqueue_protocol(UiNotification::TaskUpdated(TaskUpdatedEvent {
             session_id: session_id.clone(),
             task_id: build_task_id,
+            tool_call_id: None,
             title: "mock background synthesis".into(),
             state: TaskRuntimeState::Completed,
             runtime_detail: Some("Summary ready in runtime_detail".into()),

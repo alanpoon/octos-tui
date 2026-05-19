@@ -3028,6 +3028,114 @@ impl Store {
                 };
                 None
             }
+            UiNotification::AgentUpdated(event) => {
+                let title = event
+                    .agent
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| event.agent.nickname.clone());
+                let detail = event
+                    .agent
+                    .summary
+                    .clone()
+                    .or_else(|| event.agent.last_task.clone())
+                    .unwrap_or_else(|| event.agent.role.clone());
+                self.state.push_activity(
+                    ActivityItem::new(ActivityKind::Progress, title.clone(), event.agent.status)
+                        .with_detail(detail),
+                );
+                self.state.status = format!("Agent status refreshed: {title}");
+                None
+            }
+            UiNotification::AgentOutputDelta(event) => {
+                let bytes = event.text.len();
+                self.state.push_activity(
+                    ActivityItem::new(
+                        ActivityKind::Progress,
+                        "agent output",
+                        format!("Agent output refreshed: {} ({bytes} bytes)", event.agent_id),
+                    )
+                    .with_detail(compact_preview(&event.text)),
+                );
+                None
+            }
+            UiNotification::AgentArtifactUpdated(event) => {
+                let count = event.artifacts.len();
+                self.state.push_activity(ActivityItem::new(
+                    ActivityKind::Tool,
+                    "agent artifacts",
+                    format!("{} artifact(s) refreshed for {}", count, event.agent_id),
+                ));
+                None
+            }
+            UiNotification::SessionGoalUpdated(event) => {
+                self.state.push_activity(ActivityItem::new(
+                    ActivityKind::Progress,
+                    "session goal",
+                    event.goal.status.clone(),
+                ));
+                self.state.status = format!("Goal updated: {}", event.goal.objective);
+                None
+            }
+            UiNotification::SessionGoalCleared(event) => {
+                self.state.status = if event.cleared {
+                    "Goal cleared".into()
+                } else {
+                    "Goal clear requested".into()
+                };
+                None
+            }
+            UiNotification::LoopUpdated(event) => {
+                let status = event
+                    .status
+                    .clone()
+                    .unwrap_or_else(|| event.loop_state.status.clone());
+                self.state.push_activity(ActivityItem::new(
+                    ActivityKind::Progress,
+                    event.loop_state.loop_id,
+                    status,
+                ));
+                None
+            }
+            UiNotification::LoopFired(event) => {
+                let status = event.status.unwrap_or_else(|| {
+                    event
+                        .fire
+                        .as_ref()
+                        .map(|fire| if fire.queued { "queued" } else { "fired" })
+                        .unwrap_or("fired")
+                        .into()
+                });
+                self.state.push_activity(ActivityItem::new(
+                    ActivityKind::Progress,
+                    event.loop_id,
+                    status,
+                ));
+                None
+            }
+            UiNotification::LoopCompleted(event) => {
+                let status = event.status.unwrap_or_else(|| "completed".into());
+                self.state.push_activity(ActivityItem::new(
+                    ActivityKind::Progress,
+                    event.loop_id,
+                    status,
+                ));
+                None
+            }
+            UiNotification::ContextCompactionCompleted(event) => {
+                self.state.status = format!(
+                    "Context compaction {}: {}",
+                    event.compaction.compaction_id, event.compaction.status
+                );
+                None
+            }
+            UiNotification::ContextNormalizationReported(event) => {
+                self.state.status = format!(
+                    "Context normalized: {} prompt messages",
+                    event.normalization.prompt_message_count
+                );
+                None
+            }
         }
     }
 

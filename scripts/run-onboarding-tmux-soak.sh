@@ -168,6 +168,39 @@ wait_for_tui_text() {
   return 1
 }
 
+submit_composer_prompt() {
+  local prompt="$1"
+  local buffer="octos-tui-soak-prompt-$run_id"
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/octos-tui-prompt.XXXXXX")"
+  printf '%s' "$prompt" > "$tmp"
+  tmux send-keys -t "$tui_session" Escape
+  sleep 0.2
+  tmux load-buffer -b "$buffer" "$tmp"
+  rm -f "$tmp"
+  tmux paste-buffer -p -t "$tui_session" -b "$buffer"
+  tmux delete-buffer -b "$buffer" >/dev/null 2>&1 || true
+  sleep "${OCTOS_TUI_SOAK_PROMPT_SETTLE_SECS:-0.35}"
+  tmux send-keys -t "$tui_session" Enter
+}
+
+capture_scrolled_transcript_until_text() {
+  local pattern="$1"
+  local out="$2"
+  local max_pages="${3:-6}"
+  local page=1
+  while [ "$page" -le "$max_pages" ]; do
+    tmux send-keys -t "$tui_session" PageUp
+    sleep 0.2
+    capture_pane "$tui_session" "$out"
+    if grep --fixed-strings -- "$pattern" "$out" >/dev/null 2>&1; then
+      return 0
+    fi
+    page=$((page + 1))
+  done
+  return 1
+}
+
 server_socket_ready() {
   (exec 3<>"/dev/tcp/$host/$port") >/dev/null 2>&1
 }
@@ -613,11 +646,7 @@ send_turn() {
   if ! tmux has-session -t "$tui_session" 2>/dev/null; then
     die "TUI tmux session is not running: $tui_session"
   fi
-  tmux send-keys -t "$tui_session" Escape
-  sleep 0.2
-  tmux send-keys -t "$tui_session" -l "$prompt"
-  sleep 0.1
-  tmux send-keys -t "$tui_session" Enter
+  submit_composer_prompt "$prompt"
   sleep "${OCTOS_TUI_SOAK_TURN_WAIT_SECS:-20}"
   capture
 }
@@ -885,7 +914,7 @@ drive_task_subagent_tree() {
   local prompt="${OCTOS_TUI_SOAK_TASK_SUBAGENT_PROMPT:-Run M15 code review with live subagent orchestration through octos serve --stdio. Use supervised subagents and produce the final marker.}"
   wait_for_tui_text "Ask Octos to change code" "${OCTOS_TUI_SOAK_TUI_READY_WAIT_SECS:-20}" || \
     die "Timed out waiting for TUI composer before driving task/subagent tree"
-  send_tui_line "$prompt"
+  submit_composer_prompt "$prompt"
   wait_for_tui_text "Agent task" "${OCTOS_TUI_SOAK_TASK_SUBAGENT_RUNNING_WAIT_SECS:-10}" || \
     die "Timed out waiting for visible agent task tree"
   capture_pane "$tui_session" "$artifact_dir/tui-capture-task-subagent-tree-running.txt"
@@ -893,6 +922,17 @@ drive_task_subagent_tree() {
   wait_for_tui_text "M15CODEREVIEWFINALLINE" "${OCTOS_TUI_SOAK_TASK_SUBAGENT_DONE_WAIT_SECS:-80}" || \
     die "Timed out waiting for M15 final marker in TUI"
   capture_pane "$tui_session" "$artifact_dir/tui-capture-task-subagent-tree-final.txt"
+  capture_scrolled_transcript_until_text \
+    "Review Summary" \
+    "$artifact_dir/tui-capture-task-subagent-tree-summary.txt" \
+    "${OCTOS_TUI_SOAK_TASK_SUBAGENT_SUMMARY_PAGEUP_COUNT:-6}" || \
+    die "Timed out waiting for visible code-review summary heading after scrolling task/subagent output"
+  local page_down=1
+  while [ "$page_down" -le "${OCTOS_TUI_SOAK_TASK_SUBAGENT_SUMMARY_PAGEUP_COUNT:-6}" ]; do
+    tmux send-keys -t "$tui_session" PageDown
+    sleep 0.05
+    page_down=$((page_down + 1))
+  done
   if [ -n "${OCTOS_TUI_M15_UX_OUTPUT_DIR:-}" ] && [ -d "$OCTOS_TUI_M15_UX_OUTPUT_DIR" ]; then
     local m15_source_abs
     local m15_dest_abs
@@ -919,11 +959,7 @@ drive_dropped_completion_backpressure() {
   local prompt="${OCTOS_TUI_SOAK_BACKPRESSURE_PROMPT:-M9 replay-lossy fixture for M18 reconnect-style replay.}"
   wait_for_tui_text "Ask Octos to change code" "${OCTOS_TUI_SOAK_TUI_READY_WAIT_SECS:-20}" || \
     die "Timed out waiting for TUI composer before driving replay-lossy backpressure"
-  tmux send-keys -t "$tui_session" Escape
-  sleep 0.2
-  tmux send-keys -t "$tui_session" -l "$prompt"
-  sleep 0.1
-  tmux send-keys -t "$tui_session" Enter
+  submit_composer_prompt "$prompt"
   wait_for_tui_text "Replay lossy" "${OCTOS_TUI_SOAK_BACKPRESSURE_WAIT_SECS:-30}" || \
     die "Timed out waiting for replay-lossy status in TUI"
   capture_pane "$tui_session" "$artifact_dir/tui-capture-replay-lossy.txt"
