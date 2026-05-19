@@ -485,7 +485,7 @@ start() {
     tui_cmd="$tui_cmd --session $(shell_quote "$launch_session_id")"
   fi
   tui_cmd="$tui_cmd --profile-id $(shell_quote "$profile_id") --cwd $(shell_quote "$workspace") --theme $(shell_quote "$theme")"
-  tui_cmd="$tui_cmd 2>&1; status=\$?; echo octos-tui exited with status \$status; sleep ${OCTOS_TUI_SOAK_EXIT_HOLD_SECS:-30}"
+  tui_cmd="$tui_cmd 2>&1; exit_code=\$?; echo octos-tui exited with status \$exit_code; sleep ${OCTOS_TUI_SOAK_EXIT_HOLD_SECS:-30}"
   tmux new-session -d -s "$tui_session" "$tui_cmd"
 
   sleep "${OCTOS_TUI_SOAK_TUI_WAIT_SECS:-2}"
