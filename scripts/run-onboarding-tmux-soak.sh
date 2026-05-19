@@ -165,6 +165,24 @@ wait_for_tui_text() {
   return 1
 }
 
+wait_for_server_ready() {
+  local timeout_secs="${1:-20}"
+  local deadline=$((SECONDS + timeout_secs))
+  local ready_line="Listening: http://$host:$port"
+  while [ "$SECONDS" -le "$deadline" ]; do
+    if grep --fixed-strings -- "$ready_line" "$logs_dir/server.log" >/dev/null 2>&1; then
+      return 0
+    fi
+    if ! tmux has-session -t "$server_session" 2>/dev/null; then
+      capture_pane "$server_session" "$artifact_dir/server-pane.txt"
+      die "Backend tmux session exited before WebSocket server became ready: $server_session"
+    fi
+    sleep 1
+  done
+  capture_pane "$server_session" "$artifact_dir/server-pane.txt"
+  die "Timed out waiting for WebSocket server readiness line: $ready_line"
+}
+
 redact_profile() {
   local input="$1"
   local output="$2"
@@ -457,7 +475,7 @@ start() {
     fi
     server_cmd="$server_cmd 2>&1 | tee $(shell_quote "$logs_dir/server.log")"
     tmux new-session -d -s "$server_session" "$server_cmd"
-    sleep "${OCTOS_TUI_SOAK_SERVER_WAIT_SECS:-4}"
+    wait_for_server_ready "${OCTOS_TUI_SOAK_SERVER_WAIT_SECS:-20}"
   else
     : > "$logs_dir/server.log"
     tmux new-session -d -s "$server_session" "tail -n +1 -F $(shell_quote "$logs_dir/server.log")"
