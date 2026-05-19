@@ -42,7 +42,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|capture|send-turn|verify|verify-solo|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-task-subagent-tree|capture|send-turn|verify|verify-solo|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -300,6 +300,18 @@ runtime_env_prefix() {
   fi
   if [ -n "${OCTOS_M9_PROTOCOL_FIXTURES:-}" ]; then
     prefix="$prefix $(shell_quote "OCTOS_M9_PROTOCOL_FIXTURES=$OCTOS_M9_PROTOCOL_FIXTURES")"
+  fi
+  if [ -n "${OCTOS_M15_LIVE_SUBAGENT_FIXTURE:-}" ]; then
+    prefix="$prefix $(shell_quote "OCTOS_M15_LIVE_SUBAGENT_FIXTURE=$OCTOS_M15_LIVE_SUBAGENT_FIXTURE")"
+  fi
+  if [ -n "${OCTOS_TUI_M15_UX_OUTPUT_DIR:-}" ]; then
+    prefix="$prefix $(shell_quote "OCTOS_TUI_M15_UX_OUTPUT_DIR=$OCTOS_TUI_M15_UX_OUTPUT_DIR")"
+  fi
+  if [ -n "${OCTOS_TUI_M15_UX_WORKDIR:-}" ]; then
+    prefix="$prefix $(shell_quote "OCTOS_TUI_M15_UX_WORKDIR=$OCTOS_TUI_M15_UX_WORKDIR")"
+  fi
+  if [ -n "${OCTOS_M15_LIVE_SUBAGENT_DELAY_SCALE:-}" ]; then
+    prefix="$prefix $(shell_quote "OCTOS_M15_LIVE_SUBAGENT_DELAY_SCALE=$OCTOS_M15_LIVE_SUBAGENT_DELAY_SCALE")"
   fi
   if [ -n "$prefix" ]; then
     printf 'env%s ' "$prefix"
@@ -816,6 +828,30 @@ drive_approval_denial() {
   echo "Drove approval denial in $tui_session"
 }
 
+drive_task_subagent_tree() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required for drive-task-subagent-tree"
+  if ! tmux has-session -t "$tui_session" 2>/dev/null; then
+    die "TUI tmux session is not running: $tui_session"
+  fi
+
+  local prompt="${OCTOS_TUI_SOAK_TASK_SUBAGENT_PROMPT:-Run M15 code review with live subagent orchestration through octos serve --stdio. Use supervised subagents and produce the final marker.}"
+  wait_for_tui_text "Ask Octos to change code" "${OCTOS_TUI_SOAK_TUI_READY_WAIT_SECS:-20}" || \
+    die "Timed out waiting for TUI composer before driving task/subagent tree"
+  send_tui_line "$prompt"
+  wait_for_tui_text "Agent task" "${OCTOS_TUI_SOAK_TASK_SUBAGENT_RUNNING_WAIT_SECS:-10}" || true
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-task-subagent-tree-running.txt"
+
+  wait_for_tui_text "M15CODEREVIEWFINALLINE" "${OCTOS_TUI_SOAK_TASK_SUBAGENT_DONE_WAIT_SECS:-80}" || \
+    die "Timed out waiting for M15 final marker in TUI"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-task-subagent-tree-final.txt"
+  if [ -n "${OCTOS_TUI_M15_UX_OUTPUT_DIR:-}" ] && [ -d "$OCTOS_TUI_M15_UX_OUTPUT_DIR" ]; then
+    mkdir -p "$artifact_dir/m15-evidence"
+    cp -R "$OCTOS_TUI_M15_UX_OUTPUT_DIR"/. "$artifact_dir/m15-evidence"/
+  fi
+  capture
+  echo "Drove task/subagent tree in $tui_session"
+}
+
 verify_solo() {
   capture
   local required=(
@@ -960,6 +996,7 @@ case "${1:-help}" in
   drive-permissions) drive_permissions ;;
   drive-provider-missing) drive_provider_missing ;;
   drive-approval-denial) drive_approval_denial ;;
+  drive-task-subagent-tree) drive_task_subagent_tree ;;
   capture) capture ;;
   send-turn) send_turn ;;
   verify) verify ;;
