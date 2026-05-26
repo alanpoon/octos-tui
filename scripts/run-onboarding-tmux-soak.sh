@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-task-subagent-tree|drive-task-subagent-reconnect|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-task-subagent-tree|drive-task-subagent-reconnect|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -1507,6 +1507,125 @@ verify_task_subagent_reconnect() {
   echo "Verified task/subagent reconnect artifacts in $artifact_dir"
 }
 
+verify_autonomy_live() {
+  local capture_file
+  capture_file="$(first_existing_artifact "M15 autonomy TUI capture" \
+    "$artifact_dir/tui-capture-autonomy-live.txt" \
+    "$artifact_dir/tui-capture.txt")"
+  local transcript
+  transcript="$(first_existing_artifact "M15 autonomy AppUI transcript" \
+    "$artifact_dir/m15-evidence/appui-transcript.jsonl" \
+    "$artifact_dir/appui-transcript.jsonl")"
+  local runtime_policy
+  runtime_policy="$(first_existing_artifact "M15 autonomy runtime policy stamp" \
+    "$artifact_dir/m15-evidence/runtime-policy-stamp.json" \
+    "$artifact_dir/runtime-policy-stamp.json")"
+  local agent_ledger
+  agent_ledger="$(first_existing_artifact "M15 autonomy agent ledger" \
+    "$artifact_dir/m15-evidence/agent-ledger.jsonl" \
+    "$artifact_dir/agent-ledger.jsonl")"
+  local goal_ledger
+  goal_ledger="$(first_existing_artifact "M15 autonomy goal ledger" \
+    "$artifact_dir/m15-evidence/goal-ledger.jsonl" \
+    "$artifact_dir/goal-ledger.jsonl")"
+  local loop_ledger
+  loop_ledger="$(first_existing_artifact "M15 autonomy loop ledger" \
+    "$artifact_dir/m15-evidence/loop-ledger.jsonl" \
+    "$artifact_dir/loop-ledger.jsonl")"
+  local task_ledger
+  task_ledger="$(first_existing_artifact "M15 autonomy task ledger" \
+    "$artifact_dir/m15-evidence/task-ledger.jsonl" \
+    "$artifact_dir/task-ledger.jsonl")"
+  local artifact_index
+  artifact_index="$(first_existing_artifact "M15 autonomy artifact index" \
+    "$artifact_dir/m15-evidence/artifact-index.json" \
+    "$artifact_dir/artifact-index.json")"
+
+  local required_file
+  for required_file in \
+    "$capture_file" \
+    "$transcript" \
+    "$runtime_policy" \
+    "$agent_ledger" \
+    "$goal_ledger" \
+    "$loop_ledger" \
+    "$task_ledger" \
+    "$artifact_index"
+  do
+    [ -s "$required_file" ] || die "M15 autonomy artifact missing or empty: $required_file"
+  done
+
+  assert_capture_clean "$capture_file" "M15 autonomy"
+  for required_text in \
+    "Agent" \
+    "Goal" \
+    "Loop" \
+    "Ask Octos to change code"
+  do
+    grep --fixed-strings -- "$required_text" "$capture_file" >/dev/null 2>&1 \
+      || die "M15 autonomy capture missing required text: $required_text"
+  done
+  grep -Ei 'summary|final|joined answer|completed' "$capture_file" >/dev/null 2>&1 \
+    || die "M15 autonomy capture missing visible summary/final content"
+
+  if grep -E 'm15-fixture-appui-backend|fixture-only|deterministic fixture|fake-openai|M15_CODE_REVIEW_FINAL_LINE|M15CODEREVIEWFINALLINE' \
+    "$capture_file" \
+    "$transcript" \
+    "$runtime_policy" \
+    "$agent_ledger" \
+    "$goal_ledger" \
+    "$loop_ledger" \
+    "$task_ledger" >/dev/null 2>&1; then
+    die "M15 autonomy artifacts contain fixture-only or deterministic marker text"
+  fi
+
+  grep -E '"direction"[[:space:]]*:[[:space:]]*"(client_to_server|tx)".*"method"[[:space:]]*:[[:space:]]*"(turn/start|review/start)"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "M15 autonomy transcript missing turn/start or review/start request"
+  grep -E '"direction"[[:space:]]*:[[:space:]]*"(client_to_server|tx)".*"method"[[:space:]]*:[[:space:]]*"agent/(list|status/read|output/read|artifact/list)"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "M15 autonomy transcript missing agent inspection request"
+  grep -E '"direction"[[:space:]]*:[[:space:]]*"(client_to_server|tx)".*"method"[[:space:]]*:[[:space:]]*"session/goal/(get|set|clear)"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "M15 autonomy transcript missing goal runtime request"
+  grep -E '"direction"[[:space:]]*:[[:space:]]*"(client_to_server|tx)".*"method"[[:space:]]*:[[:space:]]*"loop/(list|create|fire_now|pause|resume|delete)"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "M15 autonomy transcript missing loop runtime request"
+  grep -E '"direction"[[:space:]]*:[[:space:]]*"(server_to_client|rx)".*"method"[[:space:]]*:[[:space:]]*"agent/(updated|output/delta|artifact/updated)"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "M15 autonomy transcript missing backend agent notification"
+  grep -E '"direction"[[:space:]]*:[[:space:]]*"(server_to_client|rx)".*"method"[[:space:]]*:[[:space:]]*"session/goal/(updated|cleared)"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "M15 autonomy transcript missing backend goal notification"
+  grep -E '"direction"[[:space:]]*:[[:space:]]*"(server_to_client|rx)".*"method"[[:space:]]*:[[:space:]]*"loop/(updated|fired|completed)"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "M15 autonomy transcript missing backend loop notification"
+
+  if grep -E '"direction"[[:space:]]*:[[:space:]]*"(client_to_server|tx)".*"method"[[:space:]]*:[[:space:]]*"(agent/updated|agent/output/delta|agent/artifact/updated|session/goal/updated|session/goal/cleared|loop/updated|loop/fired|loop/completed)"' \
+    "$transcript" >/dev/null 2>&1; then
+    die "M15 autonomy transcript shows TUI-owned notification/timer traffic"
+  fi
+
+  grep -E '"event"[[:space:]]*:[[:space:]]*"agent_started"' "$agent_ledger" >/dev/null 2>&1 \
+    || die "M15 autonomy agent ledger missing agent_started"
+  grep -E '"event"[[:space:]]*:[[:space:]]*"agent_completed"' "$agent_ledger" >/dev/null 2>&1 \
+    || die "M15 autonomy agent ledger missing agent_completed"
+  grep -E '"event"[[:space:]]*:[[:space:]]*"(goal_started|goal_continuation|goal_updated)"' "$goal_ledger" >/dev/null 2>&1 \
+    || die "M15 autonomy goal ledger missing goal event"
+  grep -E '"event"[[:space:]]*:[[:space:]]*"(loop_iteration|loop_fired|loop_completed|loop_updated)"' "$loop_ledger" >/dev/null 2>&1 \
+    || die "M15 autonomy loop ledger missing loop event"
+  grep -E '"event"[[:space:]]*:[[:space:]]*"task_started"' "$task_ledger" >/dev/null 2>&1 \
+    || die "M15 autonomy task ledger missing task_started"
+  grep -E '"event"[[:space:]]*:[[:space:]]*"task_completed"' "$task_ledger" >/dev/null 2>&1 \
+    || die "M15 autonomy task ledger missing task_completed"
+  grep -E '"artifacts"[[:space:]]*:[[:space:]]*\[' "$artifact_index" >/dev/null 2>&1 \
+    || die "M15 autonomy artifact index missing artifacts array"
+
+  write_ux_validation "autonomy-live" "passed" "M15 autonomy production artifact bundle verified"
+  secret_leak_check
+  echo "Verified M15 autonomy artifacts in $artifact_dir"
+}
+
 verify_ux_run() {
   local scenario_json="$artifact_dir/scenario.json"
   local summary_json="$artifact_dir/summary.json"
@@ -1850,6 +1969,79 @@ JSONL
     die "self-test expected task-subagent reconnect verification to fail"
   fi
 
+  mkdir -p "$tmp_root/autonomy-live/m15-evidence"
+  cat > "$tmp_root/autonomy-live/tui-capture-autonomy-live.txt" <<'CAPTURE'
+Agent reviewer-api summary generated by model
+Goal active continuation rendered
+Loop fire_now completed from backend
+Final joined answer completed
+Ask Octos to change code...
+state Done
+CAPTURE
+  cat > "$tmp_root/autonomy-live/m15-evidence/appui-transcript.jsonl" <<'JSONL'
+{"direction":"client_to_server","frame":{"method":"review/start"}}
+{"direction":"client_to_server","frame":{"method":"agent/list"}}
+{"direction":"client_to_server","frame":{"method":"session/goal/get"}}
+{"direction":"client_to_server","frame":{"method":"loop/fire_now"}}
+{"direction":"server_to_client","frame":{"method":"agent/updated"}}
+{"direction":"server_to_client","frame":{"method":"session/goal/updated"}}
+{"direction":"server_to_client","frame":{"method":"loop/fired"}}
+JSONL
+  cat > "$tmp_root/autonomy-live/m15-evidence/runtime-policy-stamp.json" <<'JSON'
+{"scenario":"production_autonomy","runtime":"octos-serve","tool_policy_id":"coding-autonomy-v1"}
+JSON
+  cat > "$tmp_root/autonomy-live/m15-evidence/agent-ledger.jsonl" <<'JSONL'
+{"event":"agent_started","agent_id":"reviewer-api"}
+{"event":"agent_completed","agent_id":"reviewer-api","summary_kind":"model_generated"}
+JSONL
+  cat > "$tmp_root/autonomy-live/m15-evidence/goal-ledger.jsonl" <<'JSONL'
+{"event":"goal_started","goal_id":"goal-1"}
+{"event":"goal_continuation","goal_id":"goal-1","status":"active"}
+JSONL
+  cat > "$tmp_root/autonomy-live/m15-evidence/loop-ledger.jsonl" <<'JSONL'
+{"event":"loop_iteration","loop_id":"loop-1","status":"started"}
+{"event":"loop_fired","loop_id":"loop-1","status":"completed"}
+JSONL
+  cat > "$tmp_root/autonomy-live/m15-evidence/task-ledger.jsonl" <<'JSONL'
+{"event":"task_started","task_id":"task-1"}
+{"event":"task_completed","task_id":"task-1"}
+JSONL
+  cat > "$tmp_root/autonomy-live/m15-evidence/artifact-index.json" <<'JSON'
+{"artifacts":[{"id":"joined-answer"}]}
+JSON
+  env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/autonomy-live" "$0" verify-autonomy-live >/dev/null
+
+  mkdir -p "$tmp_root/bad-autonomy-live/m15-evidence"
+  cp "$tmp_root/autonomy-live/tui-capture-autonomy-live.txt" "$tmp_root/bad-autonomy-live/"
+  cp "$tmp_root/autonomy-live/m15-evidence/runtime-policy-stamp.json" "$tmp_root/bad-autonomy-live/m15-evidence/"
+  cp "$tmp_root/autonomy-live/m15-evidence/agent-ledger.jsonl" "$tmp_root/bad-autonomy-live/m15-evidence/"
+  cp "$tmp_root/autonomy-live/m15-evidence/goal-ledger.jsonl" "$tmp_root/bad-autonomy-live/m15-evidence/"
+  cp "$tmp_root/autonomy-live/m15-evidence/loop-ledger.jsonl" "$tmp_root/bad-autonomy-live/m15-evidence/"
+  cp "$tmp_root/autonomy-live/m15-evidence/task-ledger.jsonl" "$tmp_root/bad-autonomy-live/m15-evidence/"
+  cp "$tmp_root/autonomy-live/m15-evidence/artifact-index.json" "$tmp_root/bad-autonomy-live/m15-evidence/"
+  cat > "$tmp_root/bad-autonomy-live/m15-evidence/appui-transcript.jsonl" <<'JSONL'
+{"direction":"client_to_server","frame":{"method":"review/start"}}
+{"direction":"client_to_server","frame":{"method":"agent/list"}}
+{"direction":"client_to_server","frame":{"method":"session/goal/get"}}
+{"direction":"client_to_server","frame":{"method":"loop/fire_now"}}
+{"direction":"client_to_server","frame":{"method":"loop/fired"}}
+{"direction":"server_to_client","frame":{"method":"agent/updated"}}
+{"direction":"server_to_client","frame":{"method":"session/goal/updated"}}
+{"direction":"server_to_client","frame":{"method":"loop/fired"}}
+JSONL
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-autonomy-live" "$0" verify-autonomy-live >/dev/null 2>&1; then
+    die "self-test expected autonomy live client notification verification to fail"
+  fi
+
+  mkdir -p "$tmp_root/fixture-autonomy-live/m15-evidence"
+  cp "$tmp_root/autonomy-live/tui-capture-autonomy-live.txt" "$tmp_root/fixture-autonomy-live/"
+  cp "$tmp_root/autonomy-live/m15-evidence/"*.json "$tmp_root/fixture-autonomy-live/m15-evidence/"
+  cp "$tmp_root/autonomy-live/m15-evidence/"*.jsonl "$tmp_root/fixture-autonomy-live/m15-evidence/"
+  printf 'M15CODEREVIEWFINALLINE\n' >> "$tmp_root/fixture-autonomy-live/tui-capture-autonomy-live.txt"
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/fixture-autonomy-live" "$0" verify-autonomy-live >/dev/null 2>&1; then
+    die "self-test expected autonomy live fixture-marker verification to fail"
+  fi
+
   mkdir -p "$tmp_root/ux-run"
   cat > "$tmp_root/ux-run/scenario.json" <<'JSON'
 {"schema":"octos.ux.scenario.v1","scenario_id":"narrow-layout","transport":"stdio"}
@@ -1942,6 +2134,7 @@ case "${1:-help}" in
   verify-multiline-composer) verify_multiline_composer ;;
   verify-task-subagent-tree) verify_task_subagent_tree ;;
   verify-task-subagent-reconnect) verify_task_subagent_reconnect ;;
+  verify-autonomy-live) verify_autonomy_live ;;
   verify-ux-run) verify_ux_run ;;
   api-parity) api_parity ;;
   self-test) self_test ;;

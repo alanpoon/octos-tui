@@ -221,6 +221,23 @@ capture, the post-reconnect composer/status line, and AppUI hydration method
 evidence such as `session/open`, `agent/list`, `session/goal/get`,
 `loop/list`, or `task/list`.
 
+## M15 Autonomy Live Artifacts
+
+For M15 production autonomy evidence, point the verifier at a retained live
+artifact directory:
+
+```sh
+OCTOS_TUI_SOAK_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<run-id> \
+scripts/run-onboarding-tmux-soak.sh verify-autonomy-live
+```
+
+`verify-autonomy-live` checks the capture, AppUI transcript,
+`runtime-policy-stamp.json`, `agent-ledger.jsonl`, `goal-ledger.jsonl`,
+`loop-ledger.jsonl`, `task-ledger.jsonl`, and `artifact-index.json`. It fails
+if production evidence is still deterministic fixture text, if agent/goal/loop
+notifications appear to come from the TUI as client traffic, or if the capture
+does not visibly show agent, goal, loop, and final summary state.
+
 ## M19 UX Run Bundle
 
 For M19 runner-owned artifacts, set `OCTOS_TUI_SOAK_ARTIFACT_DIR` to the
