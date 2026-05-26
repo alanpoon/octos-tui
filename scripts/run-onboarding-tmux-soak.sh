@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-task-subagent-tree|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-task-subagent-tree|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-task-subagent-tree|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-task-subagent-tree|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -67,6 +67,8 @@ Environment:
   OCTOS_TUI_SOAK_FAKE_OPENAI     Set to 1 to start scripts/fake-openai-server.py in tmux.
   OCTOS_TUI_SOAK_FAKE_OPENAI_PORT Local fake OpenAI-compatible port, default 50180.
   OCTOS_TUI_SOAK_FAKE_OPENAI_DELAY_SECS Optional fake API response delay for progress captures.
+  OCTOS_TUI_SOAK_MULTILINE_PROMPT Optional multiline composer text used by
+                                 drive-multiline-composer.
   OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE Set to 1 to launch without a preselected
                                  profile/session and save tui-capture-first-launch.txt.
   OCTOS_TUI_SOAK_REQUIRE_PROFILE Set to 0 to allow verify without profile JSON.
@@ -1077,6 +1079,39 @@ drive_approval_denial() {
   echo "Drove approval denial in $tui_session"
 }
 
+drive_multiline_composer() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required for drive-multiline-composer"
+  if ! tmux has-session -t "$tui_session" 2>/dev/null; then
+    die "TUI tmux session is not running: $tui_session"
+  fi
+
+  local prompt="${OCTOS_TUI_SOAK_MULTILINE_PROMPT:-}"
+  if [ -z "$prompt" ]; then
+    prompt=$'first instruction\nsecond instruction\nthird instruction'
+  fi
+  wait_for_tui_text "Ask Octos to change code" "${OCTOS_TUI_SOAK_TUI_READY_WAIT_SECS:-20}" || \
+    die "Timed out waiting for TUI composer before multiline capture"
+  tmux send-keys -t "$tui_session" Escape
+  sleep 0.1
+  local first_line=1
+  while IFS= read -r line; do
+    if [ "$first_line" = "1" ]; then
+      first_line=0
+    else
+      tmux send-keys -t "$tui_session" Enter
+    fi
+    if [ -n "$line" ]; then
+      tmux send-keys -t "$tui_session" -l "$line"
+    fi
+  done <<EOF
+$prompt
+EOF
+  sleep "${OCTOS_TUI_SOAK_MULTILINE_SETTLE_SECS:-0.5}"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-multiline-composer.txt"
+  capture
+  echo "Drove multiline composer capture in $tui_session"
+}
+
 drive_task_subagent_tree() {
   command -v tmux >/dev/null 2>&1 || die "tmux is required for drive-task-subagent-tree"
   if ! tmux has-session -t "$tui_session" 2>/dev/null; then
@@ -1342,6 +1377,30 @@ verify_approval_denial() {
   write_ux_validation "approval-denial" "passed" "approval denial captures verified"
   secret_leak_check
   echo "Verified approval denial artifacts in $artifact_dir"
+}
+
+verify_multiline_composer() {
+  local capture_file="$artifact_dir/tui-capture-multiline-composer.txt"
+  assert_capture_clean "$capture_file" "multiline-composer"
+
+  for required_text in \
+    "Composer" \
+    "first instruction" \
+    "second instruction" \
+    "third instruction"
+  do
+    grep --fixed-strings -- "$required_text" "$capture_file" >/dev/null 2>&1 \
+      || die "multiline composer capture missing required text: $required_text"
+  done
+
+  if grep -E 'state !.*Blocked|Approval Requested|Task Error|app-ui error|malformed_json' \
+    "$capture_file" >/dev/null 2>&1; then
+    die "multiline composer capture contains blocked or AppUI error text"
+  fi
+
+  write_ux_validation "multiline-composer" "passed" "multiline composer capture verified"
+  secret_leak_check
+  echo "Verified multiline composer capture in $artifact_dir"
 }
 
 verify_task_subagent_tree() {
@@ -1645,6 +1704,26 @@ state Done
 CAPTURE
   env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/approval-denial" "$0" verify-approval-denial >/dev/null
 
+  mkdir -p "$tmp_root/multiline-composer"
+  cat > "$tmp_root/multiline-composer/tui-capture-multiline-composer.txt" <<'CAPTURE'
+Composer  Enter send | Tab inspector
+> first instruction
+  second instruction
+  third instruction
+state Done
+CAPTURE
+  env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/multiline-composer" "$0" verify-multiline-composer >/dev/null
+
+  mkdir -p "$tmp_root/bad-multiline-composer"
+  cat > "$tmp_root/bad-multiline-composer/tui-capture-multiline-composer.txt" <<'CAPTURE'
+Composer  Enter send | Tab inspector
+> first instruction
+  third instruction
+CAPTURE
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-multiline-composer" "$0" verify-multiline-composer >/dev/null 2>&1; then
+    die "self-test expected incomplete multiline composer verification to fail"
+  fi
+
   mkdir -p "$tmp_root/bad-approval-denial"
   cp "$tmp_root/approval-denial/tui-capture-approval-request.txt" "$tmp_root/bad-approval-denial/"
   cat > "$tmp_root/bad-approval-denial/tui-capture-approval-denied.txt" <<'CAPTURE'
@@ -1782,6 +1861,7 @@ case "${1:-help}" in
   drive-permissions) drive_permissions ;;
   drive-provider-missing) drive_provider_missing ;;
   drive-approval-denial) drive_approval_denial ;;
+  drive-multiline-composer) drive_multiline_composer ;;
   drive-task-subagent-tree) drive_task_subagent_tree ;;
   drive-dropped-completion-backpressure) drive_dropped_completion_backpressure ;;
   capture) capture ;;
@@ -1792,6 +1872,7 @@ case "${1:-help}" in
   verify-provider-missing) verify_provider_missing ;;
   verify-permissions) verify_permissions ;;
   verify-approval-denial) verify_approval_denial ;;
+  verify-multiline-composer) verify_multiline_composer ;;
   verify-task-subagent-tree) verify_task_subagent_tree ;;
   verify-ux-run) verify_ux_run ;;
   api-parity) api_parity ;;
