@@ -337,6 +337,26 @@ scripts/run-onboarding-tmux-soak.sh drive-onboard
 `drive-onboard` sends only `/onboard` commands through the live tmux TUI and
 then captures the pane. The retained artifacts must show masked secrets only.
 
+## Runtime Menus
+
+For M12 runtime-cockpit evidence, capture the server-backed status, model, and
+MCP menu surfaces:
+
+```sh
+OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+scripts/run-onboarding-tmux-soak.sh drive-runtime-menus
+
+OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+scripts/run-onboarding-tmux-soak.sh verify-runtime-menus
+```
+
+`verify-runtime-menus` checks `tui-capture-runtime-status.txt`,
+`tui-capture-runtime-model.txt`, `tui-capture-runtime-mcp.txt`, and
+`appui-transcript.jsonl`. The verifier requires visible profile/model/MCP
+surfaces plus outbound `session/status/read`, `profile/llm/list`, and
+`mcp/status/list` or `mcp/config/list` requests, so a capture cannot pass only
+because the TUI rendered local placeholder text.
+
 ## Verify
 
 For Moonshot AutoDL:
