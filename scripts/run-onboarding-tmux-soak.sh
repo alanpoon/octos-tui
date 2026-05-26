@@ -531,6 +531,56 @@ write_ux_validation() {
   } > "$artifact_dir/ux-validation.json"
 }
 
+markdown_cell() {
+  local value="$1"
+  value=${value//$'\r'/ }
+  value=${value//$'\n'/ }
+  value=${value//|/\\|}
+  printf '%s' "$value"
+}
+
+write_solo_summary_matrix() {
+  local summary_json="$artifact_dir/soak-summary.json"
+  local summary_matrix="$artifact_dir/summary-matrix.md"
+  [ -f "$summary_json" ] || die "M12 solo summary missing: $summary_json"
+
+  {
+    printf '# M12 Solo Soak Summary\n\n'
+    printf 'Run: `%s`\n\n' "$run_id"
+    printf '| Case | Status | Notes |\n'
+    printf '|---|---|---|\n'
+    if command -v jq >/dev/null 2>&1; then
+      jq -e '.cases | type == "array" and length > 0' "$summary_json" >/dev/null \
+        || die "M12 solo summary has no case matrix: $summary_json"
+      jq -r '
+        .cases[]
+        | [
+            (.name // "unknown"),
+            (.status // "unknown"),
+            (
+              .reason
+              // .todo
+              // .error.message
+              // (if (.missing_required_tools? // []) | length > 0 then
+                    "missing_required_tools=" + ((.missing_required_tools? // []) | join(","))
+                  else
+                    ""
+                  end)
+            )
+          ]
+        | @tsv
+      ' "$summary_json" | while IFS=$'\t' read -r name status notes; do
+        printf '| %s | %s | %s |\n' \
+          "$(markdown_cell "$name")" \
+          "$(markdown_cell "$status")" \
+          "$(markdown_cell "$notes")"
+      done
+    else
+      printf '| soak-summary | present | jq unavailable; inspect `soak-summary.json` for per-case status. |\n'
+    fi
+  } > "$summary_matrix"
+}
+
 assert_capture_clean() {
   local file="$1"
   local label="$2"
@@ -1140,6 +1190,8 @@ verify_solo() {
       die "M12 solo strict verification requires passed soak-summary.json"
     fi
   fi
+  write_solo_summary_matrix
+  [ -f "$artifact_dir/summary-matrix.md" ] || die "M12 solo summary matrix missing"
   write_ux_validation "solo-onboarding" "passed" "M12 solo soak artifacts verified"
   secret_leak_check
   echo "Verified M12 solo soak artifacts in $artifact_dir"
