@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-task-subagent-tree|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-task-subagent-tree|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-task-subagent-tree|drive-task-subagent-reconnect|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -1157,6 +1157,19 @@ drive_task_subagent_tree() {
   echo "Drove task/subagent tree in $tui_session"
 }
 
+drive_task_subagent_reconnect() {
+  if [ "$transport" != "ws" ]; then
+    die "drive-task-subagent-reconnect requires OCTOS_TUI_SOAK_TRANSPORT=ws"
+  fi
+  restart_server
+  wait_for_tui_text "Ask Octos to change code|UI protocol reconnected|state" \
+    "${OCTOS_TUI_SOAK_RECONNECT_WAIT_SECS:-20}" || \
+    die "Timed out waiting for TUI to settle after backend restart"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-task-subagent-tree-reconnect.txt"
+  capture
+  echo "Drove task/subagent reconnect capture in $tui_session"
+}
+
 drive_dropped_completion_backpressure() {
   command -v tmux >/dev/null 2>&1 || die "tmux is required for drive-dropped-completion-backpressure"
   if ! tmux has-session -t "$tui_session" 2>/dev/null; then
@@ -1464,6 +1477,34 @@ verify_task_subagent_tree() {
   write_ux_validation "task-subagent-tree" "passed" "task/subagent tree captures verified"
   secret_leak_check
   echo "Verified task/subagent tree artifacts in $artifact_dir"
+}
+
+verify_task_subagent_reconnect() {
+  local server_restart_capture="$artifact_dir/server-pane-after-restart.txt"
+  local reconnect_capture
+  reconnect_capture="$(first_existing_artifact "task-subagent reconnect capture" \
+    "$artifact_dir/tui-capture-task-subagent-tree-reconnect.txt" \
+    "$artifact_dir/tui-capture.txt")"
+  local transcript
+  transcript="$(first_existing_artifact "task-subagent reconnect AppUI transcript" \
+    "$artifact_dir/m15-evidence/appui-transcript.jsonl" \
+    "$artifact_dir/appui-transcript.jsonl")"
+
+  assert_capture_clean "$server_restart_capture" "task-subagent-server-after-restart"
+  assert_capture_clean "$reconnect_capture" "task-subagent-reconnect"
+
+  grep --fixed-strings -- "Ask Octos to change code" "$reconnect_capture" >/dev/null 2>&1 \
+    || die "task-subagent reconnect capture missing usable composer"
+  grep --fixed-strings -- "state" "$reconnect_capture" >/dev/null 2>&1 \
+    || die "task-subagent reconnect capture missing status line"
+
+  grep -E '"method"[[:space:]]*:[[:space:]]*"(session/open|session/status/read|agent/list|session/goal/get|loop/list|task/list)"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "task-subagent reconnect transcript missing reconnect/hydration method evidence"
+
+  write_ux_validation "task-subagent-reconnect" "passed" "task/subagent reconnect capture verified"
+  secret_leak_check
+  echo "Verified task/subagent reconnect artifacts in $artifact_dir"
 }
 
 verify_ux_run() {
@@ -1784,6 +1825,31 @@ JSONL
     die "self-test expected task-subagent client task-control verification to fail"
   fi
 
+  mkdir -p "$tmp_root/task-subagent-reconnect/m15-evidence"
+  cat > "$tmp_root/task-subagent-reconnect/server-pane-after-restart.txt" <<'CAPTURE'
+Listening: http://127.0.0.1:50179
+CAPTURE
+  cat > "$tmp_root/task-subagent-reconnect/tui-capture-task-subagent-tree-reconnect.txt" <<'CAPTURE'
+UI protocol reconnected to ws://127.0.0.1:50179/api/ui-protocol/ws.
+Ask Octos to change code...
+state Done
+CAPTURE
+  cat > "$tmp_root/task-subagent-reconnect/m15-evidence/appui-transcript.jsonl" <<'JSONL'
+{"direction":"client_to_server","frame":{"method":"session/open"}}
+{"direction":"client_to_server","frame":{"method":"agent/list"}}
+JSONL
+  env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/task-subagent-reconnect" "$0" verify-task-subagent-reconnect >/dev/null
+
+  mkdir -p "$tmp_root/bad-task-subagent-reconnect/m15-evidence"
+  cp "$tmp_root/task-subagent-reconnect/server-pane-after-restart.txt" "$tmp_root/bad-task-subagent-reconnect/"
+  cp "$tmp_root/task-subagent-reconnect/tui-capture-task-subagent-tree-reconnect.txt" "$tmp_root/bad-task-subagent-reconnect/"
+  cat > "$tmp_root/bad-task-subagent-reconnect/m15-evidence/appui-transcript.jsonl" <<'JSONL'
+{"direction":"client_to_server","frame":{"method":"turn/start"}}
+JSONL
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-task-subagent-reconnect" "$0" verify-task-subagent-reconnect >/dev/null 2>&1; then
+    die "self-test expected task-subagent reconnect verification to fail"
+  fi
+
   mkdir -p "$tmp_root/ux-run"
   cat > "$tmp_root/ux-run/scenario.json" <<'JSON'
 {"schema":"octos.ux.scenario.v1","scenario_id":"narrow-layout","transport":"stdio"}
@@ -1863,6 +1929,7 @@ case "${1:-help}" in
   drive-approval-denial) drive_approval_denial ;;
   drive-multiline-composer) drive_multiline_composer ;;
   drive-task-subagent-tree) drive_task_subagent_tree ;;
+  drive-task-subagent-reconnect) drive_task_subagent_reconnect ;;
   drive-dropped-completion-backpressure) drive_dropped_completion_backpressure ;;
   capture) capture ;;
   send-turn) send_turn ;;
@@ -1874,6 +1941,7 @@ case "${1:-help}" in
   verify-approval-denial) verify_approval_denial ;;
   verify-multiline-composer) verify_multiline_composer ;;
   verify-task-subagent-tree) verify_task_subagent_tree ;;
+  verify-task-subagent-reconnect) verify_task_subagent_reconnect ;;
   verify-ux-run) verify_ux_run ;;
   api-parity) api_parity ;;
   self-test) self_test ;;
