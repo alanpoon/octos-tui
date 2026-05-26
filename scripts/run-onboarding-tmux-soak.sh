@@ -43,7 +43,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-task-subagent-tree|drive-task-subagent-reconnect|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-multiline-composer|drive-runtime-menus|drive-task-subagent-tree|drive-task-subagent-reconnect|capture|send-turn|verify|verify-solo|verify-first-launch|verify-provider-missing|verify-permissions|verify-approval-denial|verify-multiline-composer|verify-runtime-menus|verify-task-subagent-tree|verify-task-subagent-reconnect|verify-autonomy-live|verify-ux-run|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -1112,6 +1112,25 @@ EOF
   echo "Drove multiline composer capture in $tui_session"
 }
 
+drive_runtime_menus() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required for drive-runtime-menus"
+  if ! tmux has-session -t "$tui_session" 2>/dev/null; then
+    die "TUI tmux session is not running: $tui_session"
+  fi
+
+  wait_for_tui_text "Ask Octos to change code|state|AppUI capabilities refreshed" \
+    "${OCTOS_TUI_SOAK_TUI_READY_WAIT_SECS:-20}" || \
+    die "Timed out waiting for TUI ready signal before runtime menu capture"
+  send_tui_line "/status"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-runtime-status.txt"
+  send_tui_line "/model"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-runtime-model.txt"
+  send_tui_line "/mcp"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-runtime-mcp.txt"
+  capture
+  echo "Drove runtime menu captures in $tui_session"
+}
+
 drive_task_subagent_tree() {
   command -v tmux >/dev/null 2>&1 || die "tmux is required for drive-task-subagent-tree"
   if ! tmux has-session -t "$tui_session" 2>/dev/null; then
@@ -1414,6 +1433,47 @@ verify_multiline_composer() {
   write_ux_validation "multiline-composer" "passed" "multiline composer capture verified"
   secret_leak_check
   echo "Verified multiline composer capture in $artifact_dir"
+}
+
+verify_runtime_menus() {
+  local status_capture="$artifact_dir/tui-capture-runtime-status.txt"
+  local model_capture="$artifact_dir/tui-capture-runtime-model.txt"
+  local mcp_capture="$artifact_dir/tui-capture-runtime-mcp.txt"
+  local transcript
+  transcript="$(first_existing_artifact "runtime menu AppUI transcript" \
+    "$artifact_dir/appui-transcript.jsonl" \
+    "$artifact_dir/m15-evidence/appui-transcript.jsonl")"
+
+  assert_capture_clean "$status_capture" "runtime-status"
+  assert_capture_clean "$model_capture" "runtime-model"
+  assert_capture_clean "$mcp_capture" "runtime-mcp"
+
+  for required_text in \
+    "Status" \
+    "Profile" \
+    "Model"
+  do
+    grep --fixed-strings -- "$required_text" "$status_capture" "$model_capture" >/dev/null 2>&1 \
+      || die "runtime menu captures missing required text: $required_text"
+  done
+  grep -Ei 'provider|route|configured|profile/llm' "$model_capture" >/dev/null 2>&1 \
+    || die "runtime model capture missing server-backed provider/model surface"
+  grep -E 'MCP|mcp/status/list|mcp/config/list|Configured MCP|No MCP|server' "$mcp_capture" >/dev/null 2>&1 \
+    || die "runtime MCP capture missing MCP status/config surface"
+
+  grep -E '"direction"[[:space:]]*:[[:space:]]*"(client_to_server|tx)".*"method"[[:space:]]*:[[:space:]]*"session/status/read"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "runtime menu transcript missing session/status/read request"
+  grep -E '"direction"[[:space:]]*:[[:space:]]*"(client_to_server|tx)".*"method"[[:space:]]*:[[:space:]]*"profile/llm/list"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "runtime menu transcript missing profile/llm/list request"
+  grep -E '"direction"[[:space:]]*:[[:space:]]*"(client_to_server|tx)".*"method"[[:space:]]*:[[:space:]]*"mcp/(status/list|config/list)"' \
+    "$transcript" >/dev/null 2>&1 \
+    || die "runtime menu transcript missing MCP status/config request"
+
+  write_ux_validation "runtime-menus" "passed" "runtime status/model/MCP menu captures verified"
+  secret_leak_check
+  echo "Verified runtime menu captures in $artifact_dir"
 }
 
 verify_task_subagent_tree() {
@@ -1884,6 +1944,40 @@ CAPTURE
     die "self-test expected incomplete multiline composer verification to fail"
   fi
 
+  mkdir -p "$tmp_root/runtime-menus"
+  cat > "$tmp_root/runtime-menus/tui-capture-runtime-status.txt" <<'CAPTURE'
+Status
+Profile coding
+Model server-only-model via local-provider
+CAPTURE
+  cat > "$tmp_root/runtime-menus/tui-capture-runtime-model.txt" <<'CAPTURE'
+Model
+Configured provider route from profile/llm/list
+server-only-model
+CAPTURE
+  cat > "$tmp_root/runtime-menus/tui-capture-runtime-mcp.txt" <<'CAPTURE'
+MCP
+mcp/status/list server fixture-stdio connected
+CAPTURE
+  cat > "$tmp_root/runtime-menus/appui-transcript.jsonl" <<'JSONL'
+{"direction":"client_to_server","frame":{"method":"session/status/read"}}
+{"direction":"client_to_server","frame":{"method":"profile/llm/list"}}
+{"direction":"client_to_server","frame":{"method":"mcp/status/list"}}
+JSONL
+  env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/runtime-menus" "$0" verify-runtime-menus >/dev/null
+
+  mkdir -p "$tmp_root/bad-runtime-menus"
+  cp "$tmp_root/runtime-menus/tui-capture-runtime-status.txt" "$tmp_root/bad-runtime-menus/"
+  cp "$tmp_root/runtime-menus/tui-capture-runtime-model.txt" "$tmp_root/bad-runtime-menus/"
+  cp "$tmp_root/runtime-menus/tui-capture-runtime-mcp.txt" "$tmp_root/bad-runtime-menus/"
+  cat > "$tmp_root/bad-runtime-menus/appui-transcript.jsonl" <<'JSONL'
+{"direction":"client_to_server","frame":{"method":"session/status/read"}}
+{"direction":"client_to_server","frame":{"method":"profile/llm/list"}}
+JSONL
+  if env "OCTOS_TUI_SOAK_ARTIFACT_DIR=$tmp_root/bad-runtime-menus" "$0" verify-runtime-menus >/dev/null 2>&1; then
+    die "self-test expected runtime menu MCP transcript verification to fail"
+  fi
+
   mkdir -p "$tmp_root/bad-approval-denial"
   cp "$tmp_root/approval-denial/tui-capture-approval-request.txt" "$tmp_root/bad-approval-denial/"
   cat > "$tmp_root/bad-approval-denial/tui-capture-approval-denied.txt" <<'CAPTURE'
@@ -2120,6 +2214,7 @@ case "${1:-help}" in
   drive-provider-missing) drive_provider_missing ;;
   drive-approval-denial) drive_approval_denial ;;
   drive-multiline-composer) drive_multiline_composer ;;
+  drive-runtime-menus) drive_runtime_menus ;;
   drive-task-subagent-tree) drive_task_subagent_tree ;;
   drive-task-subagent-reconnect) drive_task_subagent_reconnect ;;
   drive-dropped-completion-backpressure) drive_dropped_completion_backpressure ;;
@@ -2132,6 +2227,7 @@ case "${1:-help}" in
   verify-permissions) verify_permissions ;;
   verify-approval-denial) verify_approval_denial ;;
   verify-multiline-composer) verify_multiline_composer ;;
+  verify-runtime-menus) verify_runtime_menus ;;
   verify-task-subagent-tree) verify_task_subagent_tree ;;
   verify-task-subagent-reconnect) verify_task_subagent_reconnect ;;
   verify-autonomy-live) verify_autonomy_live ;;
