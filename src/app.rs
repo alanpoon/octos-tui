@@ -5,6 +5,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use octos_core::ui_protocol::approval_kinds;
@@ -274,7 +275,42 @@ fn composer_visible_input_rows(text: &str, terminal_width: u16, terminal_height:
 }
 
 fn visual_rows_for_text(text: &str, width: usize) -> usize {
-    text.width().max(1).div_ceil(width.max(1))
+    // Derived from the wrap so the rows reserved here always equal the rows
+    // actually drawn by render_composer (and the rows the cursor math counts).
+    wrap_composer_line(text, width).len()
+}
+
+/// Split one logical composer line into the visual sub-lines it occupies, each
+/// fitting within `width` display columns. The `Paragraph` that draws the
+/// composer has no soft-wrap, so without this the overflow of a long line is
+/// clipped at the pane edge and its reserved continuation row renders blank
+/// ("dark/invisible").
+///
+/// Packing is by grapheme cluster measured with `UnicodeWidthStr::width` (the
+/// same primitive `str::width()` uses), so a multi-codepoint glyph (CJK, emoji
+/// ZWJ/modifier/variation sequences) is never split across a row boundary, and
+/// the chunk count is the authoritative visual-row count (`visual_rows_for_text`
+/// delegates here) — keeping reserved height, rendered rows, and cursor row in
+/// agreement for every input. Always returns at least one (possibly empty)
+/// chunk so an empty logical line still occupies a row.
+fn wrap_composer_line(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_w = 0usize;
+    for grapheme in text.graphemes(true) {
+        let g_w = grapheme.width();
+        if current_w + g_w > width && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            current_w = 0;
+        }
+        current.push_str(grapheme);
+        current_w += g_w;
+    }
+    if !current.is_empty() || chunks.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 const CODE_BLOCK_LINE_LIMIT: usize = 120;
@@ -2835,17 +2871,22 @@ fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'s
         ])),
         ComposerPresentation::Inline(_) => {
             if let Some(view) = input_view.as_ref() {
-                for (index, line) in view.lines.iter().enumerate() {
-                    let prefix = if index == 0 { " › " } else { "   " };
-                    let prefix_style = if index == 0 {
-                        palette.selected().bg(palette.surface)
-                    } else {
-                        palette.muted().bg(palette.surface)
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(prefix, prefix_style),
-                        Span::styled(line.clone(), palette.text().bg(palette.surface)),
-                    ]));
+                let text_width = composer_text_width(area.width);
+                let mut first_row = true;
+                for line in view.lines.iter() {
+                    for chunk in wrap_composer_line(line, text_width) {
+                        let prefix = if first_row { " › " } else { "   " };
+                        let prefix_style = if first_row {
+                            palette.selected().bg(palette.surface)
+                        } else {
+                            palette.muted().bg(palette.surface)
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(prefix, prefix_style),
+                            Span::styled(chunk, palette.text().bg(palette.surface)),
+                        ]));
+                        first_row = false;
+                    }
                 }
             }
         }
@@ -3053,19 +3094,36 @@ fn tail_around_cursor(
     width: usize,
     max_rows: usize,
 ) -> VisibleCursorLine {
-    let max_width = width.saturating_mul(max_rows).max(1);
     let prefix = &text[..cursor.min(text.len())];
-    let prefix_width = prefix.width();
-    if text.width() <= max_width || prefix_width < max_width {
+    // Whole line fits the budget: show it unchanged. Measured via the same
+    // grapheme wrapping render uses, so this can't disagree with what is drawn.
+    if visual_rows_for_text(text, width) <= max_rows {
         return VisibleCursorLine {
             text: text.to_string(),
             before_cursor: prefix.to_string(),
         };
     }
-
-    let suffix_width = max_width.saturating_sub(3).max(1);
-    let before_cursor = suffix_by_display_width(prefix, suffix_width);
-    let text = format!("...{before_cursor}");
+    // Line is taller than the budget. If the cursor is still within the first
+    // `max_rows` rows, show the HEAD window (the first `max_rows` wrapped rows)
+    // — the cursor is already inside it — so render never emits more rows than
+    // the composer reserved (which would clip the footer).
+    let cursor_chunks = wrap_composer_line(prefix, width);
+    if cursor_chunks.len() <= max_rows {
+        let chunks = wrap_composer_line(text, width);
+        let head: String = chunks[..max_rows.min(chunks.len())].concat();
+        return VisibleCursorLine {
+            text: head,
+            before_cursor: prefix.to_string(),
+        };
+    }
+    // Cursor is past the budget: show the tail of `prefix` ending at the cursor.
+    // Keep the last `max_rows - 1` wrapped rows and reserve the first row for the
+    // "..." marker, so the window never exceeds `max_rows` rows even when
+    // double-width graphemes leave spare columns at a row boundary.
+    let keep = max_rows.saturating_sub(1).max(1);
+    let start = cursor_chunks.len().saturating_sub(keep);
+    let tail: String = cursor_chunks[start..].concat();
+    let text = format!("...{tail}");
     VisibleCursorLine {
         text: text.clone(),
         before_cursor: text,
@@ -3073,41 +3131,19 @@ fn tail_around_cursor(
 }
 
 fn cursor_row_for_text(text: &str, width: usize) -> usize {
-    let display_width = text.width();
-    if display_width == 0 {
-        0
-    } else {
-        (display_width - 1) / width.max(1)
-    }
+    // Row index of the cursor within its logical line, derived from the same
+    // grapheme wrapping render uses (wrap_composer_line) so the cursor sits on
+    // the row the text is actually drawn on.
+    wrap_composer_line(text, width).len().saturating_sub(1)
 }
 
 fn cursor_width_for_text(text: &str, width: usize) -> usize {
-    let display_width = text.width();
-    if display_width == 0 {
-        0
-    } else {
-        ((display_width - 1) % width.max(1)) + 1
-    }
-}
-
-fn suffix_by_display_width(text: &str, max_width: usize) -> String {
-    if max_width == 0 {
-        return String::new();
-    }
-    let mut width = 0usize;
-    let mut chars = Vec::new();
-    for ch in text.chars().rev() {
-        let ch_width = ch.width().unwrap_or(0);
-        if width > 0 && width.saturating_add(ch_width) > max_width {
-            break;
-        }
-        width = width.saturating_add(ch_width);
-        chars.push(ch);
-        if width >= max_width {
-            break;
-        }
-    }
-    chars.into_iter().rev().collect()
+    // Display column of the cursor within its row: the width of the last wrapped
+    // chunk (0 for empty input).
+    wrap_composer_line(text, width)
+        .last()
+        .map(|chunk| chunk.width())
+        .unwrap_or(0)
 }
 
 fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
@@ -5390,6 +5426,72 @@ mod tests {
         app.composer = "x".repeat(180);
 
         assert_eq!(composer_height_for_size(&app, 80, 42), 7);
+    }
+
+    #[test]
+    fn render_composer_draws_wrapped_tail_of_long_single_line() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // One logical line longer than the composer width: the tail must wrap
+        // onto a 2nd visible row, not be clipped (and the reserved row left dark).
+        app.composer = format!("HEAD{}TAIL", "x".repeat(160));
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let (buffer, _cursor) = rendered_buffer_and_cursor(&app, palette);
+        let rows = rendered_rows(&buffer);
+
+        let head_row = row_index_containing(&rows, "HEAD");
+        let tail_row = row_index_containing(&rows, "TAIL");
+        assert!(
+            tail_row > head_row,
+            "wrapped tail should render below the head (head={head_row}, tail={tail_row})"
+        );
+        // ...and it must be drawn in the visible text colour, not the surface bg.
+        let tail_style = style_for_text(&buffer, "TAIL").expect("tail rendered");
+        assert_eq!(
+            tail_style.fg,
+            Some(palette.text),
+            "wrapped tail must use the composer text colour, not be invisible"
+        );
+    }
+
+    #[test]
+    fn tail_around_cursor_caps_window_to_row_budget() {
+        let width = 10;
+        let max_rows = 3;
+        // A single logical line far taller than the budget.
+        let text = "x".repeat(100);
+
+        // Cursor at the very start: HEAD window, must not exceed the budget
+        // (render_composer wraps the returned text, so an over-long return clips
+        // the composer footer).
+        let head = tail_around_cursor(&text, 0, width, max_rows);
+        assert!(
+            visual_rows_for_text(&head.text, width) <= max_rows,
+            "head window must fit row budget, got {} rows",
+            visual_rows_for_text(&head.text, width)
+        );
+
+        // Cursor at the end: TAIL window, also within budget, marked truncated.
+        let tail = tail_around_cursor(&text, text.len(), width, max_rows);
+        assert!(
+            visual_rows_for_text(&tail.text, width) <= max_rows,
+            "tail window must fit row budget, got {} rows",
+            visual_rows_for_text(&tail.text, width)
+        );
+        assert!(tail.text.starts_with("..."), "tail window marks truncation");
     }
 
     #[test]
