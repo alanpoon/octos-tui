@@ -1826,6 +1826,21 @@ fn push_turn_activity_log_section(
     }
 }
 
+/// "Tentacle pulse" octopus spinner frames (braille blob, all single-width).
+const SPINNER_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+
+/// Current spinner frame, advancing ~every 120ms off a process-lifetime clock
+/// (independent of any turn timer, so it keeps animating while background
+/// sub-agents run after the parent turn has finished). The event loop redraws
+/// every ~25ms, so this reads as smooth motion.
+fn spinner_frame() -> &'static str {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
+    SPINNER_FRAMES[(elapsed / 120) as usize % SPINNER_FRAMES.len()]
+}
+
 fn push_agent_task_group(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
@@ -1851,7 +1866,8 @@ fn push_agent_task_group(
     // separately in `session.tasks`). Treat the turn as still orchestrating
     // while any of its sub-agents are live, so the chip never says "completed"
     // with work outstanding.
-    let title = if active > 0 || active_subagents > 0 {
+    let in_progress = active > 0 || active_subagents > 0;
+    let title = if in_progress {
         "Orchestrating..."
     } else if failed > 0 {
         "Agent task finished with errors"
@@ -1875,8 +1891,12 @@ fn push_agent_task_group(
         metadata.push(format!("turn {}", short_id(&turn_id.0.to_string())));
     }
 
+    // While orchestrating, show the animated octopus "tentacle pulse" spinner;
+    // a settled chip keeps the static bullet. Both are 1 col wide so the title
+    // stays aligned whether running or done.
+    let icon = if in_progress { spinner_frame() } else { "•" };
     let spans = vec![
-        Span::styled("• ", palette.selected()),
+        Span::styled(format!("{icon} "), palette.selected()),
         Span::styled(title, palette.title().add_modifier(Modifier::BOLD)),
         Span::styled(format!(" ({})", metadata.join(" · ")), palette.muted()),
     ];
