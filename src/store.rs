@@ -5369,6 +5369,12 @@ impl Store {
         {
             task.state = event.state;
             task.runtime_detail = event.runtime_detail;
+            // C5: keep the originating turn so the chip can attribute this task
+            // per-turn. Never clobber a known turn with a later turn-less update
+            // (synthetic / replay emitters send `turn_id: None`).
+            if event.turn_id.is_some() {
+                task.turn_id = event.turn_id;
+            }
         } else {
             session.tasks.push(TaskView {
                 id: event.task_id,
@@ -5376,6 +5382,7 @@ impl Store {
                 state: event.state,
                 runtime_detail: event.runtime_detail,
                 output_tail: String::new(),
+                turn_id: event.turn_id,
             });
         }
     }
@@ -6569,6 +6576,7 @@ mod tests {
                 state: TaskRuntimeState::Running,
                 runtime_detail: None,
                 output_tail: String::new(),
+                turn_id: None,
             }],
             live_reply: None,
         };

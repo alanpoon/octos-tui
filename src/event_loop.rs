@@ -1615,6 +1615,7 @@ mod tests {
             state: TaskRuntimeState::Running,
             runtime_detail: Some("running tests".into()),
             output_tail: "test output".into(),
+            turn_id: None,
         });
         store.state.sessions[0].tasks.push(TaskView {
             id: TaskId::new(),
@@ -1622,6 +1623,7 @@ mod tests {
             state: TaskRuntimeState::Completed,
             runtime_detail: None,
             output_tail: String::new(),
+            turn_id: None,
         });
 
         assert!(matches!(
@@ -1773,6 +1775,7 @@ mod tests {
             state: TaskRuntimeState::Running,
             runtime_detail: Some(format!("preview_id={}", preview_id.0)),
             output_tail: String::new(),
+            turn_id: None,
         });
 
         let action = handle_key(&mut store, key(KeyCode::Char('d')));

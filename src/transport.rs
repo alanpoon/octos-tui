@@ -3016,6 +3016,7 @@ impl MockAppUiBackend {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            turn_id: Some(turn_id.clone()),
         }));
         self.enqueue_protocol(UiNotification::TaskOutputDelta(TaskOutputDeltaEvent {
             session_id: session_id.clone(),
@@ -3052,6 +3053,7 @@ impl MockAppUiBackend {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            turn_id: Some(turn_id.clone()),
         }));
         self.enqueue_protocol(UiNotification::Warning(WarningEvent {
             session_id: session_id.clone(),
@@ -3102,6 +3104,7 @@ impl AppUiBackend for MockAppUiBackend {
                 state: TaskRuntimeState::Running,
                 runtime_detail: Some("Spec + types drafted in octos-core".into()),
                 output_tail: "bootstrap: seeded mock session\n".into(),
+                turn_id: None,
             }],
             live_reply: None,
         };
@@ -3122,6 +3125,7 @@ impl AppUiBackend for MockAppUiBackend {
                 state: TaskRuntimeState::Completed,
                 runtime_detail: Some("Checklist written in docs/".into()),
                 output_tail: "review: m8 gate recorded\n".into(),
+                turn_id: None,
             }],
             live_reply: None,
         };

@@ -2313,24 +2313,51 @@ fn active_background_tasks(app: &AppState) -> usize {
         .unwrap_or(0)
 }
 
-/// Running sub-agents to attribute to an agent-task chip. Attributed to the
-/// chip whose turn is the active turn OR the latest turn — background sub-agents
-/// outlive the parent turn (it shows "done" while they keep running), so we must
-/// still surface them on that turn's chip. Older turns' chips get 0, so a
-/// completed earlier turn doesn't flip back to "Orchestrating".
+/// Running sub-agents to attribute to an agent-task chip. Each running task is
+/// attributed to the chip for its OWN originating turn (`task.turn_id`, stamped
+/// by the server per C1 step 4), so two turns can no longer both claim the same
+/// global sub-agent count — the "two Orchestrating chips" bug (C5). Background
+/// sub-agents outlive the parent turn (it shows "done" while they keep running),
+/// and that still works: their `turn_id` keeps pointing at the turn that spawned
+/// them, so that — and only that — chip stays "Orchestrating".
+///
+/// Tasks the server couldn't stamp with a turn (legacy daemons, `session/open`
+/// replay, synthetic emitters → `turn_id == None`) fall back to a SINGLE current
+/// chip — the active (live) turn if one exists, else the latest activity-log
+/// turn — so they still surface without being double-counted across chips.
 fn running_subagents_for_chip(
     app: &AppState,
     turn_id: Option<&octos_core::ui_protocol::TurnId>,
 ) -> usize {
-    let is_current_turn = turn_id.is_some_and(|chip| {
-        app.active_turn().map(|(_, t)| t) == Some(chip)
-            || app.turn_activity_logs.last().map(|log| &log.turn_id) == Some(chip)
+    let Some(chip_turn) = turn_id else {
+        return 0;
+    };
+    let Some(session) = app.active_session() else {
+        return 0;
+    };
+    // The one chip that owns turn-less tasks: prefer the active (live) turn; if
+    // the turn already finished, this session's latest activity-log turn. At most
+    // one chip is ever "current", so unattributed tasks are counted exactly once.
+    // Scope the log lookup to the active session (codex P2): `turn_activity_logs`
+    // is cross-session, and the tasks we count belong to `session`, so a newer
+    // log in a *different* session must not steal this session's fallback chip.
+    let current_turn = app.active_turn().map(|(_, t)| t).or_else(|| {
+        app.turn_activity_logs
+            .iter()
+            .rev()
+            .find(|log| log.session_id == session.id)
+            .map(|log| &log.turn_id)
     });
-    if is_current_turn {
-        active_background_tasks(app)
-    } else {
-        0
-    }
+    let owns_unattributed = current_turn == Some(chip_turn);
+    session
+        .tasks
+        .iter()
+        .filter(|task| matches!(task_state_label(task.state), "pending" | "running"))
+        .filter(|task| match task.turn_id.as_ref() {
+            Some(task_turn) => task_turn == chip_turn,
+            None => owns_unattributed,
+        })
+        .count()
 }
 
 fn render_plan(app: &AppState, palette: Palette) -> Paragraph<'static> {
@@ -3908,6 +3935,7 @@ mod tests {
                     state: TaskRuntimeState::Running,
                     runtime_detail: None,
                     output_tail: String::new(),
+                    turn_id: None,
                 }],
                 live_reply: None,
             }],
@@ -3934,6 +3962,7 @@ mod tests {
                     state: TaskRuntimeState::Running,
                     runtime_detail: None,
                     output_tail: "artifact log line\n".into(),
+                    turn_id: None,
                 }],
                 live_reply: None,
             }],
@@ -4073,6 +4102,7 @@ mod tests {
                     state: TaskRuntimeState::Running,
                     runtime_detail: None,
                     output_tail: "artifact log line\n".into(),
+                    turn_id: None,
                 }],
                 live_reply: None,
             }],
@@ -4635,6 +4665,7 @@ mod tests {
                     state: TaskRuntimeState::Running,
                     runtime_detail: None,
                     output_tail: String::new(),
+                    turn_id: None,
                 }],
                 live_reply: Some(crate::model::LiveReply {
                     turn_id: TurnId::new(),
@@ -5803,6 +5834,7 @@ mod tests {
                         state: TaskRuntimeState::Running,
                         runtime_detail: None,
                         output_tail: String::new(),
+                        turn_id: None,
                     },
                     crate::model::TaskView {
                         id: octos_core::TaskId::new(),
@@ -5810,6 +5842,7 @@ mod tests {
                         state: TaskRuntimeState::Running,
                         runtime_detail: None,
                         output_tail: String::new(),
+                        turn_id: None,
                     },
                 ],
                 // Parent turn has FINISHED (no live_reply) but the background
@@ -5850,6 +5883,143 @@ mod tests {
             !text.contains("Agent task completed"),
             "chip must NOT report completed while sub-agents run: {text:?}"
         );
+    }
+
+    #[test]
+    fn subagents_attributed_per_turn_not_double_counted() {
+        // C5 regression: two turns each spawn sub-agents. Before C1's `turn_id`
+        // landed on the task wire, `running_subagents_for_chip` returned the
+        // GLOBAL active count for every chip matching active-OR-latest, so both
+        // turns' chips lit up "Orchestrating" with the same total ("two chips").
+        // Now each chip counts ONLY its own turn's running tasks; turn-less tasks
+        // (server couldn't stamp them) fall back to a SINGLE current chip.
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let running = |title: &str, turn: Option<TurnId>| crate::model::TaskView {
+            id: octos_core::TaskId::new(),
+            title: title.into(),
+            state: TaskRuntimeState::Running,
+            runtime_detail: None,
+            output_tail: String::new(),
+            turn_id: turn,
+        };
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("two turns of agents")],
+                tasks: vec![
+                    running("a1", Some(turn_a.clone())),
+                    running("b1", Some(turn_b.clone())),
+                    running("b2", Some(turn_b.clone())),
+                    // Turn-less (legacy / replay / synthetic) → single current chip.
+                    running("orphan", None),
+                ],
+                // turn_a is the live/active turn.
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_a.clone(),
+                    text: String::new(),
+                }),
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: turn_b.clone(),
+            request: Some("earlier turn".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "spawn", "complete")
+                    .with_turn(turn_b.clone())
+                    .with_success(true),
+            ],
+        });
+
+        // turn_a (active) chip: its own 1 running task + the orphan (None → the
+        // single current chip, which is the active turn).
+        assert_eq!(running_subagents_for_chip(&app, Some(&turn_a)), 2);
+        // turn_b chip: its own 2 running tasks — NOT the global 4, NOT the orphan.
+        assert_eq!(running_subagents_for_chip(&app, Some(&turn_b)), 2);
+        // The pre-C5 bug would have returned the global active count (4) for BOTH.
+        assert_ne!(
+            running_subagents_for_chip(&app, Some(&turn_a)),
+            running_subagents_for_chip(&app, Some(&turn_b)) + 2,
+            "chips must not both report the global total"
+        );
+    }
+
+    #[test]
+    fn turnless_tasks_fall_back_to_active_session_not_a_newer_other_session_log() {
+        // codex P2: the None-fallback chip is "this session's latest turn", not
+        // the globally-latest log. A *different* session having the newest
+        // activity log must not steal the active session's turn-less task.
+        let turn_active = TurnId::new();
+        let turn_other = TurnId::new();
+        let active_id = SessionKey("local:active".into());
+        let other_id = SessionKey("local:other".into());
+        let orphan = crate::model::TaskView {
+            id: octos_core::TaskId::new(),
+            title: "orphan".into(),
+            state: TaskRuntimeState::Running,
+            runtime_detail: None,
+            output_tail: String::new(),
+            turn_id: None,
+        };
+        // Active session (index 0) has the turn-less task but NO live_reply and
+        // NO log; the other session owns the globally-newest log.
+        let mut app = AppState::new(
+            vec![
+                SessionView {
+                    id: active_id.clone(),
+                    title: "active".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::user("active session")],
+                    tasks: vec![orphan],
+                    live_reply: None,
+                },
+                SessionView {
+                    id: other_id.clone(),
+                    title: "other".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::user("other session")],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+            ],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // Active session's log first, then a NEWER log for the OTHER session.
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id: active_id,
+            turn_id: turn_active.clone(),
+            request: Some("active turn".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "spawn", "complete").with_success(true),
+            ],
+        });
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id: other_id,
+            turn_id: turn_other.clone(),
+            request: Some("other turn".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "spawn", "complete").with_success(true),
+            ],
+        });
+
+        // The orphan attaches to the active session's own latest turn…
+        assert_eq!(running_subagents_for_chip(&app, Some(&turn_active)), 1);
+        // …and NOT to the other (globally-newest) session's turn.
+        assert_eq!(running_subagents_for_chip(&app, Some(&turn_other)), 0);
     }
 
     #[test]

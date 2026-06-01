@@ -12,7 +12,7 @@ name = "octos-tui"
 path = "src/main.rs"
 
 [dependencies]
-octos-core = { path = "../octos/crates/octos-core" }
+octos-core = { path = "../octos-combined/crates/octos-core" }
 clap = { version = "4", features = ["derive"] }
 eyre = "0.6"
 color-eyre = "0.6"

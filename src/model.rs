@@ -5883,6 +5883,7 @@ mod tests {
                     state: TaskRuntimeState::Running,
                     runtime_detail: Some(format!("pending preview_id: {}", preview_id.0)),
                     output_tail: "bootstrap: seeded mock session\n".into(),
+                    turn_id: None,
                 }],
                 live_reply: None,
             }],
@@ -6095,6 +6096,7 @@ mod tests {
             state: TaskRuntimeState::Running,
             runtime_detail: Some(format!("pending preview_id: {}", preview_id.0)),
             output_tail: String::new(),
+            turn_id: None,
         });
 
         assert_eq!(state.active_diff_preview_id(), Some(preview_id));
