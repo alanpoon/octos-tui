@@ -4154,7 +4154,12 @@ impl Store {
         if let Some(messages) = projected_messages {
             if let Some(session) = self.find_session_mut(&session_id) {
                 session.messages = messages;
-                session.live_reply = None;
+                // codex P1: do NOT clear `live_reply` here. The hydrate result
+                // is COMMITTED history only; `live_reply` holds the turn that is
+                // still streaming. On a mid-turn reconnect, clearing it silently
+                // dropped the rest of that turn's deltas (the turn froze). Keep
+                // it — subsequent deltas keep appending and `TurnCompleted` still
+                // commits it normally.
             } else {
                 self.state.sessions.push(SessionView {
                     id: session_id.clone(),
@@ -13017,6 +13022,54 @@ mod tests {
             !hydrated_row_is_displayable(&row("assistant", "   ")),
             "tool-call-only assistant rows (empty text) are not bubbles"
         );
+    }
+
+    #[test]
+    fn hydrate_preserves_an_in_flight_live_reply() {
+        use crate::client_event::ClientEvent;
+        // codex P1: a hydrate that lands MID-TURN must not drop the streaming
+        // turn. `live_reply` (the in-flight, not-yet-committed turn) must survive
+        // so its remaining deltas keep appending instead of freezing.
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "streaming so far");
+        let session_id = store.state.sessions[0].id.clone();
+
+        let result = SessionHydrateResult {
+            session_id: session_id.clone(),
+            cursor: octos_core::ui_protocol::UiCursor {
+                stream: session_id.0.clone(),
+                seq: 1,
+            },
+            context: None,
+            context_state: None,
+            messages: Some(vec![HydratedMessage {
+                seq: 1,
+                role: "user".into(),
+                content: "earlier committed prompt".into(),
+                turn_id: None,
+                thread_id: None,
+                client_message_id: None,
+                persisted_at: chrono::Utc::now(),
+                message_id: None,
+                source: None,
+                media: Vec::new(),
+            }]),
+            threads: None,
+            turns: None,
+            pending_approvals: None,
+            replayed_envelopes: None,
+        };
+        store.apply_client_event(ClientEvent::SessionHydrate(result));
+
+        let live_reply = store.state.sessions[0]
+            .live_reply
+            .as_ref()
+            .expect("in-flight live_reply must survive a hydrate");
+        assert_eq!(
+            live_reply.turn_id, turn_id,
+            "the same streaming turn is preserved across hydrate"
+        );
+        assert_eq!(live_reply.text, "streaming so far");
     }
 
     #[test]

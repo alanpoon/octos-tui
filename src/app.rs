@@ -1807,18 +1807,31 @@ fn flow_activity_items(app: &AppState) -> Vec<&ActivityItem> {
             // When no turn is active, turn-less running sub-agent progress is
             // folded into the orchestrating turn's chip (as children) — don't
             // also render it here as a separate turn-less "Orchestrating" chip.
-            None => item.turn_id.is_none() && !is_subagent_progress(item),
+            None => item.turn_id.is_none() && !is_subagent_progress(app, item),
         })
         .collect()
 }
 
 /// A turn-less running sub-agent progress row (an `AgentUpdated` / spawn-complete
-/// `Progress` item with no originating turn). These are surfaced under the
-/// orchestrating turn's chip via `running_subagent_titles_for_chip`, so they must
-/// not also form their own phantom turn-less "Orchestrating" chip (mini5 soak:
-/// the "two Orchestrating chips" the user saw for one parallel-spawn turn).
-fn is_subagent_progress(item: &ActivityItem) -> bool {
-    item.turn_id.is_none() && item.kind == ActivityKind::Progress && is_running_activity(item)
+/// `Progress` item with no originating turn) that is ALSO represented by a
+/// running sub-agent task. Such rows are surfaced under the orchestrating turn's
+/// chip via `running_subagent_titles_for_chip`, so they must not also form their
+/// own phantom turn-less "Orchestrating" chip (mini5 soak: the "two Orchestrating
+/// chips" for one parallel-spawn turn).
+///
+/// codex P2: we only suppress when a matching running TASK exists. A turn-less
+/// progress row with no matching task has nothing to fold into, so we keep it
+/// visible in the flow rather than hiding it entirely (orphaned-from-view).
+fn is_subagent_progress(app: &AppState, item: &ActivityItem) -> bool {
+    if item.turn_id.is_some() || item.kind != ActivityKind::Progress || !is_running_activity(item) {
+        return false;
+    }
+    app.active_session().is_some_and(|session| {
+        session.tasks.iter().any(|task| {
+            matches!(task_state_label(task.state), "pending" | "running")
+                && task.title == item.title
+        })
+    })
 }
 
 fn push_turn_activity_log_section(
@@ -6160,6 +6173,45 @@ mod tests {
         assert!(
             text.contains("openclaw-deep-analysis") && text.contains("hermes-deep-analysis"),
             "the running sub-agents are folded in as children: {text:?}"
+        );
+    }
+
+    #[test]
+    fn subagent_progress_suppressed_only_when_a_matching_task_exists() {
+        // codex P2: a turn-less running progress row is folded (suppressed from
+        // the flow) ONLY if a running sub-agent task with the same title exists —
+        // otherwise it has nothing to fold into and must stay visible, not vanish.
+        let turn = TurnId::new();
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("x")],
+                tasks: vec![crate::model::TaskView {
+                    id: octos_core::TaskId::new(),
+                    title: "alpha".into(),
+                    state: TaskRuntimeState::Running,
+                    runtime_detail: None,
+                    output_tail: String::new(),
+                    turn_id: Some(turn),
+                }],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let matched = ActivityItem::new(ActivityKind::Progress, "alpha", "running");
+        let orphan = ActivityItem::new(ActivityKind::Progress, "ghost", "running");
+        assert!(
+            is_subagent_progress(&app, &matched),
+            "a progress row with a matching running task folds in → suppressed"
+        );
+        assert!(
+            !is_subagent_progress(&app, &orphan),
+            "a progress row with NO matching task must stay visible, not vanish"
         );
     }
 
