@@ -3001,75 +3001,9 @@ fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'s
         Some("Enter send | Tab inspector"),
     )
     .border_style(palette.border());
-    // Whole-job indicator on the top border (right-aligned) while the active
-    // session is orchestrating — stays up across the sub-agent-complete →
-    // master-re-entry gap because the server keeps `active` true while a
-    // continuation is pending.
-    let block = match orchestration_indicator(app) {
-        Some(text) => block.title_top(Line::from(text).right_aligned()),
-        None => block,
-    };
     Paragraph::new(Text::from(lines))
         .style(Style::default().fg(palette.text).bg(palette.surface))
         .block(block)
-}
-
-/// Whole-job indicator string for the composer top border: spinner + phase +
-/// running-agent count while the active session is orchestrating. `None` hides
-/// it. (Cumulative tokens/cost are a planned fast-follow.)
-fn orchestration_indicator(app: &AppState) -> Option<String> {
-    let session = app.active_session()?;
-    let status = app.orchestration.get(&session.id)?;
-    if !status.active {
-        return None;
-    }
-    let phase = match status.phase.as_deref() {
-        Some("orchestrating") => "Orchestrating",
-        Some("re-entering") => "Re-entering",
-        Some("working") => "Working",
-        Some(other) if !other.is_empty() => other,
-        _ => "Working",
-    };
-    let agents = if status.running_agents > 0 {
-        format!(
-            " · {} agent{}",
-            status.running_agents,
-            if status.running_agents == 1 { "" } else { "s" }
-        )
-    } else {
-        String::new()
-    };
-    // In/out tokens + cumulative session cost (from token_cost progress).
-    // `↑` = input/prompt tokens, `↓` = output tokens.
-    let mut usage = String::new();
-    if let Some((input, output, cost)) = app.session_usage.get(&session.id) {
-        if input.is_some() || output.is_some() {
-            usage.push_str(&format!(
-                " · ↑{} ↓{}",
-                humanize_token_count(input.unwrap_or(0)),
-                humanize_token_count(output.unwrap_or(0)),
-            ));
-        }
-        if let Some(cost) = cost.filter(|c| *c > 0.0) {
-            usage.push_str(&format!(" · ${cost:.4}"));
-        }
-    }
-    Some(format!(
-        " {} {}{}{} ",
-        spinner_frame(),
-        phase,
-        agents,
-        usage
-    ))
-}
-
-/// Compact token count for the job indicator: `34211` -> `34.2k`.
-fn humanize_token_count(tokens: u64) -> String {
-    if tokens >= 1000 {
-        format!("{:.1}k", tokens as f64 / 1000.0)
-    } else {
-        tokens.to_string()
-    }
 }
 
 fn set_composer_cursor(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -4066,78 +4000,6 @@ mod tests {
         );
         app.diff_preview.apply_result(result);
         app
-    }
-
-    #[test]
-    fn orchestration_indicator_reflects_active_whole_job_status() {
-        use octos_core::ui_protocol::SessionOrchestrationEvent;
-        let session_id = SessionKey("local:test".into());
-        let mut app = AppState::new(
-            vec![SessionView {
-                id: session_id.clone(),
-                title: "test".into(),
-                profile_id: Some("coding".into()),
-                messages: vec![],
-                tasks: vec![],
-                live_reply: None,
-            }],
-            0,
-            "ready".into(),
-            None,
-            false,
-        );
-        // No status → no indicator.
-        assert!(orchestration_indicator(&app).is_none());
-
-        // Active with 2 running sub-agents → spinner + phase + count.
-        app.orchestration.insert(
-            session_id.clone(),
-            SessionOrchestrationEvent {
-                session_id: session_id.clone(),
-                active: true,
-                running_agents: 2,
-                pending_continuations: 0,
-                phase: Some("orchestrating".into()),
-            },
-        );
-        // In/out tokens + cost (from token_cost progress) is folded in.
-        app.session_usage
-            .insert(session_id.clone(), (Some(34_211), Some(374), Some(0.0123)));
-        let indicator =
-            orchestration_indicator(&app).expect("active orchestration shows an indicator");
-        assert!(indicator.contains("Orchestrating"), "{indicator}");
-        assert!(indicator.contains("2 agents"), "{indicator}");
-        assert!(indicator.contains("↑34.2k"), "{indicator}");
-        assert!(indicator.contains("↓374"), "{indicator}");
-        assert!(indicator.contains("$0.0123"), "{indicator}");
-
-        // The re-entry gap (no running agents, a continuation pending) STILL
-        // shows the indicator — the whole point: it no longer reads as "done".
-        app.orchestration.insert(
-            session_id.clone(),
-            SessionOrchestrationEvent {
-                session_id: session_id.clone(),
-                active: true,
-                running_agents: 0,
-                pending_continuations: 1,
-                phase: Some("re-entering".into()),
-            },
-        );
-        let reentry = orchestration_indicator(&app).expect("re-entering still shows the indicator");
-        assert!(reentry.contains("Re-entering"), "{reentry}");
-
-        // Fully idle → hidden.
-        app.orchestration.insert(
-            session_id.clone(),
-            SessionOrchestrationEvent {
-                session_id: session_id.clone(),
-                active: false,
-                running_agents: 0,
-                pending_continuations: 0,
-                phase: None,
-            },
-        );
-        assert!(orchestration_indicator(&app).is_none());
     }
 
     #[test]
