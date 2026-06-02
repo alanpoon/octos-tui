@@ -5079,6 +5079,19 @@ impl Store {
                 if event.compaction.error.is_none() {
                     let before = event.compaction.token_estimate_before;
                     let after = event.compaction.token_estimate_after.unwrap_or(before);
+                    // codex P2: stamp the notice with the session's in-flight
+                    // turn. Compaction is reported DURING the turn that
+                    // triggered it (after `TurnStarted` set `live_reply`), and
+                    // the renderer suppresses turnless activities while a turn
+                    // is active + `capture_completed_turn_activity` only
+                    // archives turn-scoped items. A turnless notice would be
+                    // hidden exactly when it fires and never persisted; attach
+                    // it to the live turn so it shows and is archived with the
+                    // turn. (Falls back to turnless only if no turn is live —
+                    // e.g. the connection-independent drain.)
+                    let turn_id = self.find_session_mut(&session_id).and_then(|session| {
+                        session.live_reply.as_ref().map(|live| live.turn_id.clone())
+                    });
                     let mut notice = ActivityItem::new(
                         ActivityKind::Progress,
                         "context compacted",
@@ -5095,6 +5108,9 @@ impl Store {
                         event.compaction.trigger,
                     ));
                     notice.success = Some(true);
+                    if let Some(turn_id) = turn_id {
+                        notice = notice.with_turn(turn_id);
+                    }
                     self.state.push_activity(notice);
                 }
                 None
@@ -11459,13 +11475,20 @@ mod tests {
         };
 
         let session_id = SessionKey("local:test".into());
+        // Compaction is reported DURING a turn: give the session a live reply
+        // so the notice must be stamped with that turn (codex P2) — otherwise
+        // a turnless notice is suppressed mid-turn and never archived.
+        let turn_id = TurnId::new();
         let session = SessionView {
             id: session_id.clone(),
             title: "test".into(),
             profile_id: None,
             messages: vec![],
             tasks: vec![],
-            live_reply: None,
+            live_reply: Some(crate::model::LiveReply {
+                turn_id: turn_id.clone(),
+                text: String::new(),
+            }),
         };
         let mut store = Store {
             state: AppState::new(vec![session], 0, "ready".into(), None, false),
@@ -11537,6 +11560,13 @@ mod tests {
             "detail should show dropped count + trigger: {detail}"
         );
         assert_eq!(notice.success, Some(true));
+        // codex P2: stamped with the in-flight turn so the renderer shows it
+        // mid-turn and `capture_completed_turn_activity` archives it.
+        assert_eq!(
+            notice.turn_id.as_ref(),
+            Some(&turn_id),
+            "compaction notice must be stamped with the session's live turn"
+        );
     }
 
     /// M16-G2 wiring guard: `context/normalization_reported` events
