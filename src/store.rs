@@ -104,6 +104,16 @@ fn compact_first_line(value: &str, max_chars: usize) -> String {
     out
 }
 
+/// Compact token-count for the compaction activity notice: `31200` -> `31.2k`,
+/// small counts stay verbatim.
+fn humanize_token_count(tokens: usize) -> String {
+    if tokens >= 1000 {
+        format!("{:.1}k", tokens as f64 / 1000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
 fn push_unique_summary(values: &mut Vec<String>, value: String) {
     if value.is_empty() || values.iter().any(|existing| existing == &value) {
         return;
@@ -5059,6 +5069,34 @@ impl Store {
                     .apply_compaction(state, compaction);
                 self.state.status =
                     format!("Context compaction {compaction_id}: {compaction_status}");
+                // Codex-style surface: also leave a PERSISTENT activity row so
+                // the user actually sees that context was compacted. The
+                // `status` line above is a shared single-line string that the
+                // per-turn `context/normalization_reported` (and the next user
+                // action) immediately overwrites, so on its own it is
+                // effectively invisible. A successful compaction is an
+                // infrequent, notable event worth a durable notice.
+                if event.compaction.error.is_none() {
+                    let before = event.compaction.token_estimate_before;
+                    let after = event.compaction.token_estimate_after.unwrap_or(before);
+                    let mut notice = ActivityItem::new(
+                        ActivityKind::Progress,
+                        "context compacted",
+                        format!(
+                            "{} → {} tokens",
+                            humanize_token_count(before),
+                            humanize_token_count(after)
+                        ),
+                    );
+                    notice.detail = Some(format!(
+                        "kept {} message(s), dropped {} (trigger: {})",
+                        event.compaction.retained_count,
+                        event.compaction.dropped_count,
+                        event.compaction.trigger,
+                    ));
+                    notice.success = Some(true);
+                    self.state.push_activity(notice);
+                }
                 None
             }
             UiNotification::ContextNormalizationReported(event) => {
@@ -11407,6 +11445,98 @@ mod tests {
             "{}",
             store.state.status
         );
+    }
+
+    /// Codex-style surface (mini5 soak follow-up): a real context compaction
+    /// must leave a PERSISTENT, visible activity row — not just the shared
+    /// one-line `status` string that the per-turn
+    /// `context/normalization_reported` (and the next user action) immediately
+    /// overwrites — so the user actually sees that the context was compacted.
+    #[test]
+    fn context_compaction_pushes_persistent_activity_notice() {
+        use octos_core::ui_protocol::{
+            ContextCompactionCompletedEvent, UiContextCompactionRecord, UiContextState,
+        };
+
+        let session_id = SessionKey("local:test".into());
+        let session = SessionView {
+            id: session_id.clone(),
+            title: "test".into(),
+            profile_id: None,
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        let mut store = Store {
+            state: AppState::new(vec![session], 0, "ready".into(), None, false),
+        };
+
+        assert!(store.state.activity.is_empty());
+
+        store.apply_event(AppUiEvent::Protocol(
+            UiNotification::ContextCompactionCompleted(ContextCompactionCompletedEvent {
+                session_id: session_id.clone(),
+                context_state: UiContextState {
+                    session_id: session_id.clone(),
+                    thread_id: None,
+                    generation: 4,
+                    transcript_hash: "abc123".into(),
+                    item_count: 42,
+                    token_estimate: 9100,
+                    recovery_state: "healthy".into(),
+                    last_checkpoint_id: None,
+                    last_compaction_id: Some("comp-001".into()),
+                },
+                compaction: UiContextCompactionRecord {
+                    compaction_id: "comp-001".into(),
+                    checkpoint_id: "chk-001".into(),
+                    status: "applied".into(),
+                    policy_id: "default".into(),
+                    trigger: "token_budget".into(),
+                    input_generation: 3,
+                    output_generation: Some(4),
+                    input_transcript_hash: "input-h".into(),
+                    replacement_transcript_hash: Some("abc123".into()),
+                    installed_transcript_hash: Some("abc123".into()),
+                    input_item_count: 130,
+                    retained_count: 42,
+                    dropped_count: 88,
+                    summary_item_id: Some("sum-1".into()),
+                    token_estimate_before: 31200,
+                    token_estimate_after: Some(9100),
+                    error: None,
+                },
+            }),
+        ));
+
+        let notice = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.title.eq_ignore_ascii_case("context compacted"))
+            .expect("a persistent compaction activity row must be pushed");
+        // Must read as a completed notice, not a perpetual spinner.
+        assert!(
+            !matches!(
+                notice.status.trim().to_ascii_lowercase().as_str(),
+                "running" | "active" | "pending" | "queued" | "streaming" | "in_progress"
+            ),
+            "compaction notice must not render as a running spinner: {}",
+            notice.status
+        );
+        // Surfaces the token reduction so the user sees what happened.
+        assert!(
+            notice.status.contains('→') || notice.status.to_ascii_lowercase().contains("token"),
+            "status should show the token delta: {}",
+            notice.status
+        );
+        // The detail line carries kept/dropped counts + the trigger.
+        let detail = notice.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("88") && detail.contains("token_budget"),
+            "detail should show dropped count + trigger: {detail}"
+        );
+        assert_eq!(notice.success, Some(true));
     }
 
     /// M16-G2 wiring guard: `context/normalization_reported` events
