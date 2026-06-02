@@ -3971,6 +3971,19 @@ impl Store {
                             error.code, error.message
                         )
                     };
+                } else if error.code == "frame_too_large" {
+                    // Recoverable pre-send rejection: the frame (e.g. a large
+                    // inline turn input or paste) exceeded the 1 MB UI-protocol
+                    // cap. The connection + session are fine — surface an
+                    // actionable message rather than a raw "Error [...]" and do
+                    // NOT wedge the session in Error (mini5: a 1.1 MB inline send
+                    // left the session stuck in Error, unrecoverable). The
+                    // local-create attribution above runs first so the wizard's
+                    // pending-clear is preserved.
+                    self.state.status = format!(
+                        "Message too large — {}. Shorten it or attach as a file.",
+                        error.message
+                    );
                 } else if is_client_synth_error {
                     // Surfaced for the user but does NOT touch the
                     // local-create pending state.
@@ -4003,7 +4016,13 @@ impl Store {
                     )
                     .with_detail("app-ui error"),
                 );
-                self.state.set_run_state_error(error.message);
+                if error.code == "frame_too_large" {
+                    // Recoverable — keep the session usable (idle) instead of
+                    // wedging it in Error on an oversized inline send.
+                    self.state.set_run_state_idle();
+                } else {
+                    self.state.set_run_state_error(error.message);
+                }
                 None
             }
         };
@@ -7648,6 +7667,40 @@ mod tests {
                 .is_none()
         );
         assert!(store.state.onboarding.local_profile_recovery.is_none());
+    }
+
+    /// A `frame_too_large` pre-send rejection (an oversized inline turn input
+    /// or paste over the 1 MB UI-protocol cap) must be RECOVERABLE: surface an
+    /// actionable message and keep the session usable, NOT wedge it in Error
+    /// (mini5: a 1.1 MB inline send left the session stuck in Error).
+    #[test]
+    fn frame_too_large_does_not_wedge_session_in_error() {
+        use octos_core::app_ui::AppUiError;
+
+        let mut store = store_with_empty_session();
+        store.state.set_run_state_in_progress();
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "frame_too_large".into(),
+            message: "UI protocol frame is 1106897 bytes; max is 1048576".into(),
+        }));
+
+        assert!(
+            !matches!(
+                store.state.run_state,
+                crate::model::SessionRunState::Error { .. }
+            ),
+            "frame_too_large must not wedge the session in Error, got {:?}",
+            store.state.run_state
+        );
+        assert!(
+            store
+                .state
+                .status
+                .to_ascii_lowercase()
+                .contains("too large"),
+            "status should be actionable: {}",
+            store.state.status
+        );
     }
 
     /// M22-B: a pre-send rejection (e.g. `frame_too_large`) for the
