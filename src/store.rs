@@ -6165,6 +6165,7 @@ fn hydrated_projection_messages(result: &SessionHydrateResult) -> Option<Vec<Mes
     let mut projections = rows
         .iter()
         .filter(|row| !hydrated_row_is_covered_by_envelope(row, envelopes, &envelope_message_ids))
+        .filter(|row| hydrated_row_is_displayable(row))
         .cloned()
         .map(HydratedProjection::Message)
         .collect::<Vec<_>>();
@@ -6184,6 +6185,21 @@ fn hydrated_projection_messages(result: &SessionHydrateResult) -> Option<Vec<Mes
             })
             .collect(),
     )
+}
+
+/// Whether a hydrated message row should render as a transcript bubble. The
+/// live transcript only commits user + assistant *answer* messages; the
+/// intermediate turn machinery — tool-result rows and tool-call-only assistant
+/// rows (empty text) — is surfaced as activity chips, not chat bubbles. Hydrate
+/// must match, otherwise a reconnect double-renders the turn (e.g. a tool's raw
+/// output bubble AND the assistant's formatted answer — the "repeat" bug seen on
+/// the mini5 soak: a tool turn went 2 live msgs -> 4 on reconnect).
+fn hydrated_row_is_displayable(row: &HydratedMessage) -> bool {
+    match row.role.as_str() {
+        "tool" => false,
+        "assistant" => !row.content.trim().is_empty(),
+        _ => true,
+    }
 }
 
 fn hydrated_row_is_covered_by_envelope(
@@ -12962,6 +12978,44 @@ mod tests {
                 .state
                 .status
                 .contains(&short_id(&turn_id.0.to_string()))
+        );
+    }
+
+    #[test]
+    fn hydrated_row_filter_drops_tool_and_empty_assistant_rows() {
+        // mini5 soak: hydrate must render only the chat bubbles the live
+        // transcript shows (user + assistant answers). Tool-result rows and
+        // tool-call-only assistant rows (empty text) are activity, not bubbles —
+        // rendering them double-shows a turn on reconnect (the "repeat" bug:
+        // a tool turn went 2 live msgs -> 4 on hydrate before this filter).
+        let now = chrono::Utc::now();
+        let row = |role: &str, content: &str| HydratedMessage {
+            seq: 1,
+            role: role.into(),
+            content: content.into(),
+            turn_id: None,
+            thread_id: None,
+            client_message_id: None,
+            persisted_at: now,
+            message_id: None,
+            source: None,
+            media: Vec::new(),
+        };
+        assert!(hydrated_row_is_displayable(&row(
+            "user",
+            "search beijing weather"
+        )));
+        assert!(hydrated_row_is_displayable(&row(
+            "assistant",
+            "Here's the forecast"
+        )));
+        assert!(
+            !hydrated_row_is_displayable(&row("tool", "Beijing — 7-day forecast ...")),
+            "tool rows surface as activity chips, not transcript bubbles"
+        );
+        assert!(
+            !hydrated_row_is_displayable(&row("assistant", "   ")),
+            "tool-call-only assistant rows (empty text) are not bubbles"
         );
     }
 
