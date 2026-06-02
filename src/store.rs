@@ -41,6 +41,7 @@ use crate::{
         SessionRuntimeStatus, SessionToolCatalog, SessionView, TaskView, ToolConfigDeleteParams,
         ToolConfigListParams, ToolConfigSetEnabledParams, ToolConfigTestParams,
         ToolConfigUpsertParams, complete_plan_steps_in_text, task_state_label,
+        terminal_task_state_from_agent_status,
     },
 };
 
@@ -3512,12 +3513,23 @@ impl Store {
         match event.result {
             AutonomyResult::AgentList(result) => {
                 let count = result.agents.len();
+                // Stuck-chip reconnect safety net: on session reopen the
+                // `agent/list` snapshot carries the authoritative terminal
+                // status for each background agent. Reconcile any stale
+                // running `session.tasks` entry against it so a chip that was
+                // pinned on "Orchestrating…" before the reconnect flips even
+                // if the live terminal `agent/updated` was missed while
+                // disconnected.
+                for agent in &result.agents {
+                    self.reconcile_task_from_agent_record(&result.session_id, agent);
+                }
                 self.state
                     .set_session_agents(&result.session_id, result.agents);
                 self.state.status = format!("Agent list refreshed: {count} agent(s)");
             }
             AutonomyResult::AgentStatus(result) => {
                 let agent_id = result.agent.agent_id.clone();
+                self.reconcile_task_from_agent_record(&result.session_id, &result.agent);
                 self.state
                     .upsert_session_agent(&result.session_id, result.agent);
                 self.state.status = format!("Agent {agent_id} status updated");
@@ -4952,6 +4964,17 @@ impl Store {
                 let status_label = event.agent.status.clone();
                 self.state
                     .upsert_session_agent(&event.session_id, event.agent.clone());
+                // Stuck-chip safety net: a spawn_only background task that
+                // outlives its spawning turn goes terminal only AFTER the
+                // per-turn task-progress channel was torn down, so the
+                // terminal `task/updated` never arrives and `session.tasks`
+                // stays "running" — pinning the chip on "Orchestrating…". The
+                // DURABLE terminal `agent/updated` (delivered via the ledger)
+                // carries `task_id` + a terminal status, so reconcile the
+                // matching task's state from the agent record. Only terminal
+                // statuses flip the task — a "running" record must never
+                // resurrect a task the client already saw go terminal.
+                self.reconcile_task_from_agent_record(&event.session_id, &event.agent);
                 self.state.push_activity(
                     ActivityItem::new(ActivityKind::Progress, title, status_label)
                         .with_detail(detail),
@@ -5475,6 +5498,37 @@ impl Store {
         );
         self.state.status = message;
         None
+    }
+
+    /// Reconcile a `session.tasks` entry's lifecycle state from a durable
+    /// `agent/updated` record. See the call site in the `AgentUpdated` arm for
+    /// why this exists (terminal flip for a task whose per-turn task-progress
+    /// channel was already gone). Only TERMINAL agent statuses flip a task that
+    /// is still pending/running — a non-terminal record never overwrites a task
+    /// the client already saw settle, and a record with no `task_id` is a no-op.
+    fn reconcile_task_from_agent_record(
+        &mut self,
+        session_id: &SessionKey,
+        agent: &octos_core::ui_protocol::UiAgentRecord,
+    ) {
+        let Some(terminal_state) = terminal_task_state_from_agent_status(&agent.status) else {
+            return;
+        };
+        let Some(task_id) = agent
+            .task_id
+            .as_deref()
+            .and_then(|id| id.parse::<TaskId>().ok())
+        else {
+            return;
+        };
+        let Some(session) = self.find_session_mut(session_id) else {
+            return;
+        };
+        if let Some(task) = session.tasks.iter_mut().find(|task| task.id == task_id) {
+            if matches!(task_state_label(task.state), "pending" | "running") {
+                task.state = terminal_state;
+            }
+        }
     }
 
     fn apply_task_update(&mut self, event: TaskUpdatedEvent) {
@@ -12808,6 +12862,83 @@ mod tests {
         assert_eq!(mirror.agents.len(), 1);
         assert_eq!(mirror.agents[0].agent_id, "ag-1");
         assert_eq!(mirror.agents[0].status, "running");
+    }
+
+    /// Stuck-chip safety net: a spawn_only background task that outlives its
+    /// spawning turn only goes terminal AFTER the per-turn task-progress
+    /// channel was torn down, so the terminal `task/updated` never reaches the
+    /// client and `session.tasks` stays "running" — pinning the chip on
+    /// "Orchestrating…". The DURABLE terminal `agent/updated` (which now does
+    /// reach the client via the ledger) carries `task_id` + a terminal
+    /// `status`; the store reconciles the matching task to its terminal state
+    /// so the chip flips. This pins that reconcile.
+    #[test]
+    fn terminal_agent_update_reconciles_stuck_running_task() {
+        use octos_core::ui_protocol::{AgentUpdatedEvent, TaskRuntimeState, UiAgentRecord};
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        let task_id: TaskId = "01900000-0000-7000-8000-0000000000fc"
+            .parse()
+            .expect("valid task id");
+
+        // Seed a running spawn_only task — the chip currently reads this as
+        // "running" and stays on "Orchestrating…".
+        if let Some(session) = store.find_session_mut(&session_id) {
+            session.tasks.push(TaskView {
+                id: task_id.clone(),
+                title: "octos-code-review-retry".into(),
+                state: TaskRuntimeState::Running,
+                runtime_detail: None,
+                output_tail: String::new(),
+                turn_id: None,
+            });
+        }
+
+        let agent = UiAgentRecord {
+            agent_id: "task-01900000-0000-7000-8000-0000000000fc".into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session_id.clone(),
+            task_id: Some(task_id.to_string()),
+            path: "master/task-fc".into(),
+            role: "background_task".into(),
+            nickname: "spawn".into(),
+            title: None,
+            backend_kind: "task_supervisor:spawn".into(),
+            status: "failed".into(),
+            last_task: Some("spawn_only failure".into()),
+            summary: None,
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        store.apply_event(AppUiEvent::Protocol(UiNotification::AgentUpdated(
+            AgentUpdatedEvent {
+                session_id: session_id.clone(),
+                agent,
+            },
+        )));
+
+        let session = store
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .expect("session present");
+        let task = session
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .expect("seeded task present");
+        assert_eq!(
+            task.state,
+            TaskRuntimeState::Failed,
+            "the terminal agent/updated must reconcile the stuck running task to its terminal state so the chip flips off Orchestrating…",
+        );
     }
 
     #[test]

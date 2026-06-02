@@ -5850,6 +5850,23 @@ pub fn task_state_label(state: TaskRuntimeState) -> &'static str {
     }
 }
 
+/// Map a durable `agent/updated` record's `status` string to the terminal
+/// [`TaskRuntimeState`] it represents, or `None` if the status is non-terminal.
+///
+/// The server's `background_task_agent_status` emits `running` / `completed` /
+/// `failed` / `interrupted` (the last is the wire form of a cancelled task).
+/// Used by the stuck-chip reconcile so a task whose terminal `task/updated`
+/// never arrived (per-turn channel torn down) still flips off "Orchestrating…"
+/// once the durable terminal agent record lands.
+pub fn terminal_task_state_from_agent_status(status: &str) -> Option<TaskRuntimeState> {
+    match status {
+        "completed" => Some(TaskRuntimeState::Completed),
+        "failed" => Some(TaskRuntimeState::Failed),
+        "interrupted" | "cancelled" => Some(TaskRuntimeState::Cancelled),
+        _ => None,
+    }
+}
+
 fn preview_id_from_text(text: &str) -> Option<PreviewId> {
     let lower = text.to_ascii_lowercase();
     let marker_start = ["preview_id", "preview-id", "preview id"]
