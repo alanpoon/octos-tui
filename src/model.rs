@@ -3278,6 +3278,15 @@ pub struct ActivityItem {
     pub duration_ms: Option<u64>,
     pub turn_id: Option<TurnId>,
     pub tool_call_id: Option<String>,
+    /// Owning session for items created on a session-scoped path. Only set by
+    /// the projection-envelope `ToolStart` emit (`apply_envelope`), which is the
+    /// one path whose items carry NO turn identity and so cannot be reconciled
+    /// by `turn_id`. The envelope `TurnCompleted` self-heal
+    /// ([`AppState::reconcile_envelope_thread_running_activity`]) filters on
+    /// this so a thread_id shared across sessions cannot over-suppress a sibling
+    /// session's genuinely-active chip. Left `None` for all turn-scoped items
+    /// (which reconcile via `turn_id`).
+    pub session_id: Option<SessionKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3299,6 +3308,7 @@ impl ActivityItem {
             duration_ms: None,
             turn_id: None,
             tool_call_id: None,
+            session_id: None,
         }
     }
 
@@ -3314,6 +3324,14 @@ impl ActivityItem {
 
     pub fn with_tool_call(mut self, tool_call_id: impl Into<String>) -> Self {
         self.tool_call_id = Some(tool_call_id.into());
+        self
+    }
+
+    /// Stamp the owning session. Used only on the projection-envelope
+    /// `ToolStart` path so the envelope `TurnCompleted` self-heal can scope its
+    /// thread-marker sweep to one session (see [`ActivityItem::session_id`]).
+    pub fn with_session(mut self, session_id: SessionKey) -> Self {
+        self.session_id = Some(session_id);
         self
     }
 
@@ -5033,21 +5051,38 @@ impl AppState {
 
     /// GAP 2 — orphan activity-chip self-heal on the projection-envelope path.
     /// An envelope `TurnCompleted` is a hard terminal barrier for its
-    /// `thread_id`: no further tool activity can legitimately run for that
-    /// thread. Reconcile any turn-less running item the envelope `ToolStart`
-    /// path created for this thread (a `ToolStart` whose `ToolEnd` never arrived)
-    /// to [`ACTIVITY_STATUS_INTERRUPTED`] so it can no longer pin a turn-less
+    /// `(session_id, thread_id)` pair: no further tool activity can legitimately
+    /// run for that thread in that session. Reconcile any turn-less running item
+    /// the envelope `ToolStart` path created for this session's thread (a
+    /// `ToolStart` whose `ToolEnd` never arrived) to
+    /// [`ACTIVITY_STATUS_INTERRUPTED`] so it can no longer pin a turn-less
     /// "Orchestrating…" chip.
     ///
-    /// Scoped tightly to NOT over-suppress: only `turn_id == None` items (which
-    /// is all the envelope path ever creates) carrying this thread's
-    /// envelope-tool marker are touched — legacy turn-less sub-agent progress
-    /// rows (tracked independently via `session.tasks`) are left alone.
-    pub fn reconcile_envelope_thread_running_activity(&mut self, thread_id: &str) -> usize {
+    /// Scoped tightly to NOT over-suppress, on FOUR independent guards:
+    /// - `session_id` — `thread_id` is NOT globally unique (two sessions can run
+    ///   envelope tools under the same projection thread), so the sweep is
+    ///   confined to items the envelope path stamped for THIS session. Without
+    ///   it, session A's `TurnCompleted` would suppress session B's
+    ///   genuinely-active chip on the same `thread_id`.
+    /// - [`ActivityKind::Tool`] — the envelope `ToolStart` path only ever creates
+    ///   `Tool` items; a non-tool turn-less row is never touched.
+    /// - `turn_id == None` — all envelope items are turn-less; turn-scoped items
+    ///   reconcile via [`Self::reconcile_terminal_turn_running_activity`].
+    /// - the thread's envelope-tool marker (kept in lockstep with the emit via
+    ///   the shared [`Self::envelope_tool_detail_for_thread`] source) — so legacy
+    ///   turn-less sub-agent progress rows are left alone.
+    pub fn reconcile_envelope_thread_running_activity(
+        &mut self,
+        session_id: &SessionKey,
+        thread_id: &str,
+    ) -> usize {
         let marker = Self::envelope_tool_detail_for_thread(thread_id);
         let mut flipped = 0;
         for item in self.activity.iter_mut().filter(|item| {
-            item.turn_id.is_none() && item.detail.as_deref() == Some(marker.as_str())
+            item.session_id.as_ref() == Some(session_id)
+                && item.kind == ActivityKind::Tool
+                && item.turn_id.is_none()
+                && item.detail.as_deref() == Some(marker.as_str())
         }) {
             if activity_status_is_running(&item.status) {
                 item.status = ACTIVITY_STATUS_INTERRUPTED.to_string();

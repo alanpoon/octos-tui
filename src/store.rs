@@ -5302,6 +5302,7 @@ impl Store {
                 self.state.push_activity(
                     ActivityItem::new(ActivityKind::Tool, name.clone(), "running")
                         .with_tool_call(tool_call_id.clone())
+                        .with_session(session_id.clone())
                         .with_detail(AppState::envelope_tool_detail_for_thread(&thread_id)),
                 );
                 self.state.set_run_state_in_progress();
@@ -5361,12 +5362,15 @@ impl Store {
                 None
             }
             Payload::TurnCompleted { .. } => {
-                // GAP 2: this envelope is a hard terminal barrier for the thread.
-                // Heal any stranded running tool item the envelope path started
-                // for this thread (a `ToolStart` whose `ToolEnd` never arrived) so
-                // it can no longer pin a turn-less "Orchestrating…" chip.
+                // GAP 2: this envelope is a hard terminal barrier for this
+                // session's thread. Heal any stranded running tool item the
+                // envelope path started for this session+thread (a `ToolStart`
+                // whose `ToolEnd` never arrived) so it can no longer pin a
+                // turn-less "Orchestrating…" chip. Scoped to `session_id` so a
+                // thread_id shared with another session cannot suppress that
+                // sibling's genuinely-active chip.
                 self.state
-                    .reconcile_envelope_thread_running_activity(&thread_id);
+                    .reconcile_envelope_thread_running_activity(&session_id, &thread_id);
                 self.state.status = format!("Turn completed for {thread_id}");
                 self.state.set_run_state_success();
                 self.submit_next_pending_if_idle()
@@ -6826,6 +6830,26 @@ mod tests {
         };
         Store {
             state: AppState::new(vec![session], 0, "ready".into(), None, false),
+        }
+    }
+
+    fn store_with_two_sessions(first: &str, second: &str) -> Store {
+        let make = |id: &str| SessionView {
+            id: SessionKey(id.into()),
+            title: id.into(),
+            profile_id: Some("coding".into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        Store {
+            state: AppState::new(
+                vec![make(first), make(second)],
+                0,
+                "ready".into(),
+                None,
+                false,
+            ),
         }
     }
 
@@ -10531,6 +10555,74 @@ mod tests {
     }
 
     #[test]
+    fn envelope_turn_completed_does_not_suppress_other_session_same_thread() {
+        // GAP 2 over-suppression guard: two sessions can each be running an
+        // envelope tool under the SAME thread_id (thread_id is NOT globally
+        // unique — it is scoped to a session's projection). A `TurnCompleted`
+        // for session A's thread must heal ONLY session A's stranded running
+        // envelope tool item; session B's genuinely-active chip on the same
+        // thread_id must stay running.
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let session_a = store.state.sessions[0].id.clone();
+        let session_b = store.state.sessions[1].id.clone();
+        assert_eq!(session_a, SessionKey("local:a".into()));
+        assert_eq!(session_b, SessionKey("local:b".into()));
+
+        // Both sessions start a turn-less running envelope tool on "thread-1"
+        // (envelope_notification hardcodes thread_id = "thread-1").
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_a.clone(),
+            1,
+            Payload::ToolStart {
+                tool_call_id: "call-a".into(),
+                name: "run_pipeline".into(),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_b.clone(),
+            1,
+            Payload::ToolStart {
+                tool_call_id: "call-b".into(),
+                name: "run_pipeline".into(),
+            },
+        )));
+
+        // Terminal barrier for session A's thread only.
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_a,
+            2,
+            Payload::TurnCompleted {
+                token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
+            },
+        )));
+
+        let item_a = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-a"))
+            .expect("session A envelope tool item retained");
+        assert_eq!(
+            item_a.status,
+            crate::model::ACTIVITY_STATUS_INTERRUPTED,
+            "session A's stranded envelope tool item must be reconciled"
+        );
+
+        let item_b = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-b"))
+            .expect("session B envelope tool item retained");
+        assert!(
+            crate::model::activity_status_is_running(&item_b.status),
+            "session B's genuinely-active envelope tool item must NOT be suppressed \
+             by session A's TurnCompleted on the same thread_id, got {:?}",
+            item_b.status
+        );
+    }
+
+    #[test]
     fn interrupt_command_targets_active_turn() {
         let turn_id = TurnId::new();
         let mut store = store_with_live_reply(turn_id.clone(), "streaming");
@@ -13921,6 +14013,95 @@ mod tests {
         assert_eq!(
             live.status, "running",
             "an active (non-terminal) hydrated turn's running item must NOT be reconciled"
+        );
+    }
+
+    #[test]
+    fn hydrate_reconciles_leaked_running_activity_in_errored_and_interrupted_turns() {
+        use crate::client_event::ClientEvent;
+        // GAP 1 coverage: the hydrate reconcile treats ALL three terminal
+        // lifecycle states identically via the shared sweep. The existing test
+        // exercises `Completed`; assert `Errored` and `Interrupted` heal too.
+        for terminal in [TurnLifecycleState::Errored, TurnLifecycleState::Interrupted] {
+            let turn_id = TurnId::new();
+            let mut store = store_with_empty_session();
+            let session_id = store.state.sessions[0].id.clone();
+            store.state.push_activity(
+                ActivityItem::new(ActivityKind::Tool, "run_pipeline", "running")
+                    .with_turn(turn_id.clone())
+                    .with_tool_call("call-leaked"),
+            );
+
+            let result = SessionHydrateResult {
+                session_id: session_id.clone(),
+                cursor: octos_core::ui_protocol::UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 1,
+                },
+                context: None,
+                context_state: None,
+                messages: None,
+                threads: None,
+                turns: Some(vec![HydratedTurn {
+                    turn_id: turn_id.clone(),
+                    state: terminal,
+                    started_at: None,
+                    completed_at: None,
+                    thread_id: Some("thread-1".into()),
+                }]),
+                pending_approvals: None,
+                replayed_envelopes: None,
+            };
+            store.apply_client_event(ClientEvent::SessionHydrate(result));
+
+            let leaked = store
+                .state
+                .activity
+                .iter()
+                .find(|item| item.tool_call_id.as_deref() == Some("call-leaked"))
+                .expect("leaked item retained");
+            assert_eq!(
+                leaked.status,
+                crate::model::ACTIVITY_STATUS_INTERRUPTED,
+                "a {terminal:?} hydrated turn's stranded running item must be reconciled"
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_turn_completed_does_not_touch_non_tool_turn_less_row() {
+        // GAP 2 kind guard: the envelope reconcile is filtered to
+        // `ActivityKind::Tool`. A turn-less NON-tool row carrying this thread's
+        // marker (e.g. a Progress row) must never be flipped, even when its
+        // session+thread match the TurnCompleted barrier.
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.push_activity(
+            ActivityItem::new(ActivityKind::Progress, "sub-agent", "running")
+                .with_session(session_id.clone())
+                .with_detail(crate::model::AppState::envelope_tool_detail_for_thread(
+                    "thread-1",
+                )),
+        );
+
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_id,
+            1,
+            Payload::TurnCompleted {
+                token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
+            },
+        )));
+
+        let row = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.kind == ActivityKind::Progress && item.title == "sub-agent")
+            .expect("non-tool progress row retained");
+        assert!(
+            crate::model::activity_status_is_running(&row.status),
+            "a non-tool turn-less row must NOT be reconciled by the envelope sweep, got {:?}",
+            row.status
         );
     }
 
