@@ -5714,13 +5714,17 @@ impl Store {
             }
         }
         self.state.status = status;
-        // Blocking bug 2: terminal completion clears any stale retry/backoff for
-        // the session. `session_retry` was only cleared on the next non-retry
-        // PROGRESS event, so a retry immediately followed by `TurnCompleted`
-        // left a stale entry that could render "retrying" on a LATER active
-        // orchestration. Terminal = no retry in flight.
-        self.state.session_retry.remove(&event.session_id);
         if completed_current_turn {
+            // Blocking bug 2: terminal completion clears any stale retry/backoff
+            // for the session. `session_retry` was only cleared on the next
+            // non-retry PROGRESS event, so a retry immediately followed by
+            // `TurnCompleted` left a stale entry that could render "retrying" on
+            // a LATER active orchestration. Terminal = no retry in flight.
+            //
+            // Over-clear fix: only clear when this terminal applies to the LIVE
+            // turn. A STALE `TurnCompleted` (mismatched turn_id) preserves the
+            // live reply above, so it must also preserve the live turn's retry.
+            self.state.session_retry.remove(&event.session_id);
             self.state
                 .capture_completed_turn_activity(&event.session_id, &event.turn_id);
             self.state.set_run_state_success();
@@ -5775,11 +5779,15 @@ impl Store {
                 .capture_completed_turn_activity(&event.session_id, &event.turn_id);
         }
         self.state.status = status;
-        // Blocking bug 2: terminal error also clears any stale retry/backoff for
-        // the session (see `commit_live_reply`) so it can never linger and
-        // render on a later orchestration.
-        self.state.session_retry.remove(&event.session_id);
         if failed_current_turn {
+            // Blocking bug 2: terminal error also clears any stale retry/backoff
+            // for the session (see `commit_live_reply`) so it can never linger
+            // and render on a later orchestration.
+            //
+            // Over-clear fix: only clear when this terminal applies to the LIVE
+            // turn. A STALE `TurnError` (mismatched turn_id) preserves the live
+            // reply above, so it must also preserve the live turn's retry.
+            self.state.session_retry.remove(&event.session_id);
             self.state
                 .set_run_state_error(format!("{}: {}", event.code, event.message));
         }
@@ -12644,6 +12652,84 @@ mod tests {
         assert!(
             !store.state.session_retry.contains_key(&session_id),
             "TurnError must clear the stale retry so it cannot render later"
+        );
+    }
+
+    /// Over-clear fix: a STALE `TurnCompleted` (for an OLD turn, not the live
+    /// one) must NOT wipe the live turn's retry indicator. `commit_live_reply`
+    /// preserves the live reply on a turn_id mismatch, but previously the
+    /// retry clear ran unconditionally and wrongly erased the active retry.
+    /// (RED on 4022a7c.)
+    #[test]
+    fn stale_terminal_does_not_clear_live_retry() {
+        use octos_core::ui_protocol::UiRetryBackoff;
+
+        let live_turn = TurnId::new();
+        let stale_turn = TurnId::new();
+        let mut store = store_with_live_reply(live_turn.clone(), "hello");
+        let session_id = store.state.sessions[0].id.clone();
+
+        let mut retry = UiRetryBackoff::new();
+        retry.attempt = Some(2);
+        retry.max_attempts = Some(5);
+        store.state.session_retry.insert(session_id.clone(), retry);
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: stale_turn,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        assert!(
+            store.state.session_retry.contains_key(&session_id),
+            "stale TurnCompleted (mismatched turn) must NOT clear the live turn's retry"
+        );
+        assert!(
+            store.state.sessions[0].live_reply.is_some(),
+            "stale TurnCompleted preserves the live reply"
+        );
+    }
+
+    /// Over-clear fix (error path): a STALE `TurnError` (for an OLD turn) must
+    /// NOT wipe the live turn's retry indicator. `fail_live_reply` keeps the
+    /// live reply on a turn_id mismatch, but the retry clear previously ran
+    /// regardless. (RED on 4022a7c.)
+    #[test]
+    fn stale_terminal_error_does_not_clear_live_retry() {
+        use octos_core::ui_protocol::UiRetryBackoff;
+
+        let live_turn = TurnId::new();
+        let stale_turn = TurnId::new();
+        let mut store = store_with_live_reply(live_turn.clone(), "hello");
+        let session_id = store.state.sessions[0].id.clone();
+
+        let mut retry = UiRetryBackoff::new();
+        retry.attempt = Some(1);
+        store.state.session_retry.insert(session_id.clone(), retry);
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: stale_turn,
+                code: "provider_error".into(),
+                message: "upstream 500".into(),
+            },
+        )));
+
+        assert!(
+            store.state.session_retry.contains_key(&session_id),
+            "stale TurnError (mismatched turn) must NOT clear the live turn's retry"
+        );
+        assert!(
+            store.state.sessions[0].live_reply.is_some(),
+            "stale TurnError preserves the live reply"
         );
     }
 
