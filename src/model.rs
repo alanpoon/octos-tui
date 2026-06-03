@@ -4925,34 +4925,62 @@ impl AppState {
         self.optimistic_user_messages = retained;
     }
 
+    /// Orphan activity-chip self-heal: a turn just became terminal, so any of
+    /// its activity items still sitting in a running-type status is a leaked
+    /// started-state (a `ToolStarted` whose `ToolCompleted` never arrived — a
+    /// leaked spawn_only chip / any future uncovered path). Reconcile each to a
+    /// terminal display status ([`ACTIVITY_STATUS_INTERRUPTED`]) so the archived
+    /// log — and the live `self.activity` — can no longer count it as in-flight
+    /// and pin the chip on "Orchestrating…". A genuinely settled item
+    /// ("complete"/"failed"/`success`) is untouched.
+    ///
+    /// Single source of truth shared by [`Self::capture_completed_turn_activity`]
+    /// (live `TurnCompleted`/`TurnError` chokepoint) and the hydrate path
+    /// (`apply_session_hydrate_result`, GAP 1) so a terminal turn reconciles
+    /// identically whether it goes terminal live or is rehydrated terminal. The
+    /// caller MUST only invoke this for a turn that is genuinely terminal — never
+    /// the session's currently-active/live turn.
+    ///
+    /// Returns the number of items flipped (callers may ignore it).
+    pub fn reconcile_terminal_turn_running_activity(&mut self, turn_id: &TurnId) -> usize {
+        let mut flipped = 0;
+        for item in self
+            .activity
+            .iter_mut()
+            .filter(|item| item.turn_id.as_ref() == Some(turn_id))
+        {
+            if activity_status_is_running(&item.status) {
+                item.status = ACTIVITY_STATUS_INTERRUPTED.to_string();
+                flipped += 1;
+            }
+        }
+        flipped
+    }
+
     pub fn capture_completed_turn_activity(
         &mut self,
         session_id: &SessionKey,
         turn_id: &TurnId,
     ) -> bool {
-        let mut items = self
+        if !self
+            .activity
+            .iter()
+            .any(|item| item.turn_id.as_ref() == Some(turn_id))
+        {
+            return false;
+        }
+
+        // The turn is now terminal — heal any stranded running item in the LIVE
+        // activity before archiving (shared with the hydrate path), so both the
+        // captured log and any residual live row read as not-running.
+        self.reconcile_terminal_turn_running_activity(turn_id);
+
+        let items = self
             .activity
             .iter()
             .filter(|item| item.turn_id.as_ref() == Some(turn_id))
             .cloned()
             .collect::<Vec<_>>();
-        if items.is_empty() {
-            return false;
-        }
-
-        // Orphan activity-chip self-heal: the turn is now terminal, so any of its
-        // items still sitting in a running-type status is a leaked started-state
-        // (a `ToolStarted` whose `ToolCompleted` never arrived — a leaked
-        // spawn_only chip / any future uncovered path). Reconcile each to a
-        // terminal display status so the archived log can no longer count it as
-        // in-flight and pin the chip on "Orchestrating…" — including after a
-        // reconnect, which re-captures the replayed unbalanced state. A genuinely
-        // settled item ("complete"/"failed"/`success`) is untouched.
-        for item in &mut items {
-            if activity_status_is_running(&item.status) {
-                item.status = ACTIVITY_STATUS_INTERRUPTED.to_string();
-            }
-        }
 
         let optimistic = self
             .optimistic_user_messages
@@ -4990,6 +5018,43 @@ impl AppState {
         self.activity
             .retain(|item| item.turn_id.as_ref() != Some(turn_id));
         true
+    }
+
+    /// Detail marker stamped on activity items created by the M9-γ
+    /// projection-envelope `ToolStart` path. The envelope wire shape carries NO
+    /// turn identity (it is keyed on `thread_id`/`seq`), so envelope tool items
+    /// have `turn_id == None` and the turn-scoped reconcile cannot match them.
+    /// This thread-scoped marker is how the envelope `TurnCompleted` reconcile
+    /// (GAP 2) finds the items the envelope path itself started, keeping emit and
+    /// reconcile in lockstep (same discipline as the running-status set).
+    pub fn envelope_tool_detail_for_thread(thread_id: &str) -> String {
+        format!("thread {thread_id}")
+    }
+
+    /// GAP 2 — orphan activity-chip self-heal on the projection-envelope path.
+    /// An envelope `TurnCompleted` is a hard terminal barrier for its
+    /// `thread_id`: no further tool activity can legitimately run for that
+    /// thread. Reconcile any turn-less running item the envelope `ToolStart`
+    /// path created for this thread (a `ToolStart` whose `ToolEnd` never arrived)
+    /// to [`ACTIVITY_STATUS_INTERRUPTED`] so it can no longer pin a turn-less
+    /// "Orchestrating…" chip.
+    ///
+    /// Scoped tightly to NOT over-suppress: only `turn_id == None` items (which
+    /// is all the envelope path ever creates) carrying this thread's
+    /// envelope-tool marker are touched — legacy turn-less sub-agent progress
+    /// rows (tracked independently via `session.tasks`) are left alone.
+    pub fn reconcile_envelope_thread_running_activity(&mut self, thread_id: &str) -> usize {
+        let marker = Self::envelope_tool_detail_for_thread(thread_id);
+        let mut flipped = 0;
+        for item in self.activity.iter_mut().filter(|item| {
+            item.turn_id.is_none() && item.detail.as_deref() == Some(marker.as_str())
+        }) {
+            if activity_status_is_running(&item.status) {
+                item.status = ACTIVITY_STATUS_INTERRUPTED.to_string();
+                flipped += 1;
+            }
+        }
+        flipped
     }
 
     pub fn has_pending_messages(&self) -> bool {

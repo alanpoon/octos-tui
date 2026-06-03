@@ -8,8 +8,8 @@ use octos_core::ui_protocol::{
     ReplayLossyEvent, SessionHydrateParams, SessionHydrateResult, SessionOpenParams,
     TaskArtifactReadParams, TaskOutputDeltaEvent, TaskOutputReadParams, TaskRuntimeState,
     TaskUpdatedEvent, ThreadGraphGetParams, TurnCompletedEvent, TurnErrorEvent, TurnId,
-    TurnInterruptParams, TurnSpawnCompleteEvent, TurnStartParams, TurnStateGetParams,
-    UiContextState, UiNotification, UiProgressEvent,
+    TurnInterruptParams, TurnLifecycleState, TurnSpawnCompleteEvent, TurnStartParams,
+    TurnStateGetParams, UiContextState, UiNotification, UiProgressEvent,
 };
 use octos_core::{Message, MessageRole, SessionKey, TaskId, ThreadId};
 use serde_json::Value;
@@ -4236,23 +4236,57 @@ impl Store {
                 });
         }
 
-        if let Some(turns) = result.turns.as_ref()
-            && self.state.turn_state_detail.active
-            && let Some(active_turn) = turns.last()
-        {
-            self.state
-                .turn_state_detail
-                .open(&octos_core::ui_protocol::TurnStateGetResult {
-                    session_id: session_id.clone(),
-                    turn_id: active_turn.turn_id.clone(),
-                    state: active_turn.state,
-                    context: result.context.clone(),
-                    context_state: result.context_state.clone(),
-                    started_at: active_turn.started_at,
-                    completed_at: active_turn.completed_at,
-                    thread_id: active_turn.thread_id.clone(),
-                    committed_seqs: Vec::new(),
-                });
+        if let Some(turns) = result.turns.as_ref() {
+            // GAP 1: orphan activity-chip self-heal on the rehydrate path. A
+            // client rehydrating a session whose turn is already TERMINAL
+            // (Completed/Errored/Interrupted) but that still carries a stranded
+            // running-status activity item (a `ToolStarted` whose `ToolCompleted`
+            // never arrived) would otherwise pin "Orchestrating…" forever after
+            // reconnect — the hydrate path never ran the terminal reconcile that
+            // the live `TurnCompleted`/`TurnError` chokepoint does. Reconcile each
+            // genuinely-terminal hydrated turn here, sharing the exact same sweep.
+            //
+            // NEVER reconcile the session's currently-active/live turn: its
+            // running work is legitimately in-flight. The local `live_reply` turn
+            // is the source of truth for "still streaming", so we skip it even if
+            // the snapshot were to mislabel it terminal.
+            let live_turn_id = self
+                .state
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .and_then(|session| session.live_reply.as_ref())
+                .map(|live_reply| live_reply.turn_id.clone());
+            for turn in turns {
+                let is_terminal = matches!(
+                    turn.state,
+                    TurnLifecycleState::Completed
+                        | TurnLifecycleState::Errored
+                        | TurnLifecycleState::Interrupted
+                );
+                if is_terminal && live_turn_id.as_ref() != Some(&turn.turn_id) {
+                    self.state
+                        .reconcile_terminal_turn_running_activity(&turn.turn_id);
+                }
+            }
+
+            if self.state.turn_state_detail.active
+                && let Some(active_turn) = turns.last()
+            {
+                self.state
+                    .turn_state_detail
+                    .open(&octos_core::ui_protocol::TurnStateGetResult {
+                        session_id: session_id.clone(),
+                        turn_id: active_turn.turn_id.clone(),
+                        state: active_turn.state,
+                        context: result.context.clone(),
+                        context_state: result.context_state.clone(),
+                        started_at: active_turn.started_at,
+                        completed_at: active_turn.completed_at,
+                        thread_id: active_turn.thread_id.clone(),
+                        committed_seqs: Vec::new(),
+                    });
+            }
         }
 
         if let Some(approvals) = result.pending_approvals {
@@ -5268,7 +5302,7 @@ impl Store {
                 self.state.push_activity(
                     ActivityItem::new(ActivityKind::Tool, name.clone(), "running")
                         .with_tool_call(tool_call_id.clone())
-                        .with_detail(format!("thread {thread_id}")),
+                        .with_detail(AppState::envelope_tool_detail_for_thread(&thread_id)),
                 );
                 self.state.set_run_state_in_progress();
                 self.state.status = format!("Tool started: {name} ({tool_call_id})");
@@ -5327,6 +5361,12 @@ impl Store {
                 None
             }
             Payload::TurnCompleted { .. } => {
+                // GAP 2: this envelope is a hard terminal barrier for the thread.
+                // Heal any stranded running tool item the envelope path started
+                // for this thread (a `ToolStart` whose `ToolEnd` never arrived) so
+                // it can no longer pin a turn-less "Orchestrating…" chip.
+                self.state
+                    .reconcile_envelope_thread_running_activity(&thread_id);
                 self.state.status = format!("Turn completed for {thread_id}");
                 self.state.set_run_state_success();
                 self.submit_next_pending_if_idle()
@@ -10084,9 +10124,11 @@ mod tests {
             .iter()
             .find(|item| item.tool_call_id.as_deref() == Some("call-leaked"))
             .expect("leaked item retained in log");
-        assert_ne!(
-            leaked.status, "running",
-            "the leaked running item must be reconciled to a terminal status, not left running"
+        assert_eq!(
+            leaked.status,
+            crate::model::ACTIVITY_STATUS_INTERRUPTED,
+            "the leaked running item must be reconciled SPECIFICALLY to interrupted \
+             (not a false complete/failed), so it renders neutrally and reads as not-running"
         );
     }
 
@@ -10129,9 +10171,11 @@ mod tests {
             .iter()
             .find(|item| item.tool_call_id.as_deref() == Some("call-leaked"))
             .expect("leaked item retained in log");
-        assert_ne!(
-            leaked.status, "running",
-            "the leaked running item must be reconciled to a terminal status on turn error"
+        assert_eq!(
+            leaked.status,
+            crate::model::ACTIVITY_STATUS_INTERRUPTED,
+            "the leaked running item must be reconciled SPECIFICALLY to interrupted on turn error \
+             (not a false complete/failed)"
         );
     }
 
@@ -10391,6 +10435,99 @@ mod tests {
         assert_eq!(messages[0].role, MessageRole::Assistant);
         assert_eq!(messages[0].thread_id.as_deref(), Some("thread-1"));
         assert_eq!(messages[0].content, "final answer");
+    }
+
+    #[test]
+    fn envelope_turn_completed_reconciles_stranded_running_tool_item() {
+        // GAP 2: the M9-γ projection-envelope path creates tool activity with NO
+        // turn_id (the envelope is keyed on thread_id/seq — there is no turn
+        // identity on the wire). A `ToolStart` whose `ToolEnd` never arrived
+        // leaves a turn-less "running" Tool item. When `Payload::TurnCompleted`
+        // closes the thread (a hard terminal barrier), that stranded running item
+        // must be reconciled so it can no longer pin a turn-less "Orchestrating…"
+        // chip.
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_id.clone(),
+            1,
+            Payload::ToolStart {
+                tool_call_id: "call-leaked".into(),
+                name: "run_pipeline".into(),
+            },
+        )));
+        // Terminal barrier for the thread — no ToolEnd ever came for call-leaked.
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_id,
+            2,
+            Payload::TurnCompleted {
+                token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
+            },
+        )));
+
+        let leaked = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-leaked"))
+            .expect("leaked envelope tool item retained");
+        assert!(
+            !crate::model::activity_status_is_running(&leaked.status),
+            "an envelope TurnCompleted must leave no running-status chip pinned, got {:?}",
+            leaked.status
+        );
+        assert_eq!(
+            leaked.status,
+            crate::model::ACTIVITY_STATUS_INTERRUPTED,
+            "the stranded envelope tool item must be reconciled to interrupted"
+        );
+    }
+
+    #[test]
+    fn envelope_turn_completed_does_not_touch_settled_tool_item() {
+        // GAP 2 guard: a tool that DID complete (ToolEnd arrived) must keep its
+        // settled status across a TurnCompleted barrier — the reconcile only
+        // sweeps still-running items.
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_id.clone(),
+            1,
+            Payload::ToolStart {
+                tool_call_id: "call-done".into(),
+                name: "run_pipeline".into(),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_id.clone(),
+            2,
+            Payload::ToolEnd {
+                tool_call_id: "call-done".into(),
+                status: EnvelopeToolEndStatus::Complete,
+                error: None,
+                reason: None,
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_id,
+            3,
+            Payload::TurnCompleted {
+                token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
+            },
+        )));
+
+        let done = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-done"))
+            .expect("settled envelope tool item retained");
+        assert_eq!(
+            done.status, "complete",
+            "a settled envelope tool item must keep its terminal status across TurnCompleted"
+        );
     }
 
     #[test]
@@ -13677,6 +13814,114 @@ mod tests {
         );
         assert!(store.state.status.contains("2 message(s)"));
         assert!(store.state.status.contains("1 pending approval"));
+    }
+
+    #[test]
+    fn hydrate_reconciles_leaked_running_activity_in_terminal_turn() {
+        use crate::client_event::ClientEvent;
+        // GAP 1: a client rehydrating a session whose turn is already TERMINAL
+        // (Completed/Errored/Interrupted) but that still carries a stranded
+        // running-status activity item (a `ToolStarted` whose `ToolCompleted`
+        // never arrived — leaked spawn_only chip / any uncovered path) must heal
+        // the orphan. `apply_session_hydrate_result` never called the terminal
+        // reconcile, so the chip pinned "Orchestrating…" forever after reconnect.
+        let turn_id = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        // Leaked running item bound to the (about-to-be-terminal) turn.
+        store.state.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "run_pipeline", "running")
+                .with_turn(turn_id.clone())
+                .with_tool_call("call-leaked"),
+        );
+
+        let result = SessionHydrateResult {
+            session_id: session_id.clone(),
+            cursor: octos_core::ui_protocol::UiCursor {
+                stream: session_id.0.clone(),
+                seq: 1,
+            },
+            context: None,
+            context_state: None,
+            messages: None,
+            threads: None,
+            turns: Some(vec![HydratedTurn {
+                turn_id: turn_id.clone(),
+                state: TurnLifecycleState::Completed,
+                started_at: None,
+                completed_at: None,
+                thread_id: Some("thread-1".into()),
+            }]),
+            pending_approvals: None,
+            replayed_envelopes: None,
+        };
+        store.apply_client_event(ClientEvent::SessionHydrate(result));
+
+        let leaked = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-leaked"))
+            .expect("leaked item retained");
+        assert_eq!(
+            leaked.status,
+            crate::model::ACTIVITY_STATUS_INTERRUPTED,
+            "a terminal hydrated turn's stranded running item must be reconciled to interrupted"
+        );
+        assert!(
+            !crate::model::activity_status_is_running(&leaked.status),
+            "the reconciled item must no longer read as running"
+        );
+    }
+
+    #[test]
+    fn hydrate_does_not_reconcile_running_activity_in_active_turn() {
+        use crate::client_event::ClientEvent;
+        // GAP 1 guard against over-suppression: a hydrated turn that is still the
+        // live/active turn (state == Active) carries genuine in-flight work. The
+        // hydrate reconcile must touch ONLY terminal turns, so this running item
+        // must stay running.
+        let turn_id = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "run_pipeline", "running")
+                .with_turn(turn_id.clone())
+                .with_tool_call("call-live"),
+        );
+
+        let result = SessionHydrateResult {
+            session_id: session_id.clone(),
+            cursor: octos_core::ui_protocol::UiCursor {
+                stream: session_id.0.clone(),
+                seq: 1,
+            },
+            context: None,
+            context_state: None,
+            messages: None,
+            threads: None,
+            turns: Some(vec![HydratedTurn {
+                turn_id: turn_id.clone(),
+                state: TurnLifecycleState::Active,
+                started_at: None,
+                completed_at: None,
+                thread_id: Some("thread-1".into()),
+            }]),
+            pending_approvals: None,
+            replayed_envelopes: None,
+        };
+        store.apply_client_event(ClientEvent::SessionHydrate(result));
+
+        let live = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-live"))
+            .expect("live item retained");
+        assert_eq!(
+            live.status, "running",
+            "an active (non-terminal) hydrated turn's running item must NOT be reconciled"
+        );
     }
 
     #[test]
