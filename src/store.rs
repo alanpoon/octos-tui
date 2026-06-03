@@ -5264,7 +5264,11 @@ impl Store {
                         .orchestration
                         .insert(event.session_id.clone(), event);
                 } else {
+                    // Blocking bug 2 (belt-and-suspenders): the whole job is
+                    // done — drop the indicator AND any stale retry so it cannot
+                    // linger across the terminal orchestration boundary.
                     self.state.orchestration.remove(&event.session_id);
+                    self.state.session_retry.remove(&event.session_id);
                 }
                 None
             }
@@ -5710,6 +5714,12 @@ impl Store {
             }
         }
         self.state.status = status;
+        // Blocking bug 2: terminal completion clears any stale retry/backoff for
+        // the session. `session_retry` was only cleared on the next non-retry
+        // PROGRESS event, so a retry immediately followed by `TurnCompleted`
+        // left a stale entry that could render "retrying" on a LATER active
+        // orchestration. Terminal = no retry in flight.
+        self.state.session_retry.remove(&event.session_id);
         if completed_current_turn {
             self.state
                 .capture_completed_turn_activity(&event.session_id, &event.turn_id);
@@ -5765,6 +5775,10 @@ impl Store {
                 .capture_completed_turn_activity(&event.session_id, &event.turn_id);
         }
         self.state.status = status;
+        // Blocking bug 2: terminal error also clears any stale retry/backoff for
+        // the session (see `commit_live_reply`) so it can never linger and
+        // render on a later orchestration.
+        self.state.session_retry.remove(&event.session_id);
         if failed_current_turn {
             self.state
                 .set_run_state_error(format!("{}: {}", event.code, event.message));
@@ -12564,6 +12578,72 @@ mod tests {
         assert!(
             !store.state.session_retry.contains_key(&session_id),
             "non-retry progress clears the retry entry"
+        );
+    }
+
+    /// Blocking bug 2: `session_retry` was only cleared on the next NON-retry
+    /// progress event. A retry immediately followed by terminal
+    /// `TurnCompleted` left stale retry that could render "retrying" on a LATER
+    /// active orchestration. Terminal completion must clear it. (RED on
+    /// f588b6f.)
+    #[test]
+    fn turn_completed_clears_stale_session_retry() {
+        use octos_core::ui_protocol::UiRetryBackoff;
+
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "hello");
+        let session_id = store.state.sessions[0].id.clone();
+
+        let mut retry = UiRetryBackoff::new();
+        retry.attempt = Some(2);
+        retry.max_attempts = Some(5);
+        store.state.session_retry.insert(session_id.clone(), retry);
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        assert!(
+            !store.state.session_retry.contains_key(&session_id),
+            "TurnCompleted must clear the stale retry so it cannot render later"
+        );
+    }
+
+    /// Blocking bug 2: terminal `TurnError` must also clear `session_retry`.
+    /// (RED on f588b6f.)
+    #[test]
+    fn turn_error_clears_stale_session_retry() {
+        use octos_core::ui_protocol::UiRetryBackoff;
+
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "hello");
+        let session_id = store.state.sessions[0].id.clone();
+
+        let mut retry = UiRetryBackoff::new();
+        retry.attempt = Some(1);
+        store.state.session_retry.insert(session_id.clone(), retry);
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id,
+                code: "provider_error".into(),
+                message: "upstream 500".into(),
+            },
+        )));
+
+        assert!(
+            !store.state.session_retry.contains_key(&session_id),
+            "TurnError must clear the stale retry so it cannot render later"
         );
     }
 

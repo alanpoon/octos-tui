@@ -1765,6 +1765,7 @@ fn push_activity_section(lines: &mut Vec<Line<'static>>, palette: Palette, app: 
                     &group,
                     &running_subagent_titles_for_chip(app, last_turn),
                     pending_continuations,
+                    is_active_group(app, last_turn),
                     app.expanded_tool_outputs,
                 );
                 group.clear();
@@ -1781,6 +1782,7 @@ fn push_activity_section(lines: &mut Vec<Line<'static>>, palette: Palette, app: 
             &group,
             &running_subagent_titles_for_chip(app, last_turn),
             pending_continuations,
+            is_active_group(app, last_turn),
             app.expanded_tool_outputs,
         );
     }
@@ -1811,6 +1813,34 @@ fn active_session_pending_continuations(app: &AppState) -> u32 {
         .filter(|status| status.active)
         .map(|status| status.pending_continuations)
         .unwrap_or(0)
+}
+
+/// Whether the agent-task group identified by `group_turn` is the CURRENT/active
+/// turn's group (vs an ARCHIVED past-turn group).
+///
+/// Blocking bug 1: `active_session_pending_continuations` is a per-SESSION
+/// fact (the server's queued re-entry count), so feeding it to every group
+/// retitled archived completed/failed groups as "Re-entering". Only the active
+/// group may flip to "Re-entering"; this predicate scopes that.
+///
+/// A group is active when:
+/// - its `turn_id` equals the active session's live turn (`active_turn`), OR
+/// - it is the turn-less fold (`None`) AND no turn is live but the session is
+///   orchestrating — the turn-less sub-agent fold of the live orchestration is
+///   the current group (see `flow_activity_items` / `is_subagent_progress`).
+fn is_active_group(app: &AppState, group_turn: Option<&octos_core::ui_protocol::TurnId>) -> bool {
+    match (group_turn, app.active_turn()) {
+        (Some(group_turn), Some((_, active_turn))) => group_turn == active_turn,
+        (Some(_), None) => false,
+        // Turn-less fold: only the live orchestration's sub-agent fold (no live
+        // turn) is the current group. With a live turn present, the turn-less
+        // fold is not the active group.
+        (None, None) => app
+            .active_session()
+            .and_then(|session| app.orchestration.get(&session.id))
+            .is_some_and(|status| status.active),
+        (None, Some(_)) => false,
+    }
 }
 
 fn flow_activity_items(app: &AppState) -> Vec<&ActivityItem> {
@@ -1876,6 +1906,7 @@ fn push_turn_activity_log_section(
         &shown,
         &running_subagent_titles_for_chip(app, Some(&log.turn_id)),
         active_session_pending_continuations(app),
+        is_active_group(app, Some(&log.turn_id)),
         app.expanded_tool_outputs,
     );
     if log.items.len() > shown.len() {
@@ -1922,19 +1953,29 @@ fn spinner_frame() -> &'static str {
 /// directly (Gap 2 fix #2). The order of precedence is deliberate:
 ///
 /// 1. `in_progress` (live tool calls or running sub-agents) → "Orchestrating".
-/// 2. `pending_continuations > 0` → "re-entering". The parent's tool calls can
-///    all be settled while the server has a master re-entry queued; the chip
-///    must NOT read "Agent task completed" in that gap (the "looks done" lie).
-/// 3. `failed > 0` → finished with errors.
+/// 2. `pending_continuations > 0` AND `is_active_group` → "re-entering". The
+///    parent's tool calls can all be settled while the server has a master
+///    re-entry queued; the CURRENT turn's chip must NOT read "Agent task
+///    completed" in that gap (the "looks done" lie).
+///
+///    Blocking bug 1: `pending_continuations` is the active SESSION's queued
+///    count, not a per-group fact. It must only retitle the CURRENT/active
+///    turn's group — never an ARCHIVED past-turn group (whose work is over and
+///    is not the thing being continued). `is_active_group` gates this. For the
+///    active group the continuation is the live truth, so it even wins over a
+///    `failed` parent (the failure is what is being retried/continued).
+/// 3. `failed > 0` → finished with errors (the only re-entry-beating outcome
+///    for ARCHIVED groups; pending never applies there).
 /// 4. otherwise → completed.
 fn agent_task_group_title(
     in_progress: bool,
     failed: usize,
     pending_continuations: u32,
+    is_active_group: bool,
 ) -> &'static str {
     if in_progress {
         "Orchestrating..."
-    } else if pending_continuations > 0 {
+    } else if is_active_group && pending_continuations > 0 {
         "Re-entering (continuing)..."
     } else if failed > 0 {
         "Agent task finished with errors"
@@ -1943,6 +1984,7 @@ fn agent_task_group_title(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_agent_task_group(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
@@ -1950,6 +1992,7 @@ fn push_agent_task_group(
     items: &[&ActivityItem],
     subagent_titles: &[String],
     pending_continuations: u32,
+    is_active_group: bool,
     expanded: bool,
 ) {
     let active_subagents = subagent_titles.len();
@@ -1971,7 +2014,7 @@ fn push_agent_task_group(
     // while any of its sub-agents are live, so the chip never says "completed"
     // with work outstanding.
     let in_progress = active > 0 || active_subagents > 0;
-    let title = agent_task_group_title(in_progress, failed, pending_continuations);
+    let title = agent_task_group_title(in_progress, failed, pending_continuations, is_active_group);
     let mut metadata = vec![format!("{} action(s)", items.len())];
     if active > 0 {
         metadata.push(format!("{active} active"));
@@ -3076,8 +3119,12 @@ fn harness_status_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> 
     // Context window %, mirrored as the textual label alongside the gauge so
     // it survives a narrow terminal (and is unit-testable).
     if let Some(percent) = harness_context_percent(app) {
+        // `~` marks this as an estimate: the wire carries no per-model context
+        // window, so the percent is against a fixed default denominator
+        // (`DEFAULT_CONTEXT_WINDOW_TOKENS`) and is approximate when the real
+        // model window differs.
         spans.push(Span::styled(
-            format!(" · ctx {percent}%"),
+            format!(" · ctx ~{percent}%"),
             palette.muted().bg(palette.surface),
         ));
     }
@@ -3111,7 +3158,7 @@ fn render_harness_status_row(frame: &mut Frame<'_>, app: &AppState, palette: Pal
         let percent = (ratio * 100.0).round() as u16;
         let gauge = LineGauge::default()
             .ratio(ratio)
-            .label(format!("ctx {percent}%"))
+            .label(format!("ctx ~{percent}%"))
             .filled_style(Style::default().fg(palette.accent).bg(palette.surface))
             .unfilled_style(Style::default().fg(palette.frame).bg(palette.surface));
         frame.render_widget(gauge, split[1]);
@@ -6191,11 +6238,12 @@ mod tests {
         // items, no running sub-agents) but the server reports a pending
         // continuation, the title must NOT read "Agent task completed" — that
         // "looks done" lie hides the master re-entry. It must reflect
-        // re-entering/continuing instead.
-        let settled = agent_task_group_title(false, 0, 0);
+        // re-entering/continuing instead. The pending re-entry only applies to
+        // the CURRENT/active group (`is_active_group = true`).
+        let settled = agent_task_group_title(false, 0, 0, true);
         assert_eq!(settled, "Agent task completed", "baseline settled title");
 
-        let reentering = agent_task_group_title(false, 0, 1);
+        let reentering = agent_task_group_title(false, 0, 1, true);
         assert!(
             !reentering.to_lowercase().contains("completed")
                 && !reentering.to_lowercase().contains("done"),
@@ -6209,11 +6257,244 @@ mod tests {
 
         // In-progress still wins (orchestrating), and errors still surface even
         // with a pending continuation.
-        assert!(agent_task_group_title(true, 0, 1).contains("Orchestrating"));
+        assert!(agent_task_group_title(true, 0, 1, true).contains("Orchestrating"));
         assert!(
-            agent_task_group_title(false, 2, 0)
+            agent_task_group_title(false, 2, 0, true)
                 .to_lowercase()
                 .contains("error")
+        );
+    }
+
+    #[test]
+    fn agent_task_group_title_pending_continuation_does_not_retitle_archived_group() {
+        // Blocking bug 1: `pending_continuations` is the active session's queued
+        // re-entry count. It is fed into EVERY group title call, including
+        // ARCHIVED past-turn groups. A settled archived group (no live work)
+        // must keep its "completed" title even while a continuation is pending —
+        // only the CURRENT/active group may flip to "Re-entering". Guard via
+        // `is_active_group = false`.
+        let archived_completed = agent_task_group_title(false, 0, 1, false);
+        assert_eq!(
+            archived_completed, "Agent task completed",
+            "archived completed group must NOT read as re-entering: {archived_completed:?}"
+        );
+
+        // An archived FAILED group must keep its failed title — `failed > 0`
+        // must NOT be overridden by the active session's pending continuation.
+        let archived_failed = agent_task_group_title(false, 2, 1, false);
+        assert!(
+            archived_failed.to_lowercase().contains("error"),
+            "archived failed group must keep its failed title, not re-entering: {archived_failed:?}"
+        );
+        assert!(
+            !archived_failed.to_lowercase().contains("re-enter"),
+            "archived failed group must NOT read as re-entering: {archived_failed:?}"
+        );
+    }
+
+    #[test]
+    fn archived_completed_group_keeps_title_while_active_turn_continuation_pending() {
+        // Blocking bug 1 (end-to-end render): a session has an ARCHIVED
+        // completed turn (turn A) AND a live active turn (turn B). The server
+        // reports a pending continuation for the session. The archived group
+        // must STILL read "Agent task completed" — only the active turn's group
+        // may flip to "Re-entering". (RED on f588b6f: the pending count was fed
+        // to every group, retitling the archived completed turn.)
+        use octos_core::ui_protocol::SessionOrchestrationEvent;
+        let session_id = SessionKey("local:test".into());
+        let archived_turn = TurnId::new();
+        let active_turn = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("first request"),
+                    Message::assistant("First answer."),
+                    Message::user("second request"),
+                ],
+                tasks: vec![],
+                // Active turn B is live (the current/active group).
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: active_turn.clone(),
+                    text: String::new(),
+                }),
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // Archived completed group for turn A, anchored to the first request.
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id: session_id.clone(),
+            turn_id: archived_turn,
+            request: Some("first request".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete").with_success(true),
+            ],
+        });
+        // Server has a continuation queued for the active session.
+        app.orchestration.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 0,
+                pending_continuations: 1,
+                phase: Some("re-entering".into()),
+            },
+        );
+
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("Agent task completed"),
+            "archived completed group must keep its title: {text:?}"
+        );
+    }
+
+    #[test]
+    fn archived_failed_group_keeps_failed_title_while_continuation_pending() {
+        // Blocking bug 1 (end-to-end render): an ARCHIVED FAILED group must keep
+        // its failed title even while a continuation is pending for the active
+        // session — pending must NOT override `failed > 0` for a non-active
+        // group. (RED on f588b6f: pending won over failed, losing the failed
+        // title on archived groups.)
+        use octos_core::ui_protocol::SessionOrchestrationEvent;
+        let session_id = SessionKey("local:test".into());
+        let archived_turn = TurnId::new();
+        let active_turn = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("first request"),
+                    Message::assistant("First answer."),
+                    Message::user("second request"),
+                ],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: active_turn.clone(),
+                    text: String::new(),
+                }),
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id: session_id.clone(),
+            turn_id: archived_turn,
+            request: Some("first request".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "shell", "failed").with_success(false),
+            ],
+        });
+        app.orchestration.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 0,
+                pending_continuations: 1,
+                phase: Some("re-entering".into()),
+            },
+        );
+
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("Agent task finished with errors"),
+            "archived failed group must keep its failed title: {text:?}"
+        );
+    }
+
+    #[test]
+    fn active_turn_group_with_pending_continuation_reads_reentering() {
+        // Blocking bug 1 (pins intended behavior): the ACTIVE/current turn's
+        // group (the live `live_reply` turn, archived to its log) DOES read
+        // "Re-entering (continuing)…" when a continuation is pending. The active
+        // group is identified by `log.turn_id == active_turn().turn_id`.
+        use octos_core::ui_protocol::SessionOrchestrationEvent;
+        let session_id = SessionKey("local:test".into());
+        let active_turn = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("only request")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: active_turn.clone(),
+                    text: String::new(),
+                }),
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // The active turn's settled tool calls are archived to its log (the
+        // re-entry gap: parent calls done, continuation queued).
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id: session_id.clone(),
+            turn_id: active_turn.clone(),
+            request: Some("only request".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                    .with_turn(active_turn)
+                    .with_success(true),
+            ],
+        });
+        app.orchestration.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 0,
+                pending_continuations: 1,
+                phase: Some("re-entering".into()),
+            },
+        );
+
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("Re-entering (continuing)"),
+            "active turn group with pending continuation reads re-entering: {text:?}"
+        );
+        assert!(
+            !text.contains("Agent task completed"),
+            "active turn group must NOT read completed during the re-entry gap: {text:?}"
+        );
+    }
+
+    #[test]
+    fn agent_task_group_title_failed_active_turn_with_pending_reads_reentering() {
+        // Precedence decision for the ACTIVE group: a failed active turn that
+        // the server is genuinely continuing (pending_continuations > 0) reads
+        // "Re-entering (continuing)…" — the queued continuation is the live
+        // truth (the failure is being retried/continued), so it wins over the
+        // failed title FOR THE ACTIVE GROUP ONLY.
+        let active_failed_pending = agent_task_group_title(false, 1, 1, true);
+        assert!(
+            active_failed_pending.to_lowercase().contains("re-enter")
+                || active_failed_pending.to_lowercase().contains("continu"),
+            "failed active turn that is continuing reads re-entering: {active_failed_pending:?}"
+        );
+
+        // A failed active turn with NO pending continuation still reads as
+        // failed (no continuation queued → it really did finish with errors).
+        let active_failed = agent_task_group_title(false, 1, 0, true);
+        assert!(
+            active_failed.to_lowercase().contains("error"),
+            "failed active turn with no continuation reads as failed: {active_failed:?}"
         );
     }
 
@@ -7746,8 +8027,8 @@ mod tests {
         assert!(text.contains("↓374"), "{text:?}");
         assert!(text.contains("$0.0123"), "{text:?}");
         assert!(
-            text.contains("ctx 50%"),
-            "ctx % from token_estimate: {text:?}"
+            text.contains("ctx ~50%"),
+            "ctx % from token_estimate (approximate marker): {text:?}"
         );
         // Context ratio drives the LineGauge (64000 / 128000 = 0.5).
         assert_eq!(harness_context_ratio(&app), Some(0.5));
@@ -7767,6 +8048,48 @@ mod tests {
         assert!(
             rendered.contains("Tab inspector"),
             "composer hint not clobbered: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn harness_status_row_ctx_label_marks_estimate() {
+        // Nit: ctx% uses a fixed DEFAULT_CONTEXT_WINDOW_TOKENS denominator (no
+        // per-model window on the wire), so the label must read as an ESTIMATE
+        // (`ctx ~N%`) rather than an exact figure that would mislead when the
+        // real model window differs.
+        use octos_core::ui_protocol::SessionOrchestrationEvent;
+        let session_id = SessionKey("local:test".into());
+        let mut app = autonomy_app_state();
+        app.orchestration.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 0,
+                pending_continuations: 0,
+                phase: Some("working".into()),
+            },
+        );
+        app.context_lifecycle_mut(&session_id).state = Some(crate::model::ContextLifecycleState {
+            session_id: session_id.clone(),
+            thread_id: None,
+            generation: 1,
+            transcript_hash: String::new(),
+            item_count: 10,
+            token_estimate: 32_000,
+            recovery_state: "healthy".into(),
+            last_checkpoint_id: None,
+            last_compaction_id: None,
+        });
+
+        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex))
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(
+            text.contains("ctx ~25%"),
+            "ctx label must carry the approximate marker: {text:?}"
         );
     }
 
