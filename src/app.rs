@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, LineGauge, List, ListItem, Paragraph, Wrap},
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -68,8 +68,13 @@ fn render_chat_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
         frame.area().height,
     );
     let autonomy_height = autonomy_indicator_height(app);
+    let harness_height = harness_status_height(app);
     let surface_budget = frame.area().height.saturating_sub(
-        min_transcript_height(frame.area().height) + composer_height + autonomy_height + 1,
+        min_transcript_height(frame.area().height)
+            + composer_height
+            + autonomy_height
+            + harness_height
+            + 1,
     );
     let menu_height = desired_menu_height.min(surface_budget);
     let root = Layout::default()
@@ -78,6 +83,7 @@ fn render_chat_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
             Constraint::Min(8),
             Constraint::Length(menu_height),
             Constraint::Length(autonomy_height),
+            Constraint::Length(harness_height),
             Constraint::Length(composer_height),
             Constraint::Length(1),
         ])
@@ -90,9 +96,12 @@ fn render_chat_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
     if autonomy_height > 0 {
         frame.render_widget(render_autonomy_indicator(app, palette), root[2]);
     }
-    frame.render_widget(render_composer(app, palette, root[3]), root[3]);
-    set_composer_cursor(frame, app, root[3]);
-    frame.render_widget(render_status(app, palette), root[4]);
+    if harness_height > 0 {
+        render_harness_status_row(frame, app, palette, root[3]);
+    }
+    frame.render_widget(render_composer(app, palette, root[4]), root[4]);
+    set_composer_cursor(frame, app, root[4]);
+    frame.render_widget(render_status(app, palette), root[5]);
 }
 
 fn render_onboarding_first_launch_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
@@ -140,12 +149,14 @@ fn render_inspector_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palet
         frame.area().height,
     );
     let autonomy_height = autonomy_indicator_height(app);
+    let harness_height = harness_status_height(app);
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(12),
             Constraint::Length(menu_height),
             Constraint::Length(autonomy_height),
+            Constraint::Length(harness_height),
             Constraint::Length(composer_height),
             Constraint::Length(4),
         ])
@@ -191,9 +202,12 @@ fn render_inspector_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palet
     if autonomy_height > 0 {
         frame.render_widget(render_autonomy_indicator(app, palette), root[2]);
     }
-    frame.render_widget(render_composer(app, palette, root[3]), root[3]);
-    set_composer_cursor(frame, app, root[3]);
-    frame.render_widget(render_status(app, palette), root[4]);
+    if harness_height > 0 {
+        render_harness_status_row(frame, app, palette, root[3]);
+    }
+    frame.render_widget(render_composer(app, palette, root[4]), root[4]);
+    set_composer_cursor(frame, app, root[4]);
+    frame.render_widget(render_status(app, palette), root[5]);
 }
 
 fn active_menu_surface(app: &AppState) -> Option<menu_render::MenuSurface> {
@@ -1737,6 +1751,7 @@ fn push_activity_section(lines: &mut Vec<Line<'static>>, palette: Palette, app: 
         .rev()
         .copied()
         .collect::<Vec<_>>();
+    let pending_continuations = active_session_pending_continuations(app);
     let mut group: Vec<&ActivityItem> = Vec::new();
     let mut last_turn: Option<&octos_core::ui_protocol::TurnId> = None;
     for item in recent.iter().copied() {
@@ -1749,6 +1764,7 @@ fn push_activity_section(lines: &mut Vec<Line<'static>>, palette: Palette, app: 
                     last_turn,
                     &group,
                     &running_subagent_titles_for_chip(app, last_turn),
+                    pending_continuations,
                     app.expanded_tool_outputs,
                 );
                 group.clear();
@@ -1764,6 +1780,7 @@ fn push_activity_section(lines: &mut Vec<Line<'static>>, palette: Palette, app: 
             last_turn,
             &group,
             &running_subagent_titles_for_chip(app, last_turn),
+            pending_continuations,
             app.expanded_tool_outputs,
         );
     }
@@ -1783,6 +1800,17 @@ fn push_activity_section(lines: &mut Vec<Line<'static>>, palette: Palette, app: 
 
 fn has_flow_activity(app: &AppState) -> bool {
     !flow_activity_items(app).is_empty()
+}
+
+/// Pending master re-entries the server has queued for the active session
+/// (from the `session/orchestration` mirror). Drives the "re-entering" chip
+/// title so a settled-but-continuing turn doesn't read as completed.
+fn active_session_pending_continuations(app: &AppState) -> u32 {
+    app.active_session()
+        .and_then(|session| app.orchestration.get(&session.id))
+        .filter(|status| status.active)
+        .map(|status| status.pending_continuations)
+        .unwrap_or(0)
 }
 
 fn flow_activity_items(app: &AppState) -> Vec<&ActivityItem> {
@@ -1847,6 +1875,7 @@ fn push_turn_activity_log_section(
         Some(&log.turn_id),
         &shown,
         &running_subagent_titles_for_chip(app, Some(&log.turn_id)),
+        active_session_pending_continuations(app),
         app.expanded_tool_outputs,
     );
     if log.items.len() > shown.len() {
@@ -1889,12 +1918,38 @@ fn spinner_frame() -> &'static str {
     SPINNER_FRAMES[(elapsed / 120) as usize % SPINNER_FRAMES.len()]
 }
 
+/// Title for an agent-task group chip. Pure so it can be unit-tested
+/// directly (Gap 2 fix #2). The order of precedence is deliberate:
+///
+/// 1. `in_progress` (live tool calls or running sub-agents) → "Orchestrating".
+/// 2. `pending_continuations > 0` → "re-entering". The parent's tool calls can
+///    all be settled while the server has a master re-entry queued; the chip
+///    must NOT read "Agent task completed" in that gap (the "looks done" lie).
+/// 3. `failed > 0` → finished with errors.
+/// 4. otherwise → completed.
+fn agent_task_group_title(
+    in_progress: bool,
+    failed: usize,
+    pending_continuations: u32,
+) -> &'static str {
+    if in_progress {
+        "Orchestrating..."
+    } else if pending_continuations > 0 {
+        "Re-entering (continuing)..."
+    } else if failed > 0 {
+        "Agent task finished with errors"
+    } else {
+        "Agent task completed"
+    }
+}
+
 fn push_agent_task_group(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
     turn_id: Option<&octos_core::ui_protocol::TurnId>,
     items: &[&ActivityItem],
     subagent_titles: &[String],
+    pending_continuations: u32,
     expanded: bool,
 ) {
     let active_subagents = subagent_titles.len();
@@ -1916,13 +1971,7 @@ fn push_agent_task_group(
     // while any of its sub-agents are live, so the chip never says "completed"
     // with work outstanding.
     let in_progress = active > 0 || active_subagents > 0;
-    let title = if in_progress {
-        "Orchestrating..."
-    } else if failed > 0 {
-        "Agent task finished with errors"
-    } else {
-        "Agent task completed"
-    };
+    let title = agent_task_group_title(in_progress, failed, pending_continuations);
     let mut metadata = vec![format!("{} action(s)", items.len())];
     if active > 0 {
         metadata.push(format!("{active} active"));
@@ -2879,6 +2928,200 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'stati
 fn render_autonomy_indicator(app: &AppState, palette: Palette) -> Paragraph<'static> {
     let lines = autonomy_indicator_lines(app, palette);
     Paragraph::new(Text::from(lines)).style(Style::default().fg(palette.text).bg(palette.surface))
+}
+
+/// Default context-window denominator used to render `ctx N%`. The wire does
+/// not (yet) carry a per-model context-window max, so we estimate the percent
+/// against a common modern default. Surfaces the inspector-only
+/// `token_estimate` as a glanceable budget bar in the harness status row.
+const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 128_000;
+
+/// Compact token count for the harness row: `34211` -> `34.2k`.
+fn humanize_token_count(tokens: u64) -> String {
+    if tokens >= 1000 {
+        format!("{:.1}k", tokens as f64 / 1000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// True when the harness has live state worth surfacing in the dedicated
+/// status row: the active session is orchestrating (server `active`) OR a turn
+/// is in progress locally. Idle → the row collapses to height 0 so it can
+/// never collide with the composer's top-border chrome (the prior revert,
+/// 249fe652, drew the indicator ON the composer border).
+fn harness_status_active(app: &AppState) -> bool {
+    let orchestrating = app
+        .active_session()
+        .and_then(|session| app.orchestration.get(&session.id))
+        .is_some_and(|status| status.active);
+    orchestrating || matches!(app.run_state, SessionRunState::InProgress)
+}
+
+/// Rows the harness status indicator needs: 1 when active, 0 when idle.
+fn harness_status_height(app: &AppState) -> u16 {
+    if harness_status_active(app) { 1 } else { 0 }
+}
+
+/// Context-window fill ratio (0.0..=1.0) for the harness row `LineGauge`, or
+/// `None` when no `token_estimate` is known for the active session yet.
+fn harness_context_ratio(app: &AppState) -> Option<f64> {
+    let session = app.active_session()?;
+    let token_estimate = app
+        .context_lifecycle_for(&session.id)?
+        .state
+        .as_ref()?
+        .token_estimate;
+    if DEFAULT_CONTEXT_WINDOW_TOKENS == 0 {
+        return None;
+    }
+    Some((token_estimate as f64 / DEFAULT_CONTEXT_WINDOW_TOKENS as f64).clamp(0.0, 1.0))
+}
+
+/// Integer context-window percent (0..=100) for the `ctx N%` label.
+fn harness_context_percent(app: &AppState) -> Option<u16> {
+    harness_context_ratio(app).map(|ratio| (ratio * 100.0).round() as u16)
+}
+
+/// Build the harness status line(s): spinner + phase + agent count +
+/// re-entering + token in/out + cost + retry + ctx %. Empty when idle.
+fn harness_status_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> {
+    if !harness_status_active(app) {
+        return Vec::new();
+    }
+    let Some(session) = app.active_session() else {
+        return Vec::new();
+    };
+    let session_id = session.id.clone();
+    let status = app.orchestration.get(&session_id);
+
+    let phase = match status.and_then(|s| s.phase.as_deref()) {
+        Some("orchestrating") => "Orchestrating",
+        Some("re-entering") => "Re-entering",
+        Some("working") => "Working",
+        Some(other) if !other.is_empty() => other,
+        _ => "Working",
+    };
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled(
+        format!("{} ", spinner_frame()),
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD)
+            .bg(palette.surface),
+    ));
+    spans.push(Span::styled(
+        phase.to_string(),
+        palette.title().bg(palette.surface),
+    ));
+
+    if let Some(status) = status {
+        if status.running_agents > 0 {
+            spans.push(Span::styled(
+                format!(
+                    " · {} agent{}",
+                    status.running_agents,
+                    if status.running_agents == 1 { "" } else { "s" }
+                ),
+                palette.text().bg(palette.surface),
+            ));
+        }
+        // The re-entry gap (sub-agents settled, a continuation queued) is the
+        // whole reason for this row: it must NOT read as done.
+        if status.pending_continuations > 0 {
+            spans.push(Span::styled(
+                " · re-entering".to_string(),
+                palette.muted().bg(palette.surface),
+            ));
+        }
+    }
+
+    // Token in/out + cumulative session cost (from token_cost progress).
+    if let Some((input, output, cost)) = app.session_usage.get(&session_id) {
+        if input.is_some() || output.is_some() {
+            spans.push(Span::styled(
+                format!(
+                    " · ↑{} ↓{}",
+                    humanize_token_count(input.unwrap_or(0)),
+                    humanize_token_count(output.unwrap_or(0)),
+                ),
+                palette.text().bg(palette.surface),
+            ));
+        }
+        if let Some(cost) = cost.filter(|c| *c > 0.0) {
+            spans.push(Span::styled(
+                format!(" · ${cost:.4}"),
+                palette.muted().bg(palette.surface),
+            ));
+        }
+    }
+
+    // Retry/backoff (metadata.retry — previously ignored on the wire).
+    if let Some(retry) = app.session_retry.get(&session_id) {
+        let attempt = match (retry.attempt, retry.max_attempts) {
+            (Some(a), Some(max)) => format!(" · retrying (attempt {a}/{max})"),
+            (Some(a), None) => format!(" · retrying (attempt {a})"),
+            _ => " · retrying".to_string(),
+        };
+        spans.push(Span::styled(
+            attempt,
+            palette
+                .muted()
+                .bg(palette.surface)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    // Context window %, mirrored as the textual label alongside the gauge so
+    // it survives a narrow terminal (and is unit-testable).
+    if let Some(percent) = harness_context_percent(app) {
+        spans.push(Span::styled(
+            format!(" · ctx {percent}%"),
+            palette.muted().bg(palette.surface),
+        ));
+    }
+
+    vec![Line::from(spans)]
+}
+
+/// Render the dedicated harness status row. Splits the row so the textual
+/// status sits on the left and a `LineGauge` context-window bar sits on the
+/// right when a `token_estimate` is known. Drawn into its own layout row
+/// (never the composer border).
+fn render_harness_status_row(frame: &mut Frame<'_>, app: &AppState, palette: Palette, area: Rect) {
+    let lines = harness_status_lines(app, palette);
+    if lines.is_empty() {
+        return;
+    }
+    let ratio = harness_context_ratio(app);
+    // Reserve a fixed-width column for the context gauge only when we have a
+    // ratio to show; otherwise the text spans the full width.
+    const GAUGE_WIDTH: u16 = 18;
+    if let Some(ratio) = ratio.filter(|_| area.width > GAUGE_WIDTH + 12) {
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(12), Constraint::Length(GAUGE_WIDTH)])
+            .split(area);
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .style(Style::default().fg(palette.text).bg(palette.surface)),
+            split[0],
+        );
+        let percent = (ratio * 100.0).round() as u16;
+        let gauge = LineGauge::default()
+            .ratio(ratio)
+            .label(format!("ctx {percent}%"))
+            .filled_style(Style::default().fg(palette.accent).bg(palette.surface))
+            .unfilled_style(Style::default().fg(palette.frame).bg(palette.surface));
+        frame.render_widget(gauge, split[1]);
+    } else {
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .style(Style::default().fg(palette.text).bg(palette.surface)),
+            area,
+        );
+    }
 }
 
 fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'static> {
@@ -5943,6 +6186,38 @@ mod tests {
     }
 
     #[test]
+    fn agent_task_group_title_with_pending_continuations_does_not_say_completed() {
+        // Gap 2 fix #2: when the parent's tool calls are all settled (no active
+        // items, no running sub-agents) but the server reports a pending
+        // continuation, the title must NOT read "Agent task completed" — that
+        // "looks done" lie hides the master re-entry. It must reflect
+        // re-entering/continuing instead.
+        let settled = agent_task_group_title(false, 0, 0);
+        assert_eq!(settled, "Agent task completed", "baseline settled title");
+
+        let reentering = agent_task_group_title(false, 0, 1);
+        assert!(
+            !reentering.to_lowercase().contains("completed")
+                && !reentering.to_lowercase().contains("done"),
+            "pending continuation must not read as completed/done: {reentering:?}"
+        );
+        assert!(
+            reentering.to_lowercase().contains("re-enter")
+                || reentering.to_lowercase().contains("continu"),
+            "pending continuation must read as re-entering/continuing: {reentering:?}"
+        );
+
+        // In-progress still wins (orchestrating), and errors still surface even
+        // with a pending continuation.
+        assert!(agent_task_group_title(true, 0, 1).contains("Orchestrating"));
+        assert!(
+            agent_task_group_title(false, 2, 0)
+                .to_lowercase()
+                .contains("error")
+        );
+    }
+
+    #[test]
     fn leaked_running_item_in_terminal_turn_log_does_not_pin_orchestrating() {
         // Orphan activity-chip self-heal: a `ToolStarted` whose matching
         // `ToolCompleted` never arrived (a leaked spawn_only chip / any future
@@ -7414,6 +7689,136 @@ mod tests {
         assert!(text.contains("Loops: 2 running"));
         assert!(text.contains("5m deploy-check"));
         assert!(text.contains("self-paced PR-watch"));
+    }
+
+    #[test]
+    fn harness_status_row_surfaces_orchestration_usage_and_context() {
+        use octos_core::ui_protocol::SessionOrchestrationEvent;
+        let session_id = SessionKey("local:test".into());
+        let mut app = autonomy_app_state();
+
+        // Idle: no orchestration, no active turn → row reserves no rows and is
+        // absent from the render (so it cannot collide with the composer).
+        assert_eq!(harness_status_height(&app), 0);
+        assert!(harness_status_lines(&app, Palette::for_theme(ThemeName::Codex)).is_empty());
+
+        // Orchestrating: active, 2 running agents, 1 pending continuation.
+        app.orchestration.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 2,
+                pending_continuations: 1,
+                phase: Some("orchestrating".into()),
+            },
+        );
+        app.session_usage
+            .insert(session_id.clone(), (Some(34_211), Some(374), Some(0.0123)));
+        // Context usage (token_estimate) is inspector-only today — surface it
+        // as ctx N% in the harness row.
+        app.context_lifecycle_mut(&session_id).state = Some(crate::model::ContextLifecycleState {
+            session_id: session_id.clone(),
+            thread_id: None,
+            generation: 1,
+            transcript_hash: String::new(),
+            item_count: 10,
+            token_estimate: 64_000,
+            recovery_state: "healthy".into(),
+            last_checkpoint_id: None,
+            last_compaction_id: None,
+        });
+
+        assert_eq!(
+            harness_status_height(&app),
+            1,
+            "active row reserves one row"
+        );
+        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex))
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(text.contains("Orchestrating"), "{text:?}");
+        assert!(text.contains("2 agents"), "{text:?}");
+        assert!(text.contains("re-entering"), "{text:?}");
+        assert!(text.contains("↑34.2k"), "{text:?}");
+        assert!(text.contains("↓374"), "{text:?}");
+        assert!(text.contains("$0.0123"), "{text:?}");
+        assert!(
+            text.contains("ctx 50%"),
+            "ctx % from token_estimate: {text:?}"
+        );
+        // Context ratio drives the LineGauge (64000 / 128000 = 0.5).
+        assert_eq!(harness_context_ratio(&app), Some(0.5));
+
+        // Even with the row ACTIVE the composer's top-border chrome survives —
+        // the indicator lives on its own dedicated layout row, not the border
+        // (the collision that caused the 249fe652 revert cannot recur).
+        let rendered = rendered_text(&app);
+        assert!(
+            rendered.contains("Orchestrating"),
+            "active row renders: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("Composer"),
+            "composer chrome intact: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("Tab inspector"),
+            "composer hint not clobbered: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn harness_status_row_surfaces_retry_state() {
+        use octos_core::ui_protocol::{SessionOrchestrationEvent, UiRetryBackoff};
+        let session_id = SessionKey("local:test".into());
+        let mut app = autonomy_app_state();
+        app.orchestration.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 0,
+                pending_continuations: 0,
+                phase: Some("working".into()),
+            },
+        );
+        let mut retry = UiRetryBackoff::new();
+        retry.attempt = Some(3);
+        app.session_retry.insert(session_id, retry);
+
+        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex))
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(
+            text.to_lowercase().contains("retry") || text.to_lowercase().contains("retrying"),
+            "retry state must render in the harness row: {text:?}"
+        );
+        assert!(
+            text.contains('3'),
+            "retry attempt number must render: {text:?}"
+        );
+    }
+
+    #[test]
+    fn harness_status_row_does_not_collide_with_composer_when_idle() {
+        // Idle render: the dedicated harness row takes height 0, so the
+        // composer's top-border chrome ("Composer  Enter send | Tab inspector")
+        // is fully intact — the collision that caused the prior revert
+        // (249fe652) cannot recur because the indicator is never on the border.
+        let app = autonomy_app_state();
+        assert_eq!(harness_status_height(&app), 0);
+        let text = rendered_text(&app);
+        assert!(text.contains("Composer"), "{text:?}");
+        assert!(text.contains("Tab inspector"), "{text:?}");
+        assert!(
+            !text.contains("Orchestrating"),
+            "idle harness row must be absent: {text:?}"
+        );
     }
 
     #[test]

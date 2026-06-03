@@ -8,7 +8,7 @@ use octos_core::ui_protocol::{
     SessionHydrateParams, SessionOrchestrationEvent, TaskArtifactReadParams, TaskCancelParams,
     TaskListParams, TaskOutputReadParams, TaskRestartFromNodeParams, TaskRuntimeState,
     ThreadGraphGetParams, ThreadGraphGetResult, TurnId, TurnInterruptParams, TurnStartParams,
-    TurnStateGetParams, TurnStateGetResult, UiPaneSnapshot, UiProtocolCapabilities,
+    TurnStateGetParams, TurnStateGetResult, UiPaneSnapshot, UiProtocolCapabilities, UiRetryBackoff,
     approval_scopes,
 };
 use octos_core::{Message, SessionKey, TaskId};
@@ -3034,6 +3034,12 @@ pub struct AppState {
     /// indicator.
     pub session_usage:
         std::collections::HashMap<SessionKey, (Option<u64>, Option<u64>, Option<f64>)>,
+    /// Latest retry/backoff status per session — the `UiRetryBackoff` carried
+    /// on `metadata.retry` progress updates that the TUI previously ignored.
+    /// Drives the "retrying (attempt N)" surface in the harness status row.
+    /// Cleared on the session's next non-retry progress event so a settled
+    /// turn doesn't linger as "retrying".
+    pub session_retry: std::collections::HashMap<SessionKey, UiRetryBackoff>,
     pub selected_session: usize,
     pub selected_task: usize,
     pub transcript_scroll: usize,
@@ -4354,6 +4360,7 @@ impl AppState {
             sessions,
             orchestration: std::collections::HashMap::new(),
             session_usage: std::collections::HashMap::new(),
+            session_retry: std::collections::HashMap::new(),
             selected_session,
             selected_task: 0,
             transcript_scroll: 0,

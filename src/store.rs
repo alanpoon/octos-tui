@@ -4647,6 +4647,17 @@ impl Store {
                 entry.2 = token_cost.session_cost;
             }
         }
+        // Gap 2 fix #3: surface the `UiRetryBackoff` carried on
+        // `metadata.retry` (previously ignored) so the harness status row can
+        // render "retrying (attempt N)". A non-retry progress event clears the
+        // stale entry so a settled turn doesn't linger as "retrying".
+        if let Some(retry) = event.metadata.retry.as_ref() {
+            self.state
+                .session_retry
+                .insert(event.session_id.clone(), retry.clone());
+        } else {
+            self.state.session_retry.remove(&event.session_id);
+        }
         let status = progress_status(&event);
         let record_activity = should_record_progress_activity(&event);
         let diff_preview_request = event.metadata.file_mutation.as_ref().and_then(|notice| {
@@ -5233,11 +5244,14 @@ impl Store {
                     synthetic_count: event.normalization.synthetic_count,
                     truncated_count: event.normalization.truncated_count,
                 };
-                let prompt_count = event.normalization.prompt_message_count;
                 self.state
                     .context_lifecycle_mut(&session_id)
                     .apply_normalization(state, normalization);
-                self.state.status = format!("Context normalized: {prompt_count} prompt messages");
+                // Gap 2 fix #4: do NOT write the shared status line here.
+                // Normalization is a background lifecycle signal that fires
+                // every turn; clobbering `status` overwrote meaningful state
+                // (e.g. "compacting…"). The report still lands in the
+                // per-session lifecycle ledger above for the inspector.
                 None
             }
             UiNotification::SessionOrchestration(event) => {
@@ -12448,6 +12462,108 @@ mod tests {
         assert_eq!(
             ledger.last_normalization.as_ref().unwrap().repaired_count,
             1
+        );
+    }
+
+    /// Gap 2 fix #4: `context/normalization_reported` must NOT clobber a
+    /// pre-set shared status line (e.g. a "compacting…"/meaningful status).
+    /// Normalization is a background lifecycle signal — it churns every turn
+    /// and previously overwrote the user-visible status string.
+    #[test]
+    fn context_normalization_event_does_not_overwrite_status_line() {
+        use octos_core::ui_protocol::{
+            ContextNormalizationReportedEvent, UiContextNormalizationReport, UiContextState,
+        };
+
+        let session_id = SessionKey("local:test".into());
+        let mut store = store_with_empty_session();
+        store.state.status = "compacting…".into();
+
+        store.apply_event(AppUiEvent::Protocol(
+            UiNotification::ContextNormalizationReported(ContextNormalizationReportedEvent {
+                session_id: session_id.clone(),
+                context_state: UiContextState {
+                    session_id: session_id.clone(),
+                    thread_id: None,
+                    generation: 7,
+                    transcript_hash: "h".into(),
+                    item_count: 12,
+                    token_estimate: 5000,
+                    recovery_state: "healthy".into(),
+                    last_checkpoint_id: None,
+                    last_compaction_id: None,
+                },
+                normalization: UiContextNormalizationReport {
+                    generation: 7,
+                    input_transcript_hash: "h".into(),
+                    output_prompt_hash: "out".into(),
+                    model_capability_id: "anthropic/sonnet-4.7".into(),
+                    prompt_message_count: 12,
+                    token_estimate: 5000,
+                    repaired_count: 0,
+                    dropped_count: 0,
+                    synthetic_count: 0,
+                    truncated_count: 0,
+                },
+            }),
+        ));
+
+        // The ledger still records the normalization (surfaced in the
+        // inspector / lifecycle pane), but the shared status line is intact.
+        assert!(
+            store
+                .state
+                .context_lifecycle_for(&session_id)
+                .and_then(|l| l.last_normalization.as_ref())
+                .is_some(),
+            "normalization still stored in the lifecycle ledger"
+        );
+        assert_eq!(
+            store.state.status, "compacting…",
+            "normalization must not churn the shared status line"
+        );
+    }
+
+    /// Gap 2 fix #3: a progress event carrying `metadata.retry`
+    /// (`UiRetryBackoff`) must populate `AppState.session_retry` so the
+    /// harness status row can render "retrying (attempt N)". The info was on
+    /// the wire but previously ignored.
+    #[test]
+    fn progress_retry_metadata_populates_session_retry() {
+        use octos_core::ui_protocol::UiRetryBackoff;
+
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        let mut retry = UiRetryBackoff::new();
+        retry.attempt = Some(2);
+        retry.max_attempts = Some(5);
+        retry.reason = Some("rate_limited".into());
+
+        store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
+            session_id.clone(),
+            Some(TurnId::new()),
+            UiProgressMetadata::retry_backoff(retry),
+        )));
+
+        let stored = store
+            .state
+            .session_retry
+            .get(&session_id)
+            .expect("retry recorded for session");
+        assert_eq!(stored.attempt, Some(2));
+        assert_eq!(stored.max_attempts, Some(5));
+
+        // A subsequent non-retry progress event clears the stale retry so a
+        // settled turn doesn't linger as "retrying".
+        store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
+            session_id.clone(),
+            Some(TurnId::new()),
+            UiProgressMetadata::new(progress_kinds::STREAM_END).with_message("stream closed"),
+        )));
+        assert!(
+            !store.state.session_retry.contains_key(&session_id),
+            "non-retry progress clears the retry entry"
         );
     }
 
