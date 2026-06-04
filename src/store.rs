@@ -6060,9 +6060,23 @@ impl Store {
 
     fn summarize_turn_activity(&self, turn_id: &TurnId) -> TurnActivitySummary {
         let mut summary = TurnActivitySummary::default();
-        for activity in self
+        // Count from where the turn's items actually live. A switch-finalized
+        // turn has ALREADY had `capture_completed_turn_activity` move its items
+        // out of the live `state.activity` into `turn_activity_logs`, so the
+        // live set is empty for it — summarizing live would report "0 action(s)"
+        // for a turn that genuinely ran N. Prefer the archived log when present;
+        // otherwise fall back to live activity (the normal in-turn path, whose
+        // items have NOT yet been archived, is therefore unchanged).
+        let archived = self
             .state
-            .activity
+            .turn_activity_logs
+            .iter()
+            .find(|log| &log.turn_id == turn_id);
+        let items: &[ActivityItem] = match archived {
+            Some(log) => &log.items,
+            None => &self.state.activity,
+        };
+        for activity in items
             .iter()
             .filter(|activity| activity.turn_id.as_ref() == Some(turn_id))
         {
@@ -11321,6 +11335,121 @@ mod tests {
             store.state.turn_activity_logs.len(),
             logs_before,
             "late COMPLETION for the dropped-empty turn must not change captured logs"
+        );
+    }
+
+    #[test]
+    fn late_error_card_for_switch_finalized_turn_reports_real_action_count() {
+        // Count-honesty nit: a late `TurnError` for a SWITCH-FINALIZED turn must
+        // report the turn's TRUE action count on its failure card, not 0. Turn A
+        // runs N (5) tools, then a delta for turn B switches turns — which
+        // ARCHIVES A's activity into `turn_activity_logs` and removes it from the
+        // live `state.activity`. B completes, then a LATE `TurnError{A}` surfaces
+        // A's failure card. The card's "Activity: N action(s)" must read the
+        // archived log (where A's items now live), not the empty live set.
+        //
+        // Pre-fix RED: `turn_error_fallback_message` summarized only the live
+        // `state.activity`, which no longer holds A's items, so the card reported
+        // "Activity: 0 action(s) recorded." even though A really ran 5 tools.
+        const N: usize = 5;
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        // Turn A starts and runs N completed tools (no assistant deltas).
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_a.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        for i in 0..N {
+            let call_id = format!("call-A-{i}");
+            store.apply_event(AppUiEvent::Protocol(UiNotification::ToolStarted(
+                ToolStartedEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: turn_a.clone(),
+                    tool_call_id: call_id.clone(),
+                    tool_name: "shell".into(),
+                    arguments: Some(serde_json::json!({"command": "ls"})),
+                },
+            )));
+            store.apply_event(AppUiEvent::Protocol(UiNotification::ToolCompleted(
+                ToolCompletedEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: turn_a.clone(),
+                    tool_call_id: call_id,
+                    tool_name: "shell".into(),
+                    success: Some(true),
+                    output_preview: Some("files".into()),
+                    duration_ms: Some(10),
+                },
+            )));
+        }
+
+        // A delta for turn B switches turns: A is finalized + its activity is
+        // archived to turn_activity_logs and removed from live state.activity.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                text: "answer B".into(),
+            },
+        )));
+        // Sanity: A's items are no longer in the live activity (archived).
+        assert!(
+            !store
+                .state
+                .activity
+                .iter()
+                .any(|item| item.turn_id.as_ref() == Some(&turn_a)),
+            "turn A's activity must have been archived out of live state.activity"
+        );
+        // B completes — live_reply is now None.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        // LATE TurnError{A} arrives after B already completed.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_a.clone(),
+                code: "provider_error".into(),
+                message: "upstream 500 on turn A".into(),
+            },
+        )));
+
+        let card = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .find(|c| c.contains("Turn failed before producing a final answer"))
+            .expect("a failure card for A's late error must be surfaced");
+        // The count must reflect A's TRUE action count from the archived log.
+        assert!(
+            card.contains(&format!("Activity: {N} action(s) recorded.")),
+            "switch-finalized turn's failure card must report its real action \
+             count ({N}), not 0: {card:?}"
+        );
+        assert!(
+            !card.contains("Activity: 0 action(s) recorded."),
+            "switch-finalized turn's failure card must NOT report 0 actions: {card:?}"
         );
     }
 
