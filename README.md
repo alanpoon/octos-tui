@@ -12,7 +12,7 @@
 <em>Welcome to Octos — Your Coding Buddy</em>
 </div>
 
-`octos-tui` is a standalone terminal UI client for the Octos AppUi/UI Protocol.
+`octos-tui` is a standalone terminal UI client for the Octos UI Protocol.
 It is a chat-first coding client that you point at an `octos serve` backend; the
 server owns the agent, providers, and tools, and the TUI renders the
 conversation, command/tool cards, diffs, and approvals.
@@ -304,7 +304,7 @@ published crate version instead of the sibling path.
 
 ## Protocol contract
 
-`octos-tui` consumes AppUi/UI Protocol fields from `octos-core` and must not
+`octos-tui` consumes Octos UI Protocol fields from `octos-core` and must not
 invent local wire extensions. Any protocol change must land through a formal UI
 Protocol change request with shared types, server tests, golden protocol tests,
 and TUI reducer/rendering tests.
