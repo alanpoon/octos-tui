@@ -2,7 +2,7 @@
 
 ## Scope
 
-`octos-tui` is a standalone terminal client for the Octos AppUI/UI Protocol.
+`octos-tui` is a standalone terminal client for the Octos UI Protocol.
 In protocol mode it does not run the Octos agent, execute tools, approve
 commands, maintain the durable ledger, or own provider/model configuration.
 Those responsibilities belong to the `octos serve` process.
@@ -72,7 +72,7 @@ That route is implemented in the Octos repo under
 `crates/octos-cli/src/api/ui_protocol.rs`. It accepts JSON-RPC messages over a
 WebSocket and translates protocol commands into runtime actions.
 
-WebSocket is the current deployed transport, not the AppUI protocol itself. The
+WebSocket is the current deployed transport, not the Octos UI Protocol itself. The
 transport refactor milestone is documented in the parent Octos repo at
 `api/APPUI_TRANSPORT_PROTOCOL_REFACTOR_MILESTONE.md`. The intended long-term
 shape is that the same `AppUiCommand` and `AppUiEvent` contract can run over
@@ -295,7 +295,7 @@ The important product difference is where the runtime lives:
 | Tool execution | Local CLI sandbox/tool runner. | Server-side Octos runtime/tool system. |
 | Approval policy | Local CLI approval flow. | Server-owned approval requests plus client rendering/response. |
 | Durable replay | Local CLI/session behavior. | Server ledger and replay cursors. |
-| Client/server contract | CLI implementation boundary. | Stable AppUI/UI Protocol boundary. |
+| Client/server contract | CLI implementation boundary. | Stable Octos UI Protocol boundary. |
 
 For Octos, the product goal is to keep Codex-quality coding UX while preserving
 a cleaner split: the terminal app is replaceable, and all clients speak the

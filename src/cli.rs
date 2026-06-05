@@ -85,7 +85,7 @@ pub struct Cli {
 #[command(
     name = "octos-tui",
     version = env!("CARGO_PKG_VERSION"),
-    about = "Mock-backed Octos TUI prototype on the AppUi/UI Protocol boundary"
+    about = "Mock-backed Octos TUI prototype on the Octos UI Protocol boundary"
 )]
 struct CliArgs {
     /// JSON config file used as launch defaults. CLI flags override config values.
