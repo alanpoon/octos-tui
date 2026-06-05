@@ -1,6 +1,9 @@
 /target
 *.log
 
+# Local dev override for octos-core (see .cargo/config.toml.example).
+/.cargo/config.toml
+
 # Generated tmux/UX soak artifacts.
 e2e/test-results*/
 .octos-workspace.toml

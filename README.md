@@ -28,6 +28,44 @@ the terminal client. Architecture and ownership boundaries live in
 
 ---
 
+## Install
+
+Every method installs a single self-contained `octos-tui` binary. Then run
+`octos-tui --help`.
+
+### Prebuilt binary — no Rust toolchain needed (recommended)
+
+Same model as Claude Code and Codex: each [GitHub Release](https://github.com/octos-org/octos-tui/releases)
+ships prebuilt binaries for macOS (Apple Silicon), Linux (x86-64 +
+arm64), and Windows (x86-64), distributed via:
+
+```bash
+# npm
+npm install -g @octos-org/octos-tui
+
+# Homebrew
+brew install octos-org/tap/octos-tui
+
+# shell installer (macOS / Linux)
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/octos-org/octos-tui/releases/latest/download/octos-tui-installer.sh | sh
+```
+
+### From source with Cargo (needs Rust 1.85+)
+
+```bash
+# straight from git — no crates.io publish required
+cargo install --git https://github.com/octos-org/octos-tui octos-tui
+
+# or, once published to crates.io
+cargo install octos-tui
+```
+
+> `octos-core` (the shared protocol crate) is pulled automatically as a git
+> dependency, so installing needs no sibling `octos` checkout.
+
+---
+
 ## Quickstart: solo onboarding
 
 A copy-pasteable, first-time walkthrough. By the end you have a local profile,
@@ -35,29 +73,22 @@ an LLM provider, and a live coding session — no dashboard, no email OTP.
 
 ### 1. Get the source and build
 
-`octos-tui` depends on a sibling `octos` checkout via a path dependency in
-`Cargo.toml`:
-
-```text
-octos-core = { path = "../octos/crates/octos-core" }
-```
-
-So clone the two repos as **siblings** (without `../octos`, the build fails
-early with `failed to load manifest for dependency octos-core`):
+`octos-tui` is a single binary. `octos-core` (the shared protocol crate) is
+pulled automatically as a git dependency, so a plain clone builds with **no
+sibling checkout** required (needs Rust 1.85+):
 
 ```bash
-mkdir octos-workspace && cd octos-workspace
-git clone https://github.com/octos-org/octos.git
 git clone https://github.com/octos-org/octos-tui.git
-```
-
-Build the single `octos-tui` binary (needs Rust 1.85+):
-
-```bash
 cd octos-tui
 cargo build --release
 # produces ./target/release/octos-tui
 ```
+
+> **Developing against a local `octos`?** To build against an uncommitted
+> sibling `../octos/crates/octos-core` instead of the pinned git revision, run
+> `cp .cargo/config.toml.example .cargo/config.toml` (gitignored) — see the
+> comment in that file. This restores the live-sibling edit loop of the old
+> path dependency.
 
 ### 2. First run → the welcome screen
 

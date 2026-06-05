@@ -5,14 +5,20 @@ edition = "2024"
 rust-version = "1.85.0"
 license = "Apache-2.0"
 repository = "https://github.com/octos-org/octos-tui"
-description = "Terminal UI client for Octos AppUi/UI Protocol"
+homepage = "https://github.com/octos-org/octos-tui"
+description = "Terminal UI client for the Octos UI Protocol"
 
 [[bin]]
 name = "octos-tui"
 path = "src/main.rs"
 
+# octos-core is the shared protocol crate, owned by the `octos` repo. We depend
+# on it by git so a clean checkout (`cargo install --git`, release CI) builds
+# without a sibling `../octos`. For live local dev against an uncommitted core,
+# add a gitignored `.cargo/config.toml` (see `.cargo/config.toml.example`) that
+# patches it to a sibling path — no need to edit this file.
 [dependencies]
-octos-core = { path = "../octos/crates/octos-core" }
+octos-core = { git = "https://github.com/octos-org/octos", rev = "f020813810c91a146ac7cddfb3cd4cfcaf8f8a8f" }
 clap = { version = "4", features = ["derive"] }
 eyre = "0.6"
 color-eyre = "0.6"
@@ -34,3 +40,8 @@ unsafe_code = "deny"
 
 [workspace]
 resolver = "3"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
