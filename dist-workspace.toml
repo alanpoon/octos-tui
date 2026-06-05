@@ -19,6 +19,6 @@ tap = "octos-org/homebrew-tap"
 # in-place (and defer to brew/npm when installed that way).
 install-updater = true
 # Push the generated formula to the Homebrew tap on release.
-publish-jobs = ["homebrew"]
+publish-jobs = ["homebrew", "npm"]
 # Only dry-run ("plan") on PRs; full release artifacts run on tag pushes.
 pr-run-mode = "plan"

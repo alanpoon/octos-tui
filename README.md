@@ -36,7 +36,7 @@ Every method installs a single self-contained `octos-tui` binary. Then run
 ### Prebuilt binary — no Rust toolchain needed (recommended)
 
 Same model as Claude Code and Codex: each [GitHub Release](https://github.com/octos-org/octos-tui/releases)
-ships prebuilt binaries for macOS (Apple Silicon + Intel), Linux (x86-64 +
+ships prebuilt binaries for macOS (Apple Silicon), Linux (x86-64 +
 arm64), and Windows (x86-64), distributed via:
 
 ```bash
