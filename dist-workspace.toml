@@ -8,7 +8,7 @@ cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
-installers = ["shell", "npm", "homebrew"]
+installers = ["shell", "powershell", "npm", "homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Publish the npm package under the @octos-org scope -> `npm i -g @octos-org/octos-tui`
@@ -20,5 +20,9 @@ tap = "octos-org/homebrew-tap"
 install-updater = true
 # Push the generated formula to the Homebrew tap on release.
 publish-jobs = ["homebrew", "npm"]
+# Publish prereleases (rc/beta tags) to npm + the Homebrew tap too, so they can
+# be installed/tested before promoting to a stable tag. (npm prereleases don't
+# take the `latest` dist-tag, and Homebrew prerelease formulae land in the tap.)
+publish-prereleases = true
 # Only dry-run ("plan") on PRs; full release artifacts run on tag pushes.
 pr-run-mode = "plan"
