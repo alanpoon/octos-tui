@@ -65,12 +65,18 @@ fn authed(req: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestB
 /// release overall is a prerelease, prefer it; otherwise return the latest
 /// stable (the dedicated `/releases/latest` endpoint, which excludes
 /// prereleases and drafts).
-pub fn latest_release(allow_prerelease: bool) -> Result<LatestRelease> {
+///
+/// Returns `Ok(None)` when the repo has **no published releases yet** (GitHub
+/// answers `404` on `/releases/latest`). That is not an error — callers treat
+/// it as "nothing newer to offer" — so a brand-new repo doesn't make
+/// `update --check`/`doctor` look broken. A real failure (network, 5xx,
+/// rate-limit) still surfaces as `Err`.
+pub fn latest_release(allow_prerelease: bool) -> Result<Option<LatestRelease>> {
     let client = client()?;
 
     if allow_prerelease {
         if let Some(release) = newest_including_prerelease(&client)? {
-            return Ok(release);
+            return Ok(Some(release));
         }
     }
 
@@ -78,6 +84,9 @@ pub fn latest_release(allow_prerelease: bool) -> Result<LatestRelease> {
         .send()
         .wrap_err("failed to reach api.github.com")?;
     let status = resp.status();
+    if status.as_u16() == 404 {
+        return Ok(None);
+    }
     if !status.is_success() {
         return Err(eyre!(
             "GitHub returned {status} for the latest octos-tui release"
@@ -86,10 +95,10 @@ pub fn latest_release(allow_prerelease: bool) -> Result<LatestRelease> {
     let payload: ReleasePayload = resp
         .json()
         .wrap_err("failed to decode GitHub release payload")?;
-    Ok(LatestRelease {
+    Ok(Some(LatestRelease {
         tag: payload.tag_name,
         prerelease: payload.prerelease,
-    })
+    }))
 }
 
 /// Newest non-draft release including prereleases (first entry of `/releases`,

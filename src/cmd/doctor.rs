@@ -365,7 +365,12 @@ fn shadow_check(paths: &[PathBuf]) -> Check {
 
 fn release_check(method: &InstallMethod) -> Check {
     match github::latest_release(false) {
-        Ok(latest) => {
+        Ok(None) => Check::pass(
+            CAT_BINARY,
+            "up to date",
+            format!("v{} (no published releases yet)", env!("CARGO_PKG_VERSION")),
+        ),
+        Ok(Some(latest)) => {
             let current = env!("CARGO_PKG_VERSION");
             let current_v = super::update::parse_version(current);
             let latest_v = super::update::parse_version(&latest.tag);

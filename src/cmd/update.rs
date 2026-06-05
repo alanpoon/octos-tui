@@ -89,8 +89,25 @@ fn run_check(
     method: &InstallMethod,
     current: &Version,
 ) -> Result<UpdateOutcome> {
-    let latest = github::latest_release(args.prerelease)
-        .wrap_err("failed to query the latest octos-tui release from GitHub")?;
+    let Some(latest) = github::latest_release(args.prerelease)
+        .wrap_err("failed to query the latest octos-tui release from GitHub")?
+    else {
+        // No releases published yet — nothing to compare against; not an error.
+        if args.json {
+            let payload = serde_json::json!({
+                "current_version": current.to_string(),
+                "latest_version": serde_json::Value::Null,
+                "latest_tag": serde_json::Value::Null,
+                "update_available": false,
+                "install_method": method.id(),
+                "upgrade_command": method.upgrade_command(),
+            });
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        } else {
+            println!("octos-tui {current} — no published releases found yet.");
+        }
+        return Ok(UpdateOutcome::Success);
+    };
     let latest_version = parse_version(&latest.tag)
         .ok_or_else(|| eyre!("could not parse latest release tag `{}`", latest.tag))?;
 
