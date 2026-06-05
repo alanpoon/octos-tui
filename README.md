@@ -1,14 +1,16 @@
 # octos-tui
 
-```text
+<div align="center">
+<pre>
  ██████╗  ██████╗████████╗ ██████╗ ███████╗
 ██╔═══██╗██╔════╝╚══██╔══╝██╔═══██╗██╔════╝
 ██║   ██║██║        ██║   ██║   ██║███████╗
 ██║   ██║██║        ██║   ██║   ██║╚════██║
 ╚██████╔╝╚██████╗   ██║   ╚██████╔╝███████║
  ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚══════╝
-            Welcome to Octos — Your Coding Buddy
-```
+</pre>
+<em>Welcome to Octos — Your Coding Buddy</em>
+</div>
 
 `octos-tui` is a standalone terminal UI client for the Octos AppUi/UI Protocol.
 It is a chat-first coding client that you point at an `octos serve` backend; the
