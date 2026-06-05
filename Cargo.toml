@@ -1,6 +1,6 @@
 [package]
 name = "octos-tui"
-version = "0.1.1"
+version = "0.1.2-rc.1"
 edition = "2024"
 rust-version = "1.85.0"
 license = "Apache-2.0"
@@ -18,7 +18,7 @@ path = "src/main.rs"
 # add a gitignored `.cargo/config.toml` (see `.cargo/config.toml.example`) that
 # patches it to a sibling path — no need to edit this file.
 [dependencies]
-octos-core = { git = "https://github.com/octos-org/octos", rev = "f020813810c91a146ac7cddfb3cd4cfcaf8f8a8f" }
+octos-core = { git = "https://github.com/octos-org/octos", rev = "2afff187" }
 clap = { version = "4", features = ["derive"] }
 eyre = "0.6"
 color-eyre = "0.6"
