@@ -952,6 +952,7 @@ impl Store {
             LocalAction::McpConfig => self.dispatch_mcp_inline(inline_args.unwrap_or_default()),
             LocalAction::ToolConfig => self.dispatch_tools_inline(inline_args.unwrap_or_default()),
             LocalAction::SetLanguage => self.dispatch_set_language(inline_args.unwrap_or_default()),
+            LocalAction::SetThinking => self.dispatch_set_thinking(inline_args.unwrap_or_default()),
             LocalAction::Custom(name) => {
                 self.state.status = format!("Local menu action `{name}` is not wired yet");
                 None
@@ -987,6 +988,53 @@ impl Store {
                 None
             }
         }
+    }
+
+    /// `/thinking <low|medium|high|max|default>` — set the per-session reasoning
+    /// effort attached to every turn/start, or `default` to clear the override
+    /// (server gateway/profile default applies). No-op for models without a
+    /// reasoning style; the server decides whether the effort is honored.
+    fn dispatch_set_thinking(&mut self, inline_args: &str) -> Option<AppUiCommand> {
+        use octos_core::ui_protocol::ReasoningEffortLevel as L;
+        // Scope the effort to the active session (per-session, by SessionKey).
+        let Some(session_id) = self.active_session().map(|s| s.id.clone()) else {
+            self.state.status = t!("thinking.no_session").to_string();
+            return None;
+        };
+        let arg = inline_args.trim().to_ascii_lowercase();
+        if arg.is_empty() {
+            let current = match self.state.session_reasoning_effort.get(&session_id) {
+                Some(L::Low) => "low",
+                Some(L::Medium) => "medium",
+                Some(L::High) => "high",
+                Some(L::Max) => "max",
+                None => "default",
+            };
+            self.state.status = t!("thinking.usage", current = current).to_string();
+            return None;
+        }
+        let level = match arg.as_str() {
+            "low" => Some(L::Low),
+            "medium" | "med" => Some(L::Medium),
+            "high" => Some(L::High),
+            "max" => Some(L::Max),
+            "default" | "reset" => None,
+            other => {
+                self.state.status = t!("thinking.unknown", value = other.to_string()).to_string();
+                return None;
+            }
+        };
+        match level {
+            Some(l) => {
+                self.state.session_reasoning_effort.insert(session_id, l);
+                self.state.status = t!("thinking.set", level = arg).to_string();
+            }
+            None => {
+                self.state.session_reasoning_effort.remove(&session_id);
+                self.state.status = t!("thinking.cleared").to_string();
+            }
+        }
+        None
     }
 
     fn dispatch_mcp_inline(&mut self, inline_args: &str) -> Option<AppUiCommand> {
@@ -3020,6 +3068,11 @@ impl Store {
         self.state.scroll_transcript_to_latest();
         self.state.status = status.into();
         self.state.set_run_state_in_progress();
+        let reasoning_effort = self
+            .state
+            .session_reasoning_effort
+            .get(&session_id)
+            .copied();
         Some(AppUiCommand::SubmitPrompt(TurnStartParams {
             session_id,
             turn_id,
@@ -3027,6 +3080,7 @@ impl Store {
             media: Vec::new(),
             topic: None,
             rewrite_for: None,
+            reasoning_effort,
         }))
     }
 
@@ -4097,6 +4151,9 @@ impl Store {
                 let session_tool_catalogs = self.state.session_tool_catalogs.clone();
                 let mcp_config_catalog = self.state.mcp_config_catalog.clone();
                 let tool_config_catalog = self.state.tool_config_catalog.clone();
+                // Local-only: the server doesn't know the per-session /thinking
+                // level, so preserve it across snapshot replays (reconnect/refresh).
+                let session_reasoning_effort = self.state.session_reasoning_effort.clone();
 
                 let mut state = AppState::from_snapshot(snapshot);
                 if state.capabilities.is_none() {
@@ -4122,6 +4179,7 @@ impl Store {
                 state.session_tool_catalogs = session_tool_catalogs;
                 state.mcp_config_catalog = mcp_config_catalog;
                 state.tool_config_catalog = tool_config_catalog;
+                state.session_reasoning_effort = session_reasoning_effort;
                 state.restore_optimistic_user_messages();
                 self.state = state;
                 None
@@ -7442,6 +7500,92 @@ mod tests {
             store.state.status
         );
         assert_eq!(rust_i18n::locale().to_string(), before);
+    }
+
+    #[test]
+    fn thinking_command_sets_clears_and_rejects_unknown() {
+        use octos_core::ui_protocol::ReasoningEffortLevel as L;
+        let mut store = store_with_empty_session();
+        let key = store.active_session().expect("active session").id.clone();
+        assert!(store.state.session_reasoning_effort.get(&key).is_none());
+
+        store.dispatch_set_thinking("high");
+        assert_eq!(
+            store.state.session_reasoning_effort.get(&key),
+            Some(&L::High)
+        );
+        store.dispatch_set_thinking("max");
+        assert_eq!(
+            store.state.session_reasoning_effort.get(&key),
+            Some(&L::Max)
+        );
+
+        // `default` clears the override (server default applies).
+        store.dispatch_set_thinking("default");
+        assert!(store.state.session_reasoning_effort.get(&key).is_none());
+
+        // Unknown arg is echoed and does not change the current level.
+        store.dispatch_set_thinking("high");
+        store.dispatch_set_thinking("bogus");
+        assert!(
+            store.state.status.contains("bogus"),
+            "unknown effort should be echoed, got: {}",
+            store.state.status
+        );
+        assert_eq!(
+            store.state.session_reasoning_effort.get(&key),
+            Some(&L::High)
+        );
+
+        // Empty arg shows usage without changing the level.
+        store.dispatch_set_thinking("");
+        assert!(
+            store.state.status.contains("/thinking"),
+            "empty arg should show usage, got: {}",
+            store.state.status
+        );
+        assert_eq!(
+            store.state.session_reasoning_effort.get(&key),
+            Some(&L::High)
+        );
+
+        // Per-session: the level is keyed by SessionKey, not global.
+        let other = SessionKey("local:other".into());
+        assert!(store.state.session_reasoning_effort.get(&other).is_none());
+    }
+
+    #[test]
+    fn thinking_level_survives_snapshot_replay() {
+        use octos_core::ui_protocol::ReasoningEffortLevel as L;
+        let mut store = store_with_empty_session();
+        let key = store.active_session().expect("active session").id.clone();
+        store.dispatch_set_thinking("max");
+        assert_eq!(
+            store.state.session_reasoning_effort.get(&key),
+            Some(&L::Max)
+        );
+
+        // A snapshot replay (reconnect/refresh) rebuilds AppState from scratch;
+        // the local-only /thinking level must be preserved (codex P1).
+        store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
+            sessions: vec![SessionView {
+                id: key.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            selected_session: 0,
+            status: "replayed".into(),
+            target: None,
+            readonly: false,
+        }));
+        assert_eq!(
+            store.state.session_reasoning_effort.get(&key),
+            Some(&L::Max),
+            "/thinking level must survive a snapshot replay"
+        );
     }
 
     fn store_with_two_sessions(first: &str, second: &str) -> Store {
