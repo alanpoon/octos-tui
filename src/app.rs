@@ -189,7 +189,18 @@ fn render_live_tail(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'
     Paragraph::new(Text::from(lines))
         .block(
             Block::default()
-                .style(Style::default().fg(palette.text).bg(palette.surface_alt))
+                // The inline live tail sits directly above the terminal's native
+                // scrollback (where finalized history is written on the DEFAULT
+                // background). Painting the whole tail with `surface_alt` made it
+                // a solid theme-colored rectangle that reads as "brown blocks all
+                // over the screen" against that native scrollback — the
+                // user-reported bug. Render the tail on the default background so
+                // it blends with scrollback and the terminal, matching codex's
+                // inline rendering. (The fullscreen-overlay `render_transcript`
+                // path keeps `surface_alt` — it has no terminal scrollback behind
+                // it.) Interactive cards and the composer/status set their own
+                // backgrounds on their own spans.
+                .style(Style::default().fg(palette.text))
                 .border_style(palette.border()),
         )
         .scroll((scroll_top, 0))
