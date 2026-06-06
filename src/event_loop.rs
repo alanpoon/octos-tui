@@ -114,13 +114,21 @@ pub fn run(cli: Cli) -> Result<()> {
 /// swallowed: the copy is best-effort UX, never load-bearing, and the status
 /// line already reflected the attempt.
 fn flush_pending_clipboard(store: &mut Store) {
+    flush_pending_clipboard_to(store, &mut io::stdout());
+}
+
+/// Drain a staged clipboard request into `sink` as an OSC 52 escape sequence.
+/// Split from `flush_pending_clipboard` so tests can inject an in-memory buffer
+/// instead of writing to the real terminal — a direct `stdout` write bypasses
+/// libtest's capture, so a terminal that honors OSC 52 would otherwise clobber
+/// the developer's clipboard during `cargo test` (codex P2).
+fn flush_pending_clipboard_to<W: io::Write>(store: &mut Store, sink: &mut W) {
     let Some(text) = store.state.pending_clipboard.take() else {
         return;
     };
     let sequence = crate::clipboard::osc52_copy_sequence(&text);
-    let mut stdout = io::stdout();
-    if io::Write::write_all(&mut stdout, sequence.as_bytes()).is_ok() {
-        let _ = io::Write::flush(&mut stdout);
+    if sink.write_all(sequence.as_bytes()).is_ok() {
+        let _ = sink.flush();
     }
 }
 
@@ -1126,15 +1134,37 @@ mod tests {
     }
 
     #[test]
-    fn flush_pending_clipboard_clears_the_request() {
-        // The OSC 52 bytes go to stdout; here we only assert the one-shot field
-        // is drained so a copy cannot re-fire on every subsequent tick.
+    fn flush_pending_clipboard_writes_osc52_and_clears_the_request() {
+        // Drain into an in-memory sink (NOT real stdout) so `cargo test` can't
+        // emit OSC 52 to the developer's terminal and overwrite their clipboard
+        // (codex P2). This also lets us assert the exact bytes written.
         let mut store = store_with_live_reply_text("answer");
         store.state.pending_clipboard = Some("answer".into());
 
-        flush_pending_clipboard(&mut store);
+        let mut sink: Vec<u8> = Vec::new();
+        flush_pending_clipboard_to(&mut store, &mut sink);
 
+        // The one-shot field is drained so a copy cannot re-fire on every tick.
         assert!(store.state.pending_clipboard.is_none());
+        // And the OSC 52 sequence for "answer" was written to the sink.
+        assert_eq!(
+            String::from_utf8(sink).unwrap(),
+            crate::clipboard::osc52_copy_sequence("answer")
+        );
+    }
+
+    #[test]
+    fn flush_pending_clipboard_writes_nothing_when_unset() {
+        let mut store = store_with_live_reply_text("answer");
+        store.state.pending_clipboard = None;
+
+        let mut sink: Vec<u8> = Vec::new();
+        flush_pending_clipboard_to(&mut store, &mut sink);
+
+        assert!(
+            sink.is_empty(),
+            "no OSC 52 should be emitted with nothing staged"
+        );
     }
 
     fn store_with_visible_approval() -> (Store, ApprovalId) {
