@@ -251,18 +251,43 @@ where
         render_callback(&mut frame);
         let cursor_position = frame.cursor_position;
 
-        self.flush()?;
+        // A no-change frame must emit ZERO bytes. The inline-viewport model leaves
+        // finalized output in the terminal's real scrollback, and any write (even
+        // a redundant cursor move) can drop the user's in-progress native text
+        // selection. So we only touch the backend when the cell diff produced
+        // updates or the cursor state actually has to change. This mirrors codex,
+        // which draws solely on a scheduled frame; here the event loop may tick
+        // (e.g. the spinner cadence while a turn runs) without anything visually
+        // changing, and those ticks must not repaint.
+        let wrote_cells = self.flush()?;
 
-        match cursor_position {
-            None => self.hide_cursor()?,
-            Some(position) => {
-                self.show_cursor()?;
-                self.set_cursor_position(position)?;
+        let cursor_changed = match cursor_position {
+            None => {
+                if self.hidden_cursor {
+                    false
+                } else {
+                    self.hide_cursor()?;
+                    true
+                }
             }
-        }
+            Some(position) => {
+                let mut changed = false;
+                if self.hidden_cursor {
+                    self.show_cursor()?;
+                    changed = true;
+                }
+                if self.last_known_cursor_pos != position {
+                    self.set_cursor_position(position)?;
+                    changed = true;
+                }
+                changed
+            }
+        };
 
         self.swap_buffers();
-        Backend::flush(&mut self.backend)?;
+        if wrote_cells || cursor_changed {
+            Backend::flush(&mut self.backend)?;
+        }
         Ok(())
     }
 
@@ -275,13 +300,20 @@ where
         }
     }
 
-    /// Diff the current vs previous buffer and emit only the changes.
-    fn flush(&mut self) -> io::Result<()> {
+    /// Diff the current vs previous buffer and emit only the changes. Returns
+    /// `true` when at least one cell update was written. When the diff is empty
+    /// we emit NOTHING — not even the trailing SGR reset — so an unchanged frame
+    /// is a true no-op and cannot disturb a native scrollback selection.
+    fn flush(&mut self) -> io::Result<bool> {
         let updates = diff_buffers(self.previous_buffer(), &self.buffers[self.current]);
+        if updates.is_empty() {
+            return Ok(false);
+        }
         if let Some(&(x, y, _)) = updates.last() {
             self.last_known_cursor_pos = Position { x, y };
         }
-        draw(&mut self.backend, updates.into_iter())
+        draw(&mut self.backend, updates.into_iter())?;
+        Ok(true)
     }
 
     fn hide_cursor(&mut self) -> io::Result<()> {
@@ -461,4 +493,153 @@ fn queue_modifier_diff<W: Write>(w: &mut W, from: Modifier, to: Modifier) -> io:
         queue!(w, SetAttribute(A::RapidBlink))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::cursor::{Hide, MoveTo, Show};
+    use ratatui::backend::WindowSize;
+    use ratatui::text::Line;
+    use ratatui::widgets::Paragraph;
+
+    /// A `Backend + Write` that records every emitted byte, including the cursor
+    /// escapes crossterm would emit (so a "no-op draw" can be asserted to write
+    /// exactly zero bytes — the property that protects a native selection).
+    struct RecordingBackend {
+        buf: Vec<u8>,
+        size: Size,
+        cursor: Position,
+    }
+
+    impl RecordingBackend {
+        fn new(width: u16, height: u16) -> Self {
+            Self {
+                buf: Vec::new(),
+                size: Size::new(width, height),
+                cursor: Position { x: 0, y: 0 },
+            }
+        }
+    }
+
+    impl Write for RecordingBackend {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            self.buf.extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Backend for RecordingBackend {
+        fn draw<'a, I>(&mut self, _content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            Ok(())
+        }
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            queue!(self.buf, Hide)
+        }
+        fn show_cursor(&mut self) -> io::Result<()> {
+            queue!(self.buf, Show)
+        }
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            Ok(self.cursor)
+        }
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+            let position = position.into();
+            self.cursor = position;
+            queue!(self.buf, MoveTo(position.x, position.y))
+        }
+        fn clear(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn clear_region(&mut self, _clear_type: ClearType) -> io::Result<()> {
+            Ok(())
+        }
+        fn size(&self) -> io::Result<Size> {
+            Ok(self.size)
+        }
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            Ok(WindowSize {
+                columns_rows: self.size,
+                pixels: Size::new(0, 0),
+            })
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn render_hi(frame: &mut Frame) {
+        let area = frame.area();
+        frame.render_widget(Paragraph::new(Line::from("hi")), area);
+    }
+
+    #[test]
+    fn unchanged_frame_emits_zero_bytes_so_selection_survives() {
+        // Bug 2: an idle / no-change draw must write NOTHING to the terminal, or
+        // it would disturb the user's native scrollback selection. After the
+        // first (real) draw, a second identical draw with the SAME cursor target
+        // must be a complete no-op (zero bytes).
+        let mut terminal = Terminal::new(RecordingBackend::new(20, 5)).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 4, 20, 1));
+
+        // First draw paints "hi" and positions the cursor: this emits bytes.
+        terminal
+            .draw(|frame| {
+                render_hi(frame);
+                frame.set_cursor_position((2, 4));
+            })
+            .expect("first draw");
+        assert!(
+            !terminal.backend().buf.is_empty(),
+            "the first draw should emit the initial paint"
+        );
+
+        // Second draw is byte-identical content AND the same cursor position.
+        let before = terminal.backend().buf.len();
+        terminal
+            .draw(|frame| {
+                render_hi(frame);
+                frame.set_cursor_position((2, 4));
+            })
+            .expect("second draw");
+        let after = terminal.backend().buf.len();
+        assert_eq!(
+            before, after,
+            "an unchanged frame must emit zero bytes (selection-safe no-op)"
+        );
+    }
+
+    #[test]
+    fn changed_cell_repaints_only_the_delta() {
+        // A genuine content change still paints (so streaming output is visible);
+        // only the no-change case is suppressed.
+        let mut terminal = Terminal::new(RecordingBackend::new(20, 5)).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 4, 20, 1));
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_widget(Paragraph::new(Line::from("aaa")), area);
+                frame.set_cursor_position((3, 4));
+            })
+            .expect("first draw");
+
+        let before = terminal.backend().buf.len();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_widget(Paragraph::new(Line::from("bbb")), area);
+                frame.set_cursor_position((3, 4));
+            })
+            .expect("second draw");
+        assert!(
+            terminal.backend().buf.len() > before,
+            "a real content change must repaint"
+        );
+    }
 }

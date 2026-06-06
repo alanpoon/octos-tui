@@ -2556,6 +2556,31 @@ impl Store {
         false
     }
 
+    /// True while the first-launch onboarding wizard is still in progress: the
+    /// wizard auto-opens only when there is no session yet, and finishing it
+    /// opens a profile-scoped session. So "no session" == "onboarding not yet
+    /// complete" for the purpose of the Esc trap below.
+    fn onboarding_in_progress(&self) -> bool {
+        self.state.sessions.is_empty()
+    }
+
+    /// Handle Esc on the active menu. Mirrors `close_menu` for every menu EXCEPT
+    /// the *root* onboarding step (`MENU_ONBOARD`) while onboarding is still in
+    /// progress: that wizard is only ever auto-opened on first launch (issue #5),
+    /// so closing it would strand the user with no way back. Esc on a child
+    /// onboarding step (family/model/route/workspace) still pops back to the
+    /// parent wizard step — that is just `close_menu`. Returns true when a menu
+    /// was actually closed.
+    pub fn handle_menu_escape(&mut self) -> bool {
+        if self.onboarding_in_progress()
+            && self.active_menu_id_is(crate::menu::registry::MENU_ONBOARD)
+        {
+            // No-op: keep the root onboarding wizard open.
+            return false;
+        }
+        self.close_menu()
+    }
+
     pub fn close_all_menus(&mut self) -> bool {
         if self.state.menu_stack.is_empty() {
             return false;
@@ -8665,6 +8690,62 @@ mod tests {
             spec.items
                 .iter()
                 .any(|item| item.id == "onboard.local.create")
+        );
+    }
+
+    #[test]
+    fn esc_on_root_onboarding_menu_keeps_the_wizard_open() {
+        // Issue #5: the onboarding wizard is only auto-opened on first launch, so
+        // if Esc closed the root step the user would be stranded with no relaunch.
+        // Esc on the ROOT onboarding menu must be a no-op (wizard stays open).
+        let mut store = protocol_store_without_sessions();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        assert!(store.state.sessions.is_empty(), "onboarding-in-progress");
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+
+        let closed = store.handle_menu_escape();
+
+        assert!(!closed, "Esc on the root onboarding menu must not close it");
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD),
+            "root onboarding wizard should stay open after Esc"
+        );
+    }
+
+    #[test]
+    fn esc_on_child_onboarding_step_goes_back_to_the_root_wizard() {
+        // Esc on a CHILD step (family/model/route/workspace) should still pop back
+        // to the parent (root) wizard step — not quit the wizard.
+        let mut store = protocol_store_without_sessions();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL));
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD_MODEL));
+
+        let closed = store.handle_menu_escape();
+
+        assert!(closed, "Esc on a child step should pop a frame");
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD),
+            "Esc on a child onboarding step should return to the root wizard"
+        );
+    }
+
+    #[test]
+    fn esc_on_non_onboarding_menu_closes_it_as_before() {
+        // Regression guard: Esc behavior is unchanged for non-onboarding menus.
+        // A store with a session is NOT onboarding-in-progress, so even the
+        // generic Esc trap does not apply.
+        let mut store = protocol_store_with_methods(&[]);
+        assert!(!store.state.sessions.is_empty());
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_THEME));
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_THEME));
+
+        let closed = store.handle_menu_escape();
+
+        assert!(closed, "Esc on a non-onboarding menu should close it");
+        assert!(
+            !store.state.menu_stack.is_active(),
+            "the theme menu should be closed after Esc"
         );
     }
 

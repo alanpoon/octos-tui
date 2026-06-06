@@ -341,6 +341,155 @@ fn queue_modifier_diff<W: Write>(w: &mut W, from: Modifier, to: Modifier) -> io:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::{Backend, ClearType as RtClearType, WindowSize};
+    use ratatui::layout::{Position, Rect};
+    use ratatui::style::Style;
+
+    /// A `Backend + Write` that records every byte emitted, so tests can assert on
+    /// the exact escape-sequence stream `insert_history_lines` writes into the
+    /// terminal's real scrollback (codex's tests use a VT100 backend for this; the
+    /// octos-tui crate has no vt100 dep, so we inspect the raw bytes instead).
+    struct RecordingBackend {
+        buf: Vec<u8>,
+        size: Size,
+    }
+
+    impl RecordingBackend {
+        fn new(width: u16, height: u16) -> Self {
+            Self {
+                buf: Vec::new(),
+                size: Size::new(width, height),
+            }
+        }
+
+        fn output(&self) -> String {
+            String::from_utf8_lossy(&self.buf).into_owned()
+        }
+    }
+
+    impl Write for RecordingBackend {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            self.buf.extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Backend for RecordingBackend {
+        fn draw<'a, I>(&mut self, _content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            Ok(())
+        }
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn show_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            Ok(Position { x: 0, y: 0 })
+        }
+        fn set_cursor_position<P: Into<Position>>(&mut self, _position: P) -> io::Result<()> {
+            Ok(())
+        }
+        fn clear(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn clear_region(&mut self, _clear_type: RtClearType) -> io::Result<()> {
+            Ok(())
+        }
+        fn size(&self) -> io::Result<Size> {
+            Ok(self.size)
+        }
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            Ok(WindowSize {
+                columns_rows: self.size,
+                pixels: Size::new(0, 0),
+            })
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn term(width: u16, height: u16) -> Terminal<RecordingBackend> {
+        let mut t = Terminal::new(RecordingBackend::new(width, height)).expect("terminal");
+        // Anchor a 1-row viewport at the bottom so history inserts scroll upward.
+        t.set_viewport_area(Rect::new(0, height - 1, width, 1));
+        t
+    }
+
+    /// `crossterm::style::SetBackgroundColor(Reset)` byte sequence (`CSI 49 m`).
+    /// Any background SGR that is NOT this is a non-default (theme) background.
+    fn default_bg_seq() -> String {
+        let mut bytes: Vec<u8> = Vec::new();
+        queue!(bytes, SetBackgroundColor(CColor::Reset)).unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn history_line_with_theme_bg_is_emitted_on_default_background() {
+        // Bug 3 (b): a finalized line that *carried* a theme surface background
+        // would emit `SetBackgroundColor(Rgb(..))` and a `Clear(UntilNewLine)`
+        // under it, painting a "brown block" that bleeds to the row's right edge.
+        // After the fix, finalized lines have no bg (Bug 3a strips it), so the
+        // only background SGR in the scrollback stream is the default reset.
+        let mut t = term(40, 6);
+        // Mirror a stripped finalized line: fg set, NO bg (default background).
+        let line = Line::from(vec![Span::styled(
+            "committed reply",
+            Style::default().fg(Color::Rgb(236, 239, 244)),
+        )]);
+        insert_history_lines(&mut t, vec![line]).expect("insert history");
+
+        let out = t.backend().output();
+        let default_bg = default_bg_seq();
+        // Any non-default background SGR in the stream means a theme surface
+        // leaked into scrollback; only the default reset (`CSI 49 m`) is allowed.
+        assert!(
+            !out.contains("\x1b[48;2;"),
+            "scrollback stream emitted a truecolor background (brown block): {out:?}"
+        );
+        assert!(
+            !out.contains("\x1b[48;5;"),
+            "scrollback stream emitted an indexed background (brown block): {out:?}"
+        );
+        assert!(
+            out.contains(&default_bg),
+            "scrollback stream should reset the background to default: {out:?}"
+        );
+    }
+
+    #[test]
+    fn history_write_resets_sgr_after_each_line() {
+        // Bug 3 (b): un-reset SGR would bleed the last line's colors into the
+        // scroll-region ops / subsequent prints. Every history write must end on
+        // a full reset (fg + bg + attributes) so nothing bleeds "all over".
+        let mut t = term(40, 6);
+        let line = Line::from(vec![Span::styled(
+            "styled",
+            Style::default()
+                .fg(Color::Rgb(110, 188, 255))
+                .add_modifier(Modifier::BOLD),
+        )]);
+        insert_history_lines(&mut t, vec![line]).expect("insert history");
+
+        let out = t.backend().output();
+        // crossterm emits `SetAttribute(Reset)` as `CSI 0 m`.
+        assert!(
+            out.contains("\x1b[0m"),
+            "expected an SGR reset (CSI 0 m) in the scrollback stream: {out:?}"
+        );
+        // The reset trio must appear; the foreground reset is `CSI 39 m`.
+        assert!(
+            out.contains("\x1b[39m"),
+            "expected a foreground reset (CSI 39 m) in the scrollback stream: {out:?}"
+        );
+    }
 
     #[test]
     fn wrap_short_line_is_unchanged() {

@@ -743,7 +743,10 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
 
     match key.code {
         KeyCode::Esc => {
-            store.close_menu();
+            // Esc closes/backs out of menus, EXCEPT the root onboarding wizard
+            // step while onboarding is in progress: that menu is only auto-opened
+            // on first launch, so closing it would strand the user (issue #5).
+            store.handle_menu_escape();
         }
         KeyCode::Backspace if slash_help_capture_active(store) => {
             // Covers the bare `/` too (capture is active from the first char),

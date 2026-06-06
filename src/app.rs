@@ -265,7 +265,30 @@ pub fn finalized_history_lines_range(
             ]));
         }
     }
+    // Scrollback content must render on the terminal's NATIVE background, not the
+    // theme surface. The shared `push_message_block` path bakes a `surface` /
+    // `diff_context_bg` background into every span (correct for the live inline
+    // viewport, which keeps the theme surface) but when those same lines are
+    // written into the terminal's real scrollback by `insert_history`, the
+    // surface color paints solid "brown/grey blocks" against the terminal's own
+    // background. codex writes history on the default background; mirror that by
+    // dropping the theme background from finalized lines here (the live viewport
+    // render path is untouched, so it still shows the surface).
+    for line in &mut lines {
+        strip_line_background(line);
+    }
     lines
+}
+
+/// Reset the background of a finalized scrollback line (and every span) to the
+/// terminal default, so history written into real scrollback blends with the
+/// terminal's native background instead of painting the theme surface. Only the
+/// background is cleared; foreground colors and text attributes are preserved.
+fn strip_line_background(line: &mut Line<'static>) {
+    line.style.bg = None;
+    for span in &mut line.spans {
+        span.style.bg = None;
+    }
 }
 
 /// A stable fingerprint of the committed messages already flushed to scrollback,
@@ -9480,6 +9503,35 @@ mod tests {
             !text.contains("a1"),
             "range(2) must not re-emit already-flushed messages: {text:?}"
         );
+    }
+
+    #[test]
+    fn finalized_history_lines_carry_no_theme_background() {
+        // Bug 3a: scrollback content must render on the terminal's native
+        // background. The Codex theme's `surface` (Rgb(15,18,24)) and the user
+        // message's `diff_context_bg` would otherwise paint solid "brown blocks"
+        // into the terminal's real scrollback. Every finalized line/span must
+        // have `bg == None` so `insert_history` emits the default background.
+        let app = chat_app(vec![
+            Message::user("a user message"),
+            Message::assistant("an assistant reply\nwith two lines"),
+        ]);
+        // Use a theme with a non-default (brownish) surface, the regression case.
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let lines = finalized_history_lines(&app, palette, 80);
+        assert!(!lines.is_empty(), "expected finalized history lines");
+        for line in &lines {
+            assert_eq!(
+                line.style.bg, None,
+                "finalized line carries a theme bg (brown block): {line:?}"
+            );
+            for span in &line.spans {
+                assert_eq!(
+                    span.style.bg, None,
+                    "finalized span carries a theme bg (brown block): {span:?}"
+                );
+            }
+        }
     }
 
     #[test]
