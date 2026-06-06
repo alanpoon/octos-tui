@@ -27,6 +27,49 @@ onboarding:
     continue: "Continue"
     create_action: "Create profile"
     footer: "Up/Down choose | Enter edit or continue | type value, Enter save"
+  wizard:
+    # Wizard chrome shared by the local-profile and provider-setup screens.
+    setup_title: "Octos Setup Wizard"
+    progress_title: "Setup progress"
+    header: "Step %{number} of %{total} — %{title}"
+    subtitle: "%{header} · %{purpose}"
+    footer: "Next: %{next} | Up/Down move | Enter select | Esc close"
+    # Short checklist labels (right-side panel), one per step.
+    step:
+      profile: "Profile"
+      provider: "Provider"
+      connect: "Connect"
+      save: "Save"
+      workspace: "Workspace"
+      activate: "Activate"
+    # One-line purpose ("why this step exists") per step.
+    purpose:
+      profile: "Create a local identity for Octos. Stays on this machine; no email is sent."
+      provider: "Pick which AI model Octos talks to (model family, model, and provider route)."
+      connect: "Paste the provider API key and run a live test so we know the model answers."
+      save: "Save the verified provider into your profile so it persists."
+      workspace: "Choose and validate the folder Octos may read and edit while coding."
+      activate: "Activate the workspace: open the coding session and start working."
+    # Activate row (provider-setup screen) label + description.
+    activate_ready_label: "▶ Activate workspace — open coding session (Enter)"
+    activate_blocked_label: "Activate workspace — open coding session"
+    activate_ready_description: "Ready. Press Enter here to open the session and start coding."
+    activate_blocked_description: "Complete the steps above first (%{reason})."
+    # `Next: ...` footer phrases, in dependency order.
+    next:
+      load_catalog: "load the provider catalog"
+      choose_family: "choose a model family"
+      choose_model: "choose a model"
+      choose_route: "choose a provider route"
+      paste_key: "paste your API key"
+      test_provider: "test the provider"
+      save_provider: "save the provider"
+      validate_workspace: "validate the workspace"
+      activate: "press Enter on Activate to start coding"
+      finish_remaining: "finish the remaining steps"
+      # Local-profile (step 1) next-action phrases.
+      local_continue: "Continue to create the profile"
+      local_fill_fields: "fill name, username, and email"
 
 lang:
   # `switched` renders in the NEWLY-selected locale, so it names itself.

@@ -983,15 +983,16 @@ fn onboarding_provider_setup_menu(
             let activate_blocked =
                 onboarding_open_session_disabled_reason(ctx, state, current_profile);
             let label = if activate_blocked.is_none() {
-                "▶ Activate workspace — open coding session (Enter)"
+                t!("onboarding.wizard.activate_ready_label")
             } else {
-                "Activate workspace — open coding session"
+                t!("onboarding.wizard.activate_blocked_label")
             };
             let description = match &activate_blocked {
-                None => {
-                    "Ready. Press Enter here to open the session and start coding.".to_owned()
+                None => t!("onboarding.wizard.activate_ready_description").into_owned(),
+                Some(reason) => {
+                    t!("onboarding.wizard.activate_blocked_description", reason = reason)
+                        .into_owned()
                 }
-                Some(reason) => format!("Complete the steps above first ({reason})."),
             };
             MenuItem::new(
                 "onboard.finish",
@@ -1022,7 +1023,7 @@ fn onboarding_provider_setup_menu(
 
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(MENU_ONBOARD),
-        title: "Octos Setup Wizard".into(),
+        title: t!("onboarding.wizard.setup_title").into_owned(),
         subtitle: Some(progress.subtitle()),
         items,
         tabs: Vec::new(),
@@ -1043,19 +1044,19 @@ fn onboarding_next_action_hint(
     current_profile: Option<&str>,
 ) -> String {
     if ctx.app.profile_llm_catalog.is_none() {
-        return "load the provider catalog".into();
+        return t!("onboarding.wizard.next.load_catalog").into_owned();
     }
     if state.provider.family_id.trim().is_empty() {
-        return "choose a model family".into();
+        return t!("onboarding.wizard.next.choose_family").into_owned();
     }
     if state.provider.model_id.trim().is_empty() {
-        return "choose a model".into();
+        return t!("onboarding.wizard.next.choose_model").into_owned();
     }
     if !state.selection_ready() {
-        return "choose a provider route".into();
+        return t!("onboarding.wizard.next.choose_route").into_owned();
     }
     if !state.has_api_key() {
-        return "paste your API key".into();
+        return t!("onboarding.wizard.next.paste_key").into_owned();
     }
     if !state.provider_tested
         && !matches!(
@@ -1063,21 +1064,21 @@ fn onboarding_next_action_hint(
             OnboardingProviderStatus::SavedPrimary
         )
     {
-        return "test the provider".into();
+        return t!("onboarding.wizard.next.test_provider").into_owned();
     }
     if !matches!(
         state.provider_status(),
         OnboardingProviderStatus::SavedPrimary | OnboardingProviderStatus::SavedFallback
     ) {
-        return "save the provider".into();
+        return t!("onboarding.wizard.next.save_provider").into_owned();
     }
     if onboarding_workspace_disabled_reason(state).is_some() {
-        return "validate the workspace".into();
+        return t!("onboarding.wizard.next.validate_workspace").into_owned();
     }
     if onboarding_open_session_disabled_reason(ctx, state, current_profile).is_none() {
-        return "press Enter on Activate to start coding".into();
+        return t!("onboarding.wizard.next.activate").into_owned();
     }
-    "finish the remaining steps".into()
+    t!("onboarding.wizard.next.finish_remaining").into_owned()
 }
 
 fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResult {
@@ -1126,9 +1127,9 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
     // and `current_profile = None`.
     let progress = crate::menu::wizard::WizardProgress::from_state(state, None, true);
     let next_action = if state.local_profile_ready() {
-        "Continue to create the profile"
+        t!("onboarding.wizard.next.local_continue")
     } else {
-        "fill name, username, and email"
+        t!("onboarding.wizard.next.local_fill_fields")
     };
 
     MenuBuildResult::Ready(MenuSpec {
@@ -1139,7 +1140,7 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
         tabs: Vec::new(),
         searchable: false,
         search_placeholder: None,
-        footer_hint: Some(progress.footer_hint(next_action)),
+        footer_hint: Some(progress.footer_hint(next_action.as_ref())),
         // The first-run OCTOS splash renders in the MAIN window (see
         // `render_onboarding_first_launch_layout` in app.rs); the right pane now
         // carries the wizard progress checklist so the user always sees where
@@ -4827,7 +4828,9 @@ mod tests {
         let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_ONBOARD), &ctx) else {
             panic!("expected onboarding menu");
         };
-        assert_eq!(spec.title, "Octos Setup Wizard");
+        // Assert via the i18n key (NOT a hardcoded English literal) so the test
+        // tracks the source string and stays correct across locales.
+        assert_eq!(spec.title, t!("onboarding.wizard.setup_title"));
         // The provider/setup phase now carries the wizard progress checklist as
         // its right-side preview pane.
         assert!(

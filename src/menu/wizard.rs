@@ -14,10 +14,12 @@
 //! Keeping this in one place means the two providers stay in lock-step and the
 //! progress copy is computed, not duplicated.
 //!
-//! NOTE (i18n): the user-facing strings here are English literals for now. They
-//! should migrate to `locales/{en,zh}.yml` under an `onboarding.wizard.*`
-//! namespace (see the PR description). CJK width is handled by the generic menu
-//! render surface (`unicode-width`), so no width math lives in this module.
+//! NOTE (i18n): the user-facing strings here live in `locales/{en,zh}.yml`
+//! under the `onboarding.wizard.*` namespace and are resolved via `t!()`. CJK
+//! width is handled by the generic menu render surface (`unicode-width`), so no
+//! width math lives in this module — never compare against a rendered string.
+
+use std::borrow::Cow;
 
 use crate::menu::types::{MenuPreview, MenuPreviewRow};
 use crate::model::{
@@ -63,38 +65,28 @@ impl WizardStep {
             .unwrap_or(1)
     }
 
-    /// Short checklist label (right-side panel).
-    pub fn short_title(self) -> &'static str {
+    /// Stable i18n key suffix for this step (NOT user-facing text). Used to
+    /// build `onboarding.wizard.step.*` / `onboarding.wizard.purpose.*` keys
+    /// without ever switching on a translated string.
+    fn key(self) -> &'static str {
         match self {
-            WizardStep::Profile => "Profile",
-            WizardStep::Provider => "Provider",
-            WizardStep::Connect => "Connect",
-            WizardStep::Save => "Save",
-            WizardStep::Workspace => "Workspace",
-            WizardStep::Activate => "Activate",
+            WizardStep::Profile => "profile",
+            WizardStep::Provider => "provider",
+            WizardStep::Connect => "connect",
+            WizardStep::Save => "save",
+            WizardStep::Workspace => "workspace",
+            WizardStep::Activate => "activate",
         }
     }
 
+    /// Short checklist label (right-side panel).
+    pub fn short_title(self) -> Cow<'static, str> {
+        t!(format!("onboarding.wizard.step.{}", self.key()))
+    }
+
     /// One-line purpose ("why this step exists").
-    pub fn purpose(self) -> &'static str {
-        match self {
-            WizardStep::Profile => {
-                "Create a local identity for Octos. Stays on this machine; no email is sent."
-            }
-            WizardStep::Provider => {
-                "Pick which AI model Octos talks to (model family, model, and provider route)."
-            }
-            WizardStep::Connect => {
-                "Paste the provider API key and run a live test so we know the model answers."
-            }
-            WizardStep::Save => "Save the verified provider into your profile so it persists.",
-            WizardStep::Workspace => {
-                "Choose and validate the folder Octos may read and edit while coding."
-            }
-            WizardStep::Activate => {
-                "Activate the workspace: open the coding session and start working."
-            }
-        }
+    pub fn purpose(self) -> Cow<'static, str> {
+        t!(format!("onboarding.wizard.purpose.{}", self.key()))
     }
 }
 
@@ -158,22 +150,28 @@ impl WizardProgress {
 
     /// `Step N of M — <Short title>` header for the menu subtitle.
     pub fn header(&self) -> String {
-        format!(
-            "Step {} of {} — {}",
-            self.current.number(),
-            WizardStep::ALL.len(),
-            self.current.short_title(),
+        t!(
+            "onboarding.wizard.header",
+            number = self.current.number(),
+            total = WizardStep::ALL.len(),
+            title = self.current.short_title(),
         )
+        .into_owned()
     }
 
     /// Full subtitle: header + one-line purpose of the current step.
     pub fn subtitle(&self) -> String {
-        format!("{} · {}", self.header(), self.current.purpose())
+        t!(
+            "onboarding.wizard.subtitle",
+            header = self.header(),
+            purpose = self.current.purpose(),
+        )
+        .into_owned()
     }
 
     /// Footer hint naming the next concrete action.
     pub fn footer_hint(&self, next_action: &str) -> String {
-        format!("Next: {next_action} | Up/Down move | Enter select | Esc close")
+        t!("onboarding.wizard.footer", next = next_action).into_owned()
     }
 
     /// Right-side checklist preview: one row per step, current marked `>`,
@@ -192,12 +190,12 @@ impl WizardProgress {
                 };
                 MenuPreviewRow {
                     label: format!("{marker} {}", step.number()),
-                    value: step.short_title().into(),
+                    value: step.short_title().into_owned(),
                 }
             })
             .collect();
         MenuPreview::KeyValues {
-            title: Some("Setup progress".into()),
+            title: Some(t!("onboarding.wizard.progress_title").into_owned()),
             rows,
         }
     }
@@ -239,7 +237,18 @@ mod tests {
         let progress = WizardProgress::from_state(&state, None, true);
         assert_eq!(progress.current, WizardStep::Profile);
         assert_eq!(progress.current.number(), 1);
-        assert!(progress.header().starts_with("Step 1 of 6"));
+        // Assert via the same i18n key (NOT a hardcoded English literal) so the
+        // test tracks the source string across locales/wording changes. The
+        // step is 1-of-6 and names the Profile step's short title.
+        assert_eq!(
+            progress.header(),
+            t!(
+                "onboarding.wizard.header",
+                number = 1,
+                total = 6,
+                title = WizardStep::Profile.short_title(),
+            )
+        );
         assert!(progress.done.iter().all(|done| !done));
     }
 
