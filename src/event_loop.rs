@@ -4,9 +4,8 @@ use std::time::{Duration, Instant};
 use crossterm::{
     cursor::Show,
     event::{
-        self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-        EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -31,12 +30,17 @@ const MAX_BACKEND_EVENTS_PER_TICK: usize = 512;
 pub fn run(cli: Cli) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
+    // NOTE: deliberately NO `EnableMouseCapture`. Capturing the mouse routes
+    // click-drag to the app and prevents the terminal (and tmux copy-mode) from
+    // doing native text selection — so users can't select+copy (esp. over
+    // tmux/SSH). Matching codex, we leave the mouse to the terminal; scrolling
+    // is covered by PageUp/PageDown (and tmux's own wheel/scrollback), and the
+    // OSC 52 `/copy`/Ctrl+Y path (clipboard.rs) handles structured copy.
     execute!(
         stdout,
         EnterAlternateScreen,
         EnableBracketedPaste,
-        EnableFocusChange,
-        EnableMouseCapture
+        EnableFocusChange
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -2352,7 +2356,6 @@ impl Drop for TerminalGuard {
             stdout,
             DisableBracketedPaste,
             DisableFocusChange,
-            DisableMouseCapture,
             Show,
             LeaveAlternateScreen
         );
