@@ -567,9 +567,19 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         KeyCode::Esc => {
             store.close_menu();
         }
-        KeyCode::Backspace if slash_help_query_active(store) => {
+        KeyCode::Backspace if slash_help_capture_active(store) => {
+            // Covers the bare `/` too (capture is active from the first char),
+            // so Backspace can still delete an accidental slash — the
+            // `menu_composer_edit_active` branch no longer handles it.
             store.state.delete_composer_prev_char();
-            sync_slash_help_search_query(store);
+            if store.state.composer.starts_with('/') {
+                sync_slash_help_search_query(store);
+            } else {
+                // Backspaced away the bare `/`: the slash draft is gone, so
+                // close the popup instead of leaving it open over an empty
+                // composer.
+                store.close_menu();
+            }
         }
         KeyCode::Backspace if active_menu_search_has_query(store) => {
             delete_active_menu_search_prev_char(store);
@@ -1367,6 +1377,35 @@ mod tests {
                 .search_query,
             "t",
             "first letter after / must filter the menu immediately"
+        );
+    }
+
+    #[test]
+    fn backspace_on_bare_slash_deletes_it_and_closes_popup() {
+        // Regression (codex review of the single-keystroke slash fix): with only
+        // `/` in the composer and the popup open, Backspace must still delete the
+        // accidental slash — and close the popup — rather than no-op. The fix
+        // moved the bare `/` out of the composer-edit branch, so the slash
+        // Backspace handler has to cover it.
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+
+        handle_key(&mut store, key(KeyCode::Char('/')));
+        handle_key(&mut store, key(KeyCode::Char('t')));
+        assert_eq!(store.state.composer, "/t");
+        assert!(store.state.menu_stack.is_active());
+
+        // `/t` -> `/`: popup stays open over the bare slash.
+        handle_key(&mut store, key(KeyCode::Backspace));
+        assert_eq!(store.state.composer, "/");
+        assert!(store.state.menu_stack.is_active(), "popup stays open on `/`");
+
+        // `/` -> empty: the slash draft is gone, so the popup closes.
+        handle_key(&mut store, key(KeyCode::Backspace));
+        assert_eq!(store.state.composer, "");
+        assert!(
+            !store.state.menu_stack.is_active(),
+            "deleting the bare / closes the slash popup"
         );
     }
 
