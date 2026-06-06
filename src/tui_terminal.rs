@@ -276,7 +276,15 @@ where
                     self.show_cursor()?;
                     changed = true;
                 }
-                if self.last_known_cursor_pos != position {
+                // After `flush()` emits `Print` for changed cells, the PHYSICAL
+                // terminal cursor is left wherever the last `Print` advanced it —
+                // not necessarily `last_known_cursor_pos` (which tracks the last
+                // written cell's start). So whenever we wrote cells we must
+                // re-place the cursor even if the requested position equals our
+                // tracked one (codex P2: e.g. Backspace at the composer end left
+                // the cursor one column too far right). When nothing was written
+                // (idle) this stays a no-op, preserving the zero-byte invariant.
+                if wrote_cells || self.last_known_cursor_pos != position {
                     self.set_cursor_position(position)?;
                     changed = true;
                 }
@@ -611,6 +619,49 @@ mod tests {
         assert_eq!(
             before, after,
             "an unchanged frame must emit zero bytes (selection-safe no-op)"
+        );
+    }
+
+    #[test]
+    fn cursor_is_replaced_after_writing_the_target_cell() {
+        // codex P2: after flush() Prints changed cells, the PHYSICAL cursor sits
+        // past the last cell. If the requested cursor equals our tracked logical
+        // position (the written cell's start), the guard must NOT skip the
+        // MoveTo, else the cursor renders one column too far right (e.g.
+        // Backspace at the composer end). When nothing was written this stays a
+        // no-op (covered by `unchanged_frame_emits_zero_bytes...`).
+        let mut terminal = Terminal::new(RecordingBackend::new(20, 5)).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 4, 20, 1));
+
+        // First draw: "hi"; cursor parked at (2,4) -> tracked cursor = (2,4).
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_widget(Paragraph::new(Line::from("hi")), area);
+                frame.set_cursor_position((2, 4));
+            })
+            .expect("first draw");
+        let mark = terminal.backend().buf.len();
+
+        // Second draw: cell (2,4) changes to 'X' AND the cursor is requested on
+        // it — the exact collision case from the bug.
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_widget(Paragraph::new(Line::from("hiX")), area);
+                frame.set_cursor_position((2, 4));
+            })
+            .expect("second draw");
+
+        let delta = &terminal.backend().buf[mark..];
+        // crossterm MoveTo(col=2,row=4) == "ESC[5;3H" (1-based). It appears once
+        // for the cell write; the fix adds a second to re-place the cursor.
+        let needle = b"\x1b[5;3H";
+        let moves = delta.windows(needle.len()).filter(|w| *w == needle).count();
+        assert!(
+            moves >= 2,
+            "cursor must be re-placed after writing its target cell; got {moves} MoveTo(2,4) in delta={:?}",
+            String::from_utf8_lossy(delta)
         );
     }
 

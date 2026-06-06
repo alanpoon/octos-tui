@@ -123,6 +123,12 @@ where
     if should_update_area {
         terminal.set_viewport_area(area);
     }
+    // Flush these out-of-band scrollback writes now. The draw() that follows
+    // only flushes the backend when the live viewport diff or the cursor
+    // changed, so without this the inserted history could sit buffered and not
+    // appear until some later write (codex P2). This only runs when there is new
+    // history to insert, so an idle TUI still emits nothing.
+    Backend::flush(terminal.backend_mut())?;
     Ok(())
 }
 
