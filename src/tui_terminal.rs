@@ -212,9 +212,22 @@ where
     /// This is the per-frame analogue of codex's `update_inline_viewport`.
     pub fn resize_viewport_to(&mut self, height: u16) -> io::Result<()> {
         let size = self.backend.size()?;
+        self.resize_viewport_to_size(height, size)
+    }
+
+    /// Whether [`Terminal::resize_viewport_to`] would move/clear the viewport
+    /// for the supplied screen size. Used by the event loop to decide whether
+    /// DEC synchronized update wrapping is needed before the draw.
+    pub fn viewport_resize_needed(&self, height: u16, size: Size) -> bool {
+        self.target_viewport_area(height, size) != self.viewport_area
+    }
+
+    fn resize_viewport_to_size(&mut self, height: u16, size: Size) -> io::Result<()> {
         let mut area = self.viewport_area;
-        area.width = size.width;
-        area.height = height.min(size.height).max(1);
+        let target = self.target_viewport_area(height, size);
+        area.x = target.x;
+        area.width = target.width;
+        area.height = target.height;
         if area.bottom() > size.height {
             let scroll_by = area.bottom() - size.height;
             // Push the rows above the viewport up into scrollback so the
@@ -231,13 +244,17 @@ where
         // composer until later history shifted it down (codex P2). `clear()`
         // below clears from the OLD viewport top to end-of-screen, so the rows
         // the viewport vacates are blanked rather than left stale.
-        area.y = size.height - area.height;
-        if area != self.viewport_area {
+        if target != self.viewport_area {
             self.clear()?;
-            self.set_viewport_area(area);
+            self.set_viewport_area(target);
         }
         self.last_known_screen_size = size;
         Ok(())
+    }
+
+    fn target_viewport_area(&self, height: u16, size: Size) -> Rect {
+        let height = height.min(size.height).max(1);
+        Rect::new(0, size.height.saturating_sub(height), size.width, height)
     }
 
     /// Draw a single frame into the inline viewport. Only the cells that changed

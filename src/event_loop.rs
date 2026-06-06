@@ -8,7 +8,10 @@ use crossterm::{
         Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode,
+    },
 };
 use eyre::Result;
 use octos_core::app_ui::AppUiEvent;
@@ -189,39 +192,70 @@ fn draw(
 
     let size = terminal.size()?;
     let width = size.width;
-
-    // Ensure the inline viewport spans the full terminal width BEFORE we insert
-    // history: `insert_history_lines` wraps committed lines to the viewport
-    // width, so a zero-width viewport (the initial state) would wrap every glyph
-    // onto its own row. Anchor a 1-row viewport at the bottom if it has not been
-    // positioned yet; `resize_viewport_to` grows it to the live-UI height next.
-    if terminal.viewport_area.width != width || terminal.viewport_area.height == 0 {
-        let bottom = size.height.saturating_sub(1);
-        let h = terminal.viewport_area.height.max(1).min(size.height);
-        terminal.set_viewport_area(ratatui::layout::Rect::new(
-            0,
-            bottom.min(size.height.saturating_sub(h)),
-            width,
-            h,
-        ));
-    }
+    let height = app::live_ui_height(&store.state, width, size.height);
 
     // The scrollback flush must wrap to the SAME width `insert_history_lines`
     // uses (the full viewport width), so the line accounting stays consistent.
     let wrap_width = usize::from(width).max(1);
 
-    // 1. Push any newly-finalized committed history into scrollback. This is the
-    //    content that becomes natively selectable / scrollable above the viewport.
     let update = scrollback.sync(&store.state, palette, wrap_width);
-    if !update.lines_to_insert.is_empty() {
-        insert_history_lines(terminal, update.lines_to_insert)?;
-    }
+    let needs_history_insert = !update.lines_to_insert.is_empty();
+    let needs_resize = terminal.viewport_resize_needed(height, size);
 
-    // 2. Size the inline viewport to the live UI and render it.
-    let height = app::live_ui_height(&store.state, size.width, size.height);
+    // The inline structural order mirrors codex-rs: size/clear the viewport
+    // first, insert finalized history using that width/anchor, then draw. If a
+    // resize/clear or history insertion is pending, batch those structural
+    // writes with the frame inside DEC synchronized update so native selections
+    // are disturbed only when the terminal genuinely changes.
+    if needs_resize || needs_history_insert {
+        synchronized_terminal_update(terminal, |terminal| {
+            draw_inline_frame(
+                terminal,
+                &store.state,
+                palette,
+                height,
+                update.lines_to_insert,
+            )
+        })
+    } else {
+        draw_inline_frame(
+            terminal,
+            &store.state,
+            palette,
+            height,
+            update.lines_to_insert,
+        )
+    }
+}
+
+fn draw_inline_frame(
+    terminal: &mut InlineTerminal<CrosstermBackend<Stdout>>,
+    state: &crate::model::AppState,
+    palette: Palette,
+    height: u16,
+    lines_to_insert: Vec<ratatui::text::Line<'static>>,
+) -> Result<()> {
     terminal.resize_viewport_to(height)?;
-    terminal.draw(|frame| app::render_viewport(frame, &store.state, palette))?;
+    if !lines_to_insert.is_empty() {
+        insert_history_lines(terminal, lines_to_insert)?;
+        terminal.invalidate_viewport();
+    }
+    terminal.draw(|frame| app::render_viewport(frame, state, palette))?;
     Ok(())
+}
+
+fn synchronized_terminal_update(
+    terminal: &mut InlineTerminal<CrosstermBackend<Stdout>>,
+    operations: impl FnOnce(&mut InlineTerminal<CrosstermBackend<Stdout>>) -> Result<()>,
+) -> Result<()> {
+    execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    let operation_result = operations(terminal);
+    let end_result = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    match (operation_result, end_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(err), _) => Err(err),
+        (Ok(()), Err(err)) => Err(err.into()),
+    }
 }
 
 /// Drain a pending clipboard request by emitting the OSC 52 escape sequence to

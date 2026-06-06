@@ -222,10 +222,11 @@ fn live_tail_lines(app: &AppState, palette: Palette, wrap_width: usize) -> Vec<L
     lines
 }
 
-/// The finalized (committed) transcript lines to push into scrollback: the
-/// committed `session.messages` rendered as message blocks. Append-only as long
-/// as messages are append-only; the scrollback tracker detects discontinuities
-/// (session switch / hydrate replace) and re-flushes from scratch.
+/// The finalized transcript lines to push into scrollback: committed
+/// `session.messages` plus anchored completed turn activity logs. Append-only as
+/// long as messages are append-only; the scrollback tracker detects
+/// discontinuities (session switch / hydrate replace / late activity-log
+/// archive) and re-flushes from scratch.
 pub fn finalized_history_lines(
     app: &AppState,
     palette: Palette,
@@ -247,7 +248,8 @@ pub fn finalized_history_lines_range(
     let Some(session) = app.active_session() else {
         return lines;
     };
-    for message in session.messages.iter().skip(start) {
+    let anchored_activity_logs = anchored_turn_activity_logs(app, session);
+    for (idx, message) in session.messages.iter().enumerate().skip(start) {
         push_message_block(
             &mut lines,
             palette,
@@ -264,20 +266,29 @@ pub fn finalized_history_lines_range(
                 Span::styled(tool_call_id.to_string(), palette.text()),
             ]));
         }
+
+        for (_, log) in anchored_activity_logs
+            .iter()
+            .filter(|(anchor_idx, _)| *anchor_idx == idx)
+        {
+            push_turn_activity_log_section(&mut lines, palette, log, app);
+        }
     }
     // Scrollback content must render on the terminal's NATIVE background, not the
-    // theme surface. The shared `push_message_block` path bakes a `surface` /
-    // `diff_context_bg` background into every span (correct for the live inline
-    // viewport, which keeps the theme surface) but when those same lines are
-    // written into the terminal's real scrollback by `insert_history`, the
-    // surface color paints solid "brown/grey blocks" against the terminal's own
-    // background. codex writes history on the default background; mirror that by
-    // dropping the theme background from finalized lines here (the live viewport
-    // render path is untouched, so it still shows the surface).
-    for line in &mut lines {
+    // theme surface. Message blocks bake a `surface` / `diff_context_bg`
+    // background into their spans, and completed activity logs can inherit the
+    // live tail's `surface_alt` background if they are promoted into scrollback.
+    // codex writes finalized history on the default background; mirror that by
+    // dropping every finalized line/span background here (the live viewport
+    // render path is untouched, so it still shows the theme surface).
+    strip_lines_background(&mut lines);
+    lines
+}
+
+fn strip_lines_background(lines: &mut [Line<'static>]) {
+    for line in lines {
         strip_line_background(line);
     }
-    lines
 }
 
 /// Reset the background of a finalized scrollback line (and every span) to the
@@ -299,12 +310,19 @@ pub fn committed_messages_fingerprint(app: &AppState) -> CommittedFingerprint {
     let Some(session) = app.active_session() else {
         return CommittedFingerprint::default();
     };
+    let anchored_activity_logs = anchored_turn_activity_logs(app, session);
     CommittedFingerprint {
         session_id: session.id.0.clone(),
         message_count: session.messages.len(),
+        activity_log_count: anchored_activity_logs
+            .iter()
+            .filter(|(_, log)| !log.items.is_empty())
+            .count(),
         // A cheap content hash of the committed messages so a hydrate that
-        // *replaces* history (same count, different content) is detected.
-        content_hash: committed_content_hash(session),
+        // *replaces* history (same count, different content) is detected. It
+        // also covers archived activity logs, which can arrive after the
+        // corresponding assistant message was already flushed.
+        content_hash: committed_content_hash(session, &anchored_activity_logs),
     }
 }
 
@@ -313,15 +331,40 @@ pub fn committed_messages_fingerprint(app: &AppState) -> CommittedFingerprint {
 pub struct CommittedFingerprint {
     pub session_id: String,
     pub message_count: usize,
+    pub activity_log_count: usize,
     pub content_hash: u64,
 }
 
-fn committed_content_hash(session: &SessionView) -> u64 {
+fn committed_content_hash(
+    session: &SessionView,
+    anchored_activity_logs: &[(usize, &TurnActivityLog)],
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for message in &session.messages {
         message.role.as_str().hash(&mut hasher);
         message.content.hash(&mut hasher);
+        message.reasoning_content.hash(&mut hasher);
+        message.tool_call_id.hash(&mut hasher);
+    }
+    for (render_index, log) in anchored_activity_logs {
+        if log.items.is_empty() {
+            continue;
+        }
+        render_index.hash(&mut hasher);
+        log.session_id.0.hash(&mut hasher);
+        log.turn_id.0.to_string().hash(&mut hasher);
+        log.request.hash(&mut hasher);
+        for item in &log.items {
+            item.kind.label().hash(&mut hasher);
+            item.title.hash(&mut hasher);
+            item.status.hash(&mut hasher);
+            item.detail.hash(&mut hasher);
+            item.output_preview.hash(&mut hasher);
+            item.success.hash(&mut hasher);
+            item.duration_ms.hash(&mut hasher);
+            item.tool_call_id.hash(&mut hasher);
+        }
     }
     hasher.finish()
 }
@@ -9506,20 +9549,90 @@ mod tests {
     }
 
     #[test]
+    fn finalized_history_lines_include_anchored_activity_logs() {
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = chat_app(vec![
+            Message::user("build the site"),
+            Message::assistant("The site is built."),
+        ]);
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: turn_id.clone(),
+            request: Some("build the site".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                    .with_turn(turn_id)
+                    .with_detail("cargo build")
+                    .with_output_preview("Finished dev build")
+                    .with_success(true),
+            ],
+        });
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let lines = finalized_history_lines_range(&app, palette, 80, 1);
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(
+            text.contains("The site is built."),
+            "missing answer: {text:?}"
+        );
+        assert!(
+            text.contains("Agent task completed"),
+            "missing activity log: {text:?}"
+        );
+        assert!(
+            text.contains("$ cargo build"),
+            "missing tool detail: {text:?}"
+        );
+    }
+
+    #[test]
     fn finalized_history_lines_carry_no_theme_background() {
         // Bug 3a: scrollback content must render on the terminal's native
-        // background. The Codex theme's `surface` (Rgb(15,18,24)) and the user
+        // background. The Codex theme's `surface` / `surface_alt` and the user
         // message's `diff_context_bg` would otherwise paint solid "brown blocks"
         // into the terminal's real scrollback. Every finalized line/span must
         // have `bg == None` so `insert_history` emits the default background.
-        let app = chat_app(vec![
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = chat_app(vec![
             Message::user("a user message"),
             Message::assistant("an assistant reply\nwith two lines"),
         ]);
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: turn_id.clone(),
+            request: Some("a user message".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                    .with_turn(turn_id)
+                    .with_detail("cargo test")
+                    .with_output_preview("tests passed")
+                    .with_success(true),
+            ],
+        });
         // Use a theme with a non-default (brownish) surface, the regression case.
         let palette = Palette::for_theme(ThemeName::Codex);
         let lines = finalized_history_lines(&app, palette, 80);
         assert!(!lines.is_empty(), "expected finalized history lines");
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            text.contains("Agent task completed"),
+            "activity log must be part of finalized history: {text:?}"
+        );
         for line in &lines {
             assert_eq!(
                 line.style.bg, None,

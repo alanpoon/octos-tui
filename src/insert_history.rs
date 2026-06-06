@@ -34,9 +34,7 @@ use crossterm::style::Color as CColor;
 use crossterm::style::Colors;
 use crossterm::style::Print;
 use crossterm::style::SetAttribute;
-use crossterm::style::SetBackgroundColor;
 use crossterm::style::SetColors;
-use crossterm::style::SetForegroundColor;
 use crossterm::terminal::Clear;
 use crossterm::terminal::ClearType;
 use ratatui::backend::Backend;
@@ -289,12 +287,9 @@ where
         }
         queue!(writer, Print(span.content.clone()))?;
     }
-    queue!(
-        writer,
-        SetForegroundColor(CColor::Reset),
-        SetBackgroundColor(CColor::Reset),
-        SetAttribute(crossterm::style::Attribute::Reset),
-    )
+    // Emit explicit fg/bg/attribute resets instead of crossterm's compact
+    // `CSI m` form so history insertion always leaves a stable reset fence.
+    write!(writer, "\x1b[39m\x1b[49m\x1b[0m")
 }
 
 fn queue_modifier_diff<W: Write>(w: &mut W, from: Modifier, to: Modifier) -> io::Result<()> {
@@ -429,12 +424,10 @@ mod tests {
         t
     }
 
-    /// `crossterm::style::SetBackgroundColor(Reset)` byte sequence (`CSI 49 m`).
-    /// Any background SGR that is NOT this is a non-default (theme) background.
-    fn default_bg_seq() -> String {
-        let mut bytes: Vec<u8> = Vec::new();
-        queue!(bytes, SetBackgroundColor(CColor::Reset)).unwrap();
-        String::from_utf8(bytes).unwrap()
+    /// Explicit default-background reset (`CSI 49 m`). Any background SGR that
+    /// is NOT this is a non-default (theme) background.
+    fn default_bg_seq() -> &'static str {
+        "\x1b[49m"
     }
 
     #[test]
@@ -465,7 +458,7 @@ mod tests {
             "scrollback stream emitted an indexed background (brown block): {out:?}"
         );
         assert!(
-            out.contains(&default_bg),
+            out.contains(default_bg),
             "scrollback stream should reset the background to default: {out:?}"
         );
     }

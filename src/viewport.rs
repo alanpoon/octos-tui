@@ -124,10 +124,11 @@ fn is_prefix_preserved(
 mod tests {
     use super::*;
     use crate::cli::ThemeName;
-    use crate::model::AppState;
+    use crate::model::{ActivityItem, ActivityKind, AppState, TurnActivityLog};
     use octos_core::Message;
     use octos_core::SessionKey;
     use octos_core::app_ui::AppUiSession;
+    use octos_core::ui_protocol::TurnId;
 
     fn palette() -> Palette {
         Palette::for_theme(ThemeName::Slate)
@@ -199,6 +200,45 @@ mod tests {
         let again = tracker.sync(&app, palette(), 60);
         assert!(again.lines_to_insert.is_empty());
         assert!(!again.reset);
+    }
+
+    #[test]
+    fn late_activity_log_archive_triggers_reflush() {
+        let mut tracker = ScrollbackTracker::new();
+        let mut app = state(vec![
+            Message::user("build the site"),
+            Message::assistant("done"),
+        ]);
+        let _ = tracker.sync(&app, palette(), 60);
+
+        let session_id = app.sessions[0].id.clone();
+        let turn_id = TurnId::new();
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: turn_id.clone(),
+            request: Some("build the site".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                    .with_turn(turn_id)
+                    .with_detail("cargo test")
+                    .with_success(true),
+            ],
+        });
+
+        let update = tracker.sync(&app, palette(), 60);
+        let text = update
+            .lines_to_insert
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(update.reset, "late activity log changes finalized history");
+        assert!(
+            text.contains("Agent task completed") && text.contains("$ cargo test"),
+            "reflush should include archived activity log: {text:?}"
+        );
     }
 
     #[test]
