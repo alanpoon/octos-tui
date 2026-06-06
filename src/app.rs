@@ -5998,7 +5998,7 @@ mod tests {
             state: AppState::new(
                 vec![],
                 0,
-                "AppUI connected".into(),
+                "Octos UI connected".into(),
                 Some("stdio:octos serve --stdio".into()),
                 false,
             ),
@@ -6031,7 +6031,7 @@ mod tests {
             state: AppState::new(
                 vec![],
                 0,
-                "AppUI connected".into(),
+                "Octos UI connected".into(),
                 Some("stdio:octos serve --stdio".into()),
                 false,
             ),
@@ -6064,7 +6064,7 @@ mod tests {
             state: AppState::new(
                 vec![],
                 0,
-                "AppUI connected".into(),
+                "Octos UI connected".into(),
                 Some("stdio:octos serve --stdio".into()),
                 false,
             ),
@@ -6116,7 +6116,7 @@ mod tests {
             state: AppState::new(
                 vec![],
                 0,
-                "AppUI connected".into(),
+                "Octos UI connected".into(),
                 Some("stdio:octos serve --stdio".into()),
                 false,
             ),
@@ -6142,7 +6142,7 @@ mod tests {
             state: AppState::new(
                 vec![],
                 0,
-                "AppUI connected".into(),
+                "Octos UI connected".into(),
                 Some("stdio:octos serve --stdio".into()),
                 false,
             ),

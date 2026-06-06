@@ -334,7 +334,7 @@ fn theme_menu(ctx: &MenuContext<'_>) -> MenuSpec {
     MenuSpec {
         id: MenuId::from(MENU_THEME),
         title: "Theme".into(),
-        subtitle: Some("Local TUI palette. Does not require AppUI.".into()),
+        subtitle: Some("Local TUI palette. Does not require Octos UI.".into()),
         items,
         tabs: Vec::new(),
         searchable: true,
@@ -508,7 +508,7 @@ fn status_menu(ctx: &MenuContext<'_>) -> MenuSpec {
             items.push(
                 MenuItem::new("status.refresh", "Refresh server status", MenuAction::Noop)
                     .disabled(format!(
-                        "AppUI method `{}` is not advertised",
+                        "Octos UI method `{}` is not advertised",
                         AppUiActionKind::SessionStatusRead.method()
                     )),
             );
@@ -516,7 +516,7 @@ fn status_menu(ctx: &MenuContext<'_>) -> MenuSpec {
     } else {
         items.push(
             MenuItem::new("status.refresh", "Refresh server status", MenuAction::Noop)
-                .disabled("server status requires an open AppUI session"),
+                .disabled("server status requires an open Octos UI session"),
         );
     }
 
@@ -544,7 +544,7 @@ fn cost_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         return MenuBuildResult::Unavailable(MenuStatusSpec {
             id: MenuId::from(MENU_COST),
             title: "Cost unavailable".into(),
-            message: "Usage totals require an open AppUI session.".into(),
+            message: "Usage totals require an open Octos UI session.".into(),
             footer_hint: Some("Esc close".into()),
         });
     };
@@ -2450,7 +2450,7 @@ fn provider_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(MENU_PROVIDER),
         title: "Provider".into(),
-        subtitle: Some("Profile-owned LLM setup; catalog and state come from AppUI.".into()),
+        subtitle: Some("Profile-owned LLM setup; catalog and state come from Octos UI.".into()),
         items,
         tabs: Vec::new(),
         searchable: true,
@@ -3145,7 +3145,7 @@ fn skills_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(MENU_SKILLS),
         title: "Skills".into(),
-        subtitle: Some("Profile-owned customer skills over AppUI.".into()),
+        subtitle: Some("Profile-owned customer skills over Octos UI.".into()),
         items,
         tabs: Vec::new(),
         searchable: true,
@@ -3185,7 +3185,7 @@ fn permissions_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         return MenuBuildResult::Unavailable(MenuStatusSpec {
             id: MenuId::from(MENU_PERMISSIONS),
             title: "Permissions unavailable".into(),
-            message: "Permissions require an open AppUI session.".into(),
+            message: "Permissions require an open Octos UI session.".into(),
             footer_hint: Some("Esc close".into()),
         });
     };
@@ -3244,7 +3244,7 @@ fn action_missing_reason(ctx: &MenuContext<'_>, method: &'static str) -> Option<
 
 fn mutating_action_missing_reason(ctx: &MenuContext<'_>, method: &'static str) -> Option<String> {
     if ctx.availability.readonly {
-        Some("Read-only launch: mutating AppUI commands are disabled".into())
+        Some("Read-only launch: mutating Octos UI commands are disabled".into())
     } else {
         action_missing_reason(ctx, method)
     }
@@ -3252,7 +3252,7 @@ fn mutating_action_missing_reason(ctx: &MenuContext<'_>, method: &'static str) -
 
 fn permission_menu_missing_reason(ctx: &MenuContext<'_>) -> String {
     if ctx.availability.capabilities.is_none() {
-        "AppUI capabilities are not available".into()
+        "Octos UI capabilities are not available".into()
     } else if let Some((method, reason)) =
         APPUI_PERMISSION_MENU_METHODS_ANY.iter().find_map(|method| {
             ctx.availability
@@ -3260,10 +3260,10 @@ fn permission_menu_missing_reason(ctx: &MenuContext<'_>) -> String {
                 .map(|reason| (*method, reason))
         })
     {
-        format!("AppUI method `{method}` is unsupported: {reason}")
+        format!("Octos UI method `{method}` is unsupported: {reason}")
     } else {
         format!(
-            "AppUI permission methods are not advertised: {}",
+            "Octos UI permission methods are not advertised: {}",
             APPUI_PERMISSION_MENU_METHODS_ANY.join(", ")
         )
     }
@@ -3667,11 +3667,11 @@ fn permission_method_row(ctx: &MenuContext<'_>, method: &'static str) -> MenuPre
 
 fn method_missing_reason(ctx: &MenuContext<'_>, method: &str) -> String {
     if let Some(reason) = ctx.availability.unsupported_method_reason(method) {
-        format!("AppUI method `{method}` is unsupported: {reason}")
+        format!("Octos UI method `{method}` is unsupported: {reason}")
     } else if ctx.availability.capabilities.is_none() {
-        "AppUI capabilities are not available".into()
+        "Octos UI capabilities are not available".into()
     } else {
-        format!("AppUI method `{method}` is not advertised by this backend.")
+        format!("Octos UI method `{method}` is not advertised by this backend.")
     }
 }
 
@@ -3808,7 +3808,7 @@ fn mcp_config_description(server: &McpConfigEntry) -> String {
         parts.push(format!("error: {last_error}"));
     }
     if parts.is_empty() {
-        "Configured by AppUI.".into()
+        "Configured by Octos UI.".into()
     } else {
         parts.join(" | ")
     }
@@ -3850,7 +3850,7 @@ fn tool_config_description(tool: &ToolConfigEntry) -> String {
         parts.push(format!("tags {}", tool.tags.join(", ")));
     }
     if parts.is_empty() {
-        "Configured by AppUI.".into()
+        "Configured by Octos UI.".into()
     } else {
         parts.join(" | ")
     }
@@ -4086,7 +4086,7 @@ fn capability_summary_item(ctx: &MenuContext<'_>) -> MenuItem {
             capabilities.features().len(),
             capabilities.unsupported_methods().len()
         ),
-        None => "No AppUI capabilities have been advertised yet".into(),
+        None => "No Octos UI capabilities have been advertised yet".into(),
     };
     MenuItem::new("status.capabilities", "Capabilities", MenuAction::Noop)
         .with_description(description)
@@ -6123,7 +6123,7 @@ mod tests {
             .expect("toggle item");
         let MenuAction::SendAppUi(AppUiCommand::SetMcpConfigEnabled(params)) = &toggle.action
         else {
-            panic!("toggle should call AppUI set_enabled");
+            panic!("toggle should call Octos UI set_enabled");
         };
         assert_eq!(params.server, "github");
         assert!(!params.enabled);
@@ -6188,7 +6188,7 @@ mod tests {
             .expect("tool toggle");
         let MenuAction::SendAppUi(AppUiCommand::SetToolConfigEnabled(params)) = &toggle.action
         else {
-            panic!("toggle should call AppUI set_enabled");
+            panic!("toggle should call Octos UI set_enabled");
         };
         assert_eq!(params.tool, "web_fetch");
         assert!(params.enabled);
@@ -6442,7 +6442,7 @@ mod tests {
         };
         assert!(
             spec.message
-                .contains("AppUI permission methods are not advertised")
+                .contains("Octos UI permission methods are not advertised")
         );
     }
 

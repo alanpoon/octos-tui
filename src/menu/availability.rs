@@ -154,7 +154,7 @@ impl CommandAvailability {
             ConnectionRequirement::Disconnected
                 if ctx.connection == ConnectionState::Disconnected => {}
             ConnectionRequirement::Connected => {
-                return self.unavailable.status("requires a connected AppUI server");
+                return self.unavailable.status("requires a connected Octos UI server");
             }
             ConnectionRequirement::Disconnected => {
                 return self.unavailable.status("requires disconnected mode");
@@ -174,7 +174,7 @@ impl CommandAvailability {
         if !self.required_methods.is_empty() && ctx.capabilities.is_none() {
             return self
                 .unavailable
-                .status("AppUI capabilities are not available");
+                .status("Octos UI capabilities are not available");
         }
 
         if let Some(method) = self.required_methods.iter().find(|method| {
@@ -183,11 +183,11 @@ impl CommandAvailability {
             if let Some(reason) = ctx.unsupported_method_reason(method) {
                 return self
                     .unavailable
-                    .status(format!("AppUI method `{method}` is unsupported: {reason}"));
+                    .status(format!("Octos UI method `{method}` is unsupported: {reason}"));
             }
             return self
                 .unavailable
-                .status(format!("AppUI method `{method}` is not available"));
+                .status(format!("Octos UI method `{method}` is not available"));
         }
 
         if let Some(capabilities) = ctx.capabilities
@@ -205,15 +205,15 @@ impl CommandAvailability {
             };
             if let Some(reason) = ctx.unsupported_method_reason(method) {
                 return unavailable
-                    .status(format!("AppUI method `{method}` is unsupported: {reason}"));
+                    .status(format!("Octos UI method `{method}` is unsupported: {reason}"));
             }
-            return unavailable.status(format!("AppUI method `{method}` is not available"));
+            return unavailable.status(format!("Octos UI method `{method}` is not available"));
         }
 
         if !self.required_methods_any.is_empty() && ctx.capabilities.is_none() {
             return self
                 .unavailable
-                .status("AppUI capabilities are not available");
+                .status("Octos UI capabilities are not available");
         }
 
         if !self.required_methods_any.is_empty()
@@ -228,7 +228,7 @@ impl CommandAvailability {
             }) {
                 return self
                     .unavailable
-                    .status(format!("AppUI method `{method}` is unsupported: {reason}"));
+                    .status(format!("Octos UI method `{method}` is unsupported: {reason}"));
             }
 
             let methods = self
@@ -245,7 +245,7 @@ impl CommandAvailability {
         if !self.required_features.is_empty() && ctx.capabilities.is_none() {
             return self
                 .unavailable
-                .status("AppUI capabilities are not available");
+                .status("Octos UI capabilities are not available");
         }
 
         if let Some(feature) = self
@@ -255,7 +255,7 @@ impl CommandAvailability {
         {
             return self
                 .unavailable
-                .status(format!("AppUI feature `{feature}` is not available"));
+                .status(format!("Octos UI feature `{feature}` is not available"));
         }
 
         if self.readonly == ReadonlyPolicy::BlockMutating && ctx.readonly {
@@ -602,7 +602,7 @@ mod tests {
 
         assert_eq!(
             status.reason.as_deref(),
-            Some("AppUI capabilities are not available")
+            Some("Octos UI capabilities are not available")
         );
     }
 
@@ -626,7 +626,7 @@ mod tests {
         assert_eq!(status.disposition, AvailabilityDisposition::Hidden);
         assert_eq!(
             status.reason.as_deref(),
-            Some("AppUI method `turn/interrupt` is unsupported: disabled by policy")
+            Some("Octos UI method `turn/interrupt` is unsupported: disabled by policy")
         );
     }
 
