@@ -134,7 +134,7 @@ fn format_limited_list(values: &[String], empty: &str) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     if values.len() > 3 {
-        rendered.push_str(&format!(", +{} more", values.len() - 3));
+        rendered.push_str(&t!("status.list_more", count = values.len() - 3));
     }
     rendered
 }
@@ -245,7 +245,7 @@ impl Store {
         }
 
         if self.state.readonly {
-            self.state.status = "Read-only mode: turn/start disabled".into();
+            self.state.status = t!("status.readonly_turn_disabled").into_owned();
             self.state.clear_current_composer_draft();
             return None;
         }
@@ -255,8 +255,7 @@ impl Store {
         }
 
         if self.active_session().is_none() {
-            self.state.status =
-                "No coding session open. Run /onboard open-session before sending a prompt.".into();
+            self.state.status = t!("status.no_session_send_prompt").into_owned();
             self.state.focus = FocusPane::Composer;
             return None;
         }
@@ -264,14 +263,12 @@ impl Store {
         self.state.clear_current_composer_draft();
         if self.state.active_turn().is_some() {
             self.state.pending_messages.push(prompt);
-            self.state.status =
-                "Message staged; it will submit after the active turn. Press Esc to interrupt/send."
-                    .into();
+            self.state.status = t!("status.message_staged").into_owned();
             self.state.scroll_transcript_to_latest();
             return None;
         }
 
-        self.start_prompt_turn(prompt, "Queued turn/start")
+        self.start_prompt_turn(prompt, t!("status.queued_turn_start").into_owned())
     }
 
     #[allow(dead_code)]
@@ -300,7 +297,9 @@ impl Store {
                 } else if names
                     .clone()
                     .any(|name| name.to_ascii_lowercase().contains(&query))
-                    || command.description.to_ascii_lowercase().contains(&query)
+                    || t!(command.description)
+                        .to_ascii_lowercase()
+                        .contains(&query)
                 {
                     Some(2)
                 } else {
@@ -310,7 +309,7 @@ impl Store {
                     rank,
                     SlashCommandMatch {
                         name: command.slash_name(),
-                        description: command.description.into(),
+                        description: t!(command.description).into_owned(),
                         available: visible.availability.is_available(),
                     },
                 ))
@@ -333,12 +332,10 @@ impl Store {
                 let availability = registry.evaluate(command, &self.state.availability_context());
                 if !availability.is_available() {
                     let command_name = command.slash_name();
+                    let fallback_reason = t!("status.command_unavailable");
                     self.show_unavailable_slash_command(
                         &command_name,
-                        availability
-                            .reason
-                            .as_deref()
-                            .unwrap_or("command is unavailable"),
+                        availability.reason.as_deref().unwrap_or(&fallback_reason),
                     );
                     return None;
                 }
@@ -370,7 +367,7 @@ impl Store {
 
     /// M15-E: parse `/agents`, `/goal`, `/loop` through
     /// [`crate::autonomy::parse_autonomy_slash`] and dispatch one
-    /// AppUI command per parsed intent. Capability checks are enforced
+    /// Octos UI command per parsed intent. Capability checks are enforced
     /// at the dispatch site (and via the registry's
     /// `coding.autonomy.v1` gate), so old servers see the slash
     /// command rendered as `Unsupported` rather than getting probed.
@@ -418,7 +415,7 @@ impl Store {
                     return None;
                 }
                 let Ok(task_id) = task_id.parse::<TaskId>() else {
-                    self.state.status = format!("Invalid task id `{task_id}`");
+                    self.state.status = t!("status.invalid_task_id", id = task_id).into_owned();
                     return None;
                 };
                 let (artifact_id, path, label) = match selector {
@@ -431,7 +428,8 @@ impl Store {
                         (None, Some(path), label)
                     }
                 };
-                self.state.status = format!("Reading task artifact {label} for {task_id}");
+                self.state.status =
+                    t!("status.reading_task_artifact", label = label, id = task_id).into_owned();
                 Some(AppUiCommand::ReadTaskArtifact(TaskArtifactReadParams {
                     session_id,
                     task_id,
@@ -460,7 +458,7 @@ impl Store {
                 if !self.require_appui_method(crate::model::APPUI_METHOD_THREAD_GRAPH_GET) {
                     return None;
                 }
-                self.state.status = "Reading thread graph".into();
+                self.state.status = t!("status.reading_thread_graph").into_owned();
                 Some(AppUiCommand::GetThreadGraph(ThreadGraphGetParams {
                     session_id,
                     at: None,
@@ -485,20 +483,23 @@ impl Store {
                     {
                         Ok(turn_id) => turn_id,
                         Err(_) => {
-                            self.state.status = format!("Invalid turn id `{raw}`");
+                            self.state.status = t!("status.invalid_turn_id", id = raw).into_owned();
                             return None;
                         }
                     },
                     None => match self.state.active_turn().map(|(_, turn_id)| turn_id.clone()) {
                         Some(turn_id) => turn_id,
                         None => {
-                            self.state.status = "No active turn to inspect".into();
+                            self.state.status = t!("status.no_active_turn_inspect").into_owned();
                             return None;
                         }
                     },
                 };
-                self.state.status =
-                    format!("Reading turn state {}", short_id(&turn_id.0.to_string()));
+                self.state.status = t!(
+                    "status.reading_turn_state",
+                    id = short_id(&turn_id.0.to_string())
+                )
+                .into_owned();
                 Some(AppUiCommand::GetTurnState(TurnStateGetParams {
                     session_id,
                     turn_id,
@@ -518,7 +519,7 @@ impl Store {
                 if !self.require_appui_method(crate::model::APPUI_METHOD_AGENT_LIST) {
                     return None;
                 }
-                self.state.status = "Refreshing agent list".into();
+                self.state.status = t!("status.refreshing_agent_list").into_owned();
                 Some(AppUiCommand::ListAgents(crate::model::AgentListParams {
                     session_id,
                     parent_agent_id: None,
@@ -529,7 +530,8 @@ impl Store {
                     if !self.require_appui_method(crate::model::APPUI_METHOD_AGENT_STATUS_READ) {
                         return None;
                     }
-                    self.state.status = format!("Reading status for {agent_id}");
+                    self.state.status =
+                        t!("status.reading_agent_status", id = agent_id).into_owned();
                     Some(AppUiCommand::ReadAgentStatus(
                         crate::model::AgentStatusReadParams {
                             session_id,
@@ -541,7 +543,7 @@ impl Store {
                     if !self.require_appui_method(crate::model::APPUI_METHOD_AGENT_LIST) {
                         return None;
                     }
-                    self.state.status = "Refreshing agent list".into();
+                    self.state.status = t!("status.refreshing_agent_list").into_owned();
                     Some(AppUiCommand::ListAgents(crate::model::AgentListParams {
                         session_id,
                         parent_agent_id: None,
@@ -552,7 +554,7 @@ impl Store {
                 if !self.require_appui_method(crate::model::APPUI_METHOD_AGENT_OUTPUT_READ) {
                     return None;
                 }
-                self.state.status = format!("Reading output for {agent_id}");
+                self.state.status = t!("status.reading_agent_output", id = agent_id).into_owned();
                 Some(AppUiCommand::ReadAgentOutput(
                     crate::model::AgentOutputReadParams {
                         session_id,
@@ -565,7 +567,8 @@ impl Store {
                 if !self.require_appui_method(crate::model::APPUI_METHOD_AGENT_ARTIFACT_LIST) {
                     return None;
                 }
-                self.state.status = format!("Listing artifacts for {agent_id}");
+                self.state.status =
+                    t!("status.listing_agent_artifacts", id = agent_id).into_owned();
                 Some(AppUiCommand::ListAgentArtifacts(
                     crate::model::AgentArtifactListParams {
                         session_id,
@@ -587,7 +590,12 @@ impl Store {
                         (None, Some(path), label)
                     }
                 };
-                self.state.status = format!("Reading artifact {label} for {agent_id}");
+                self.state.status = t!(
+                    "status.reading_agent_artifact",
+                    label = label,
+                    id = agent_id
+                )
+                .into_owned();
                 Some(AppUiCommand::ReadAgentArtifact(
                     crate::model::AgentArtifactReadParams {
                         session_id,
@@ -601,7 +609,8 @@ impl Store {
                 if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_AGENT_INTERRUPT) {
                     return None;
                 }
-                self.state.status = format!("Interrupt requested for {agent_id}");
+                self.state.status =
+                    t!("status.interrupt_requested_for", id = agent_id).into_owned();
                 Some(AppUiCommand::InterruptAgent(
                     crate::model::AgentInterruptParams {
                         session_id,
@@ -613,7 +622,7 @@ impl Store {
                 if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_AGENT_CLOSE) {
                     return None;
                 }
-                self.state.status = format!("Close requested for {agent_id}");
+                self.state.status = t!("status.close_requested_for", id = agent_id).into_owned();
                 Some(AppUiCommand::CloseAgent(crate::model::AgentCloseParams {
                     session_id,
                     agent_id,
@@ -631,7 +640,7 @@ impl Store {
                 if !self.require_appui_method(crate::model::APPUI_METHOD_SESSION_GOAL_GET) {
                     return None;
                 }
-                self.state.status = "Refreshing goal".into();
+                self.state.status = t!("status.refreshing_goal").into_owned();
                 Some(AppUiCommand::GetSessionGoal(
                     crate::model::SessionGoalGetParams {
                         session_id,
@@ -642,14 +651,14 @@ impl Store {
             GoalCommand::Set(objective) => {
                 let objective = objective.trim().to_string();
                 if objective.is_empty() {
-                    self.state.status = "Goal objective cannot be empty".into();
+                    self.state.status = t!("status.goal_objective_empty").into_owned();
                     return None;
                 }
                 if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_SESSION_GOAL_SET)
                 {
                     return None;
                 }
-                self.state.status = format!("Setting goal: {objective}");
+                self.state.status = t!("status.setting_goal", objective = objective).into_owned();
                 Some(AppUiCommand::SetSessionGoal(
                     crate::model::SessionGoalSetParams {
                         session_id,
@@ -682,7 +691,7 @@ impl Store {
                 {
                     return None;
                 }
-                self.state.status = "Clearing goal".into();
+                self.state.status = t!("status.clearing_goal").into_owned();
                 Some(AppUiCommand::ClearSessionGoal(
                     crate::model::SessionGoalClearParams {
                         session_id,
@@ -702,7 +711,7 @@ impl Store {
                 if !self.require_appui_method(crate::model::APPUI_METHOD_LOOP_LIST) {
                     return None;
                 }
-                self.state.status = "Listing loops".into();
+                self.state.status = t!("status.listing_loops").into_owned();
                 Some(AppUiCommand::ListLoops(crate::model::LoopListParams {
                     session_id,
                     profile_id,
@@ -717,14 +726,14 @@ impl Store {
                     LoopCadence::Every(duration) => {
                         let secs = duration.as_secs();
                         if secs == 0 {
-                            self.state.status = "Loop interval must be at least 1 second".into();
+                            self.state.status = t!("status.loop_interval_min").into_owned();
                             return None;
                         }
                         (crate::model::LoopMode::FixedInterval, Some(secs))
                     }
                     LoopCadence::Maintenance => (crate::model::LoopMode::Maintenance, None),
                 };
-                self.state.status = "Creating loop".into();
+                self.state.status = t!("status.creating_loop").into_owned();
                 Some(AppUiCommand::CreateLoop(crate::model::LoopCreateParams {
                     session_id,
                     profile_id,
@@ -737,7 +746,7 @@ impl Store {
                 if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_LOOP_DELETE) {
                     return None;
                 }
-                self.state.status = format!("Deleting loop {loop_id}");
+                self.state.status = t!("status.deleting_loop", id = loop_id).into_owned();
                 Some(AppUiCommand::DeleteLoop(crate::model::LoopIdParams {
                     session_id,
                     loop_id,
@@ -747,7 +756,7 @@ impl Store {
                 if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_LOOP_PAUSE) {
                     return None;
                 }
-                self.state.status = format!("Pausing loop {loop_id}");
+                self.state.status = t!("status.pausing_loop", id = loop_id).into_owned();
                 Some(AppUiCommand::PauseLoop(crate::model::LoopIdParams {
                     session_id,
                     loop_id,
@@ -757,7 +766,7 @@ impl Store {
                 if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_LOOP_RESUME) {
                     return None;
                 }
-                self.state.status = format!("Resuming loop {loop_id}");
+                self.state.status = t!("status.resuming_loop", id = loop_id).into_owned();
                 Some(AppUiCommand::ResumeLoop(crate::model::LoopIdParams {
                     session_id,
                     loop_id,
@@ -767,7 +776,7 @@ impl Store {
                 if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_LOOP_FIRE_NOW) {
                     return None;
                 }
-                self.state.status = format!("Firing loop {loop_id}");
+                self.state.status = t!("status.firing_loop", id = loop_id).into_owned();
                 Some(AppUiCommand::FireLoopNow(crate::model::LoopIdParams {
                     session_id,
                     loop_id,
@@ -783,9 +792,7 @@ impl Store {
         match self.active_session() {
             Some(session) => Some(session.id.clone()),
             None => {
-                self.state.status =
-                    "No coding session open. Run /onboard open-session before runtime commands."
-                        .into();
+                self.state.status = t!("status.no_session_runtime").into_owned();
                 self.state.focus = FocusPane::Composer;
                 None
             }
@@ -843,11 +850,12 @@ impl Store {
             Ok(_) => {}
             Err(None) => {
                 self.state.status =
-                    format!("Cannot {verb}: no goal cached. Run /goal to refresh first.");
+                    t!("status.cannot_verb_no_goal_cached", verb = verb).into_owned();
                 return None;
             }
             Err(Some(state)) => {
-                self.state.status = format!("Cannot {verb} goal in `{state}` state (model-owned).");
+                self.state.status =
+                    t!("status.cannot_verb_goal_state", verb = verb, state = state).into_owned();
                 return None;
             }
         }
@@ -856,8 +864,7 @@ impl Store {
         // the refresh dance — fall back to "no transition" and let the
         // user re-issue `/goal <objective>` explicitly.
         if !self.require_appui_method(crate::model::APPUI_METHOD_SESSION_GOAL_GET) {
-            self.state.status =
-                format!("Cannot {verb}: backend does not advertise session/goal/get for refresh.");
+            self.state.status = t!("status.cannot_verb_no_goal_get", verb = verb).into_owned();
             return None;
         }
         self.state.pending_goal_transition = Some(crate::model::PendingGoalTransition {
@@ -866,7 +873,7 @@ impl Store {
             status,
             action,
         });
-        self.state.status = format!("Refreshing goal before {verb}");
+        self.state.status = t!("status.refreshing_goal_before", verb = verb).into_owned();
         Some(AppUiCommand::GetSessionGoal(
             crate::model::SessionGoalGetParams {
                 session_id,
@@ -892,15 +899,14 @@ impl Store {
                 self.review_start_command(inline_args.unwrap_or_default())
             }
             CommandEntry::AppUiAction(action) => {
-                self.state.status = format!(
-                    "AppUI command `{}` is advertised but not wired yet",
-                    action.method()
-                );
+                self.state.status =
+                    t!("status.appui_not_wired", method = action.method()).into_owned();
                 None
             }
-            CommandEntry::PromptTemplate(template) => {
-                self.start_prompt_turn((*template).to_string(), "Queued prompt template")
-            }
+            CommandEntry::PromptTemplate(template) => self.start_prompt_turn(
+                (*template).to_string(),
+                t!("status.queued_prompt_template").into_owned(),
+            ),
         }
     }
 
@@ -920,9 +926,9 @@ impl Store {
                 if !had_active_turn {
                     self.push_local_activity(
                         ActivityKind::Warning,
-                        "local /stop",
-                        "No active turn to interrupt",
-                        Some("Nothing was sent to the backend."),
+                        t!("status.local_stop").into_owned(),
+                        t!("status.no_active_turn").into_owned(),
+                        Some(t!("status.nothing_sent_to_backend").into_owned()),
                     );
                 }
                 command
@@ -943,24 +949,32 @@ impl Store {
                         // to the just-selected theme; the palette itself updates
                         // on the next frame (event loop reads `state.theme`).
                         self.refresh_active_menu_if_open();
-                        self.state.status = format!("Theme: {theme}");
+                        self.state.status = t!("status.theme_set", theme = theme).into_owned();
                     }
                     None => {
-                        self.state.status = format!("Unknown theme: {theme}");
+                        self.state.status = t!("status.theme_unknown", theme = theme).into_owned();
                     }
                 }
                 None
             }
             LocalAction::SaveStatusLine(items) => {
-                self.state.status = format!("Status line layout selected: {}", items.join(", "));
+                self.state.status = t!(
+                    "status.statusline_layout_selected",
+                    items = items.join(", ")
+                )
+                .into_owned();
                 None
             }
             LocalAction::SaveTerminalTitle(items) => {
-                self.state.status = format!("Terminal title layout selected: {}", items.join(", "));
+                self.state.status = t!(
+                    "status.terminal_title_layout_selected",
+                    items = items.join(", ")
+                )
+                .into_owned();
                 None
             }
             LocalAction::SaveKeymap => {
-                self.state.status = "Keymap save is not wired yet".into();
+                self.state.status = t!("status.keymap_save_not_wired").into_owned();
                 None
             }
             LocalAction::RefreshMenu(id) => {
@@ -970,7 +984,7 @@ impl Store {
             LocalAction::EditComposer(draft) => {
                 self.state.set_composer_text(draft);
                 self.state.focus = FocusPane::Composer;
-                self.state.status = "Edit the field, then press Enter".into();
+                self.state.status = t!("status.edit_field_prompt").into_owned();
                 None
             }
             LocalAction::Onboarding(action) => self.dispatch_onboarding_action(action, inline_args),
@@ -986,7 +1000,7 @@ impl Store {
                 None
             }
             LocalAction::Custom(name) => {
-                self.state.status = format!("Local menu action `{name}` is not wired yet");
+                self.state.status = t!("status.local_action_not_wired", name = name).into_owned();
                 None
             }
         }
@@ -1171,7 +1185,7 @@ impl Store {
             "remove" | "rm" | "uninstall" => {
                 let (name, trailing) = split_first_word(rest);
                 if name.is_empty() || !trailing.trim().is_empty() {
-                    self.state.status = "Usage: /skills remove <name>".into();
+                    self.state.status = t!("status.usage_skills_remove").into_owned();
                     return None;
                 }
                 self.profile_skills_remove_command(name.to_owned())
@@ -1192,7 +1206,7 @@ impl Store {
         if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_SKILLS_LIST) {
             return None;
         }
-        self.state.status = "Refreshing profile skills".into();
+        self.state.status = t!("status.refreshing_profile_skills").into_owned();
         Some(AppUiCommand::ProfileSkillsList(ProfileSkillsListParams {
             profile_id: self.current_profile_for_onboarding(),
         }))
@@ -1202,7 +1216,7 @@ impl Store {
         if !self.require_appui_method(crate::model::APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH) {
             return None;
         }
-        self.state.status = format!("Searching skill registry for `{query}`");
+        self.state.status = t!("status.searching_skill_registry", query = query).into_owned();
         Some(AppUiCommand::ProfileSkillsRegistrySearch(
             ProfileSkillsRegistrySearchParams {
                 profile_id: self.current_profile_for_onboarding(),
@@ -1221,10 +1235,10 @@ impl Store {
             return None;
         }
         if self.state.readonly {
-            self.state.status = "Read-only mode: profile/skills/install disabled".into();
+            self.state.status = t!("status.readonly_skills_install").into_owned();
             return None;
         }
-        self.state.status = format!("Installing profile skill from `{repo}`");
+        self.state.status = t!("status.installing_profile_skill", repo = repo).into_owned();
         Some(AppUiCommand::ProfileSkillsInstall(
             ProfileSkillsInstallParams {
                 profile_id: self.current_profile_for_onboarding(),
@@ -1240,10 +1254,10 @@ impl Store {
             return None;
         }
         if self.state.readonly {
-            self.state.status = "Read-only mode: profile/skills/remove disabled".into();
+            self.state.status = t!("status.readonly_skills_remove").into_owned();
             return None;
         }
-        self.state.status = format!("Removing profile skill `{name}`");
+        self.state.status = t!("status.removing_profile_skill", name = name).into_owned();
         Some(AppUiCommand::ProfileSkillsRemove(
             ProfileSkillsRemoveParams {
                 profile_id: self.current_profile_for_onboarding(),
@@ -1256,7 +1270,7 @@ impl Store {
         if !self.require_appui_method(crate::model::APPUI_METHOD_MCP_CONFIG_LIST) {
             return None;
         }
-        self.state.status = "Refreshing MCP config".into();
+        self.state.status = t!("status.refreshing_mcp_config").into_owned();
         Some(AppUiCommand::ListMcpConfig(McpConfigListParams {
             session_id: self.active_session().map(|session| session.id.clone()),
             profile_id: self.current_profile_for_onboarding(),
@@ -1269,10 +1283,10 @@ impl Store {
             return None;
         }
         let Some(session_id) = self.active_session().map(|session| session.id.clone()) else {
-            self.state.status = "MCP status requires an open session".into();
+            self.state.status = t!("status.mcp_status_requires_session").into_owned();
             return None;
         };
-        self.state.status = "Refreshing MCP status".into();
+        self.state.status = t!("status.refreshing_mcp_status").into_owned();
         Some(AppUiCommand::ListMcpStatus(
             crate::model::McpStatusListParams {
                 session_id,
@@ -1289,14 +1303,16 @@ impl Store {
         if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_MCP_CONFIG_SET_ENABLED) {
             return None;
         }
-        let Some(server) = parse_single_name(rest, "Usage: /mcp enable <server>") else {
-            self.state.status = "Usage: /mcp enable <server>".into();
+        let usage = t!("status.usage_mcp_enable").into_owned();
+        let Some(server) = parse_single_name(rest, &usage) else {
+            self.state.status = usage;
             return None;
         };
-        self.state.status = format!(
-            "{} MCP config `{server}`",
-            if enabled { "Enabling" } else { "Disabling" }
-        );
+        self.state.status = if enabled {
+            t!("status.enabling_mcp_config", server = server).into_owned()
+        } else {
+            t!("status.disabling_mcp_config", server = server).into_owned()
+        };
         Some(AppUiCommand::SetMcpConfigEnabled(
             McpConfigSetEnabledParams {
                 profile_id: self.current_profile_for_onboarding(),
@@ -1310,11 +1326,12 @@ impl Store {
         if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_MCP_CONFIG_TEST) {
             return None;
         }
-        let Some(server) = parse_single_name(rest, "Usage: /mcp test <server>") else {
-            self.state.status = "Usage: /mcp test <server>".into();
+        let usage = t!("status.usage_mcp_test").into_owned();
+        let Some(server) = parse_single_name(rest, &usage) else {
+            self.state.status = usage;
             return None;
         };
-        self.state.status = format!("Testing MCP config `{server}`");
+        self.state.status = t!("status.testing_mcp_config", server = server).into_owned();
         Some(AppUiCommand::TestMcpConfig(McpConfigTestParams {
             session_id: self.active_session().map(|session| session.id.clone()),
             profile_id: self.current_profile_for_onboarding(),
@@ -1326,11 +1343,12 @@ impl Store {
         if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_MCP_CONFIG_DELETE) {
             return None;
         }
-        let Some(server) = parse_single_name(rest, "Usage: /mcp delete <server>") else {
-            self.state.status = "Usage: /mcp delete <server>".into();
+        let usage = t!("status.usage_mcp_delete").into_owned();
+        let Some(server) = parse_single_name(rest, &usage) else {
+            self.state.status = usage;
             return None;
         };
-        self.state.status = format!("Deleting MCP config `{server}`");
+        self.state.status = t!("status.deleting_mcp_config", server = server).into_owned();
         Some(AppUiCommand::DeleteMcpConfig(McpConfigDeleteParams {
             profile_id: self.current_profile_for_onboarding(),
             server,
@@ -1345,7 +1363,7 @@ impl Store {
             self.state.status = mcp_usage();
             return None;
         };
-        self.state.status = format!("Upserting MCP config `{server}`");
+        self.state.status = t!("status.upserting_mcp_config", server = server).into_owned();
         Some(AppUiCommand::UpsertMcpConfig(McpConfigUpsertParams {
             profile_id: self.current_profile_for_onboarding(),
             server,
@@ -1358,7 +1376,7 @@ impl Store {
         if !self.require_appui_method(crate::model::APPUI_METHOD_TOOL_CONFIG_LIST) {
             return None;
         }
-        self.state.status = "Refreshing tool config".into();
+        self.state.status = t!("status.refreshing_tool_config").into_owned();
         Some(AppUiCommand::ListToolConfig(ToolConfigListParams {
             session_id: self.active_session().map(|session| session.id.clone()),
             profile_id: self.current_profile_for_onboarding(),
@@ -1371,10 +1389,10 @@ impl Store {
             return None;
         }
         let Some(session_id) = self.active_session().map(|session| session.id.clone()) else {
-            self.state.status = "Tool status requires an open session".into();
+            self.state.status = t!("status.tool_status_requires_session").into_owned();
             return None;
         };
-        self.state.status = "Refreshing tool status".into();
+        self.state.status = t!("status.refreshing_tool_status").into_owned();
         Some(AppUiCommand::ListToolStatus(
             crate::model::ToolStatusListParams {
                 session_id,
@@ -1391,14 +1409,16 @@ impl Store {
         if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_TOOL_CONFIG_SET_ENABLED) {
             return None;
         }
-        let Some(tool) = parse_single_name(rest, "Usage: /tools enable <tool>") else {
-            self.state.status = "Usage: /tools enable <tool>".into();
+        let usage = t!("status.usage_tools_enable").into_owned();
+        let Some(tool) = parse_single_name(rest, &usage) else {
+            self.state.status = usage;
             return None;
         };
-        self.state.status = format!(
-            "{} tool config `{tool}`",
-            if enabled { "Enabling" } else { "Disabling" }
-        );
+        self.state.status = if enabled {
+            t!("status.enabling_tool_config", tool = tool).into_owned()
+        } else {
+            t!("status.disabling_tool_config", tool = tool).into_owned()
+        };
         Some(AppUiCommand::SetToolConfigEnabled(
             ToolConfigSetEnabledParams {
                 profile_id: self.current_profile_for_onboarding(),
@@ -1412,11 +1432,12 @@ impl Store {
         if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_TOOL_CONFIG_TEST) {
             return None;
         }
-        let Some(tool) = parse_single_name(rest, "Usage: /tools test <tool>") else {
-            self.state.status = "Usage: /tools test <tool>".into();
+        let usage = t!("status.usage_tools_test").into_owned();
+        let Some(tool) = parse_single_name(rest, &usage) else {
+            self.state.status = usage;
             return None;
         };
-        self.state.status = format!("Testing tool config `{tool}`");
+        self.state.status = t!("status.testing_tool_config", tool = tool).into_owned();
         Some(AppUiCommand::TestToolConfig(ToolConfigTestParams {
             session_id: self.active_session().map(|session| session.id.clone()),
             profile_id: self.current_profile_for_onboarding(),
@@ -1428,11 +1449,12 @@ impl Store {
         if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_TOOL_CONFIG_DELETE) {
             return None;
         }
-        let Some(tool) = parse_single_name(rest, "Usage: /tools delete <tool>") else {
-            self.state.status = "Usage: /tools delete <tool>".into();
+        let usage = t!("status.usage_tools_delete").into_owned();
+        let Some(tool) = parse_single_name(rest, &usage) else {
+            self.state.status = usage;
             return None;
         };
-        self.state.status = format!("Deleting tool config `{tool}`");
+        self.state.status = t!("status.deleting_tool_config", tool = tool).into_owned();
         Some(AppUiCommand::DeleteToolConfig(ToolConfigDeleteParams {
             profile_id: self.current_profile_for_onboarding(),
             tool,
@@ -1447,7 +1469,7 @@ impl Store {
             self.state.status = tools_usage();
             return None;
         };
-        self.state.status = format!("Upserting tool config `{tool}`");
+        self.state.status = t!("status.upserting_tool_config", tool = tool).into_owned();
         Some(AppUiCommand::UpsertToolConfig(ToolConfigUpsertParams {
             profile_id: self.current_profile_for_onboarding(),
             tool,
@@ -1492,8 +1514,8 @@ impl Store {
                 self.state.onboarding.name = name.trim().to_owned();
                 self.state.onboarding.local_profile_created = false;
                 self.state.onboarding.clear_local_profile_recovery();
-                self.state.onboarding.last_message = Some("Name updated".into());
-                self.state.status = "Onboarding name updated".into();
+                self.state.onboarding.last_message = Some(t!("status.name_updated").into_owned());
+                self.state.status = t!("status.onboarding_name_updated").into_owned();
                 self.refresh_active_menu_and_advance();
                 None
             }
@@ -1502,8 +1524,9 @@ impl Store {
                 self.state.onboarding.local_profile_created = false;
                 self.state.onboarding.profile_id = None;
                 self.state.onboarding.clear_local_profile_recovery();
-                self.state.onboarding.last_message = Some("Username updated".into());
-                self.state.status = "Onboarding username updated".into();
+                self.state.onboarding.last_message =
+                    Some(t!("status.username_updated").into_owned());
+                self.state.status = t!("status.onboarding_username_updated").into_owned();
                 self.refresh_active_menu_and_advance();
                 None
             }
@@ -1513,22 +1536,24 @@ impl Store {
                 self.state.onboarding.auth_code_sent = false;
                 self.state.onboarding.auth_verified = false;
                 self.state.onboarding.clear_local_profile_recovery();
-                self.state.onboarding.last_message = Some("Email updated".into());
-                self.state.status = "Onboarding email updated".into();
+                self.state.onboarding.last_message = Some(t!("status.email_updated").into_owned());
+                self.state.status = t!("status.onboarding_email_updated").into_owned();
                 self.refresh_active_menu_and_advance();
                 None
             }
             OnboardingAction::SetOtpCode(code) => {
                 self.state.onboarding.otp_code = code.trim().to_owned();
-                self.state.onboarding.last_message = Some("OTP code updated".into());
-                self.state.status = "Onboarding OTP code updated".into();
+                self.state.onboarding.last_message =
+                    Some(t!("status.otp_code_updated").into_owned());
+                self.state.status = t!("status.onboarding_otp_code_updated").into_owned();
                 self.refresh_active_menu_and_advance();
                 None
             }
             OnboardingAction::SetProfileId(profile_id) => {
                 self.state.onboarding.profile_id = non_empty_string(profile_id);
-                self.state.onboarding.last_message = Some("Profile updated".into());
-                self.state.status = "Onboarding profile updated".into();
+                self.state.onboarding.last_message =
+                    Some(t!("status.profile_updated").into_owned());
+                self.state.status = t!("status.onboarding_profile_updated").into_owned();
                 self.refresh_active_menu_and_advance();
                 None
             }
@@ -1537,7 +1562,7 @@ impl Store {
                     return None;
                 }
                 self.state.onboarding.apply_selection(selection);
-                self.state.status = "Provider route selected; enter API key".into();
+                self.state.status = t!("status.provider_route_selected").into_owned();
                 if self.active_menu_id_is(crate::menu::registry::MENU_ONBOARD_ROUTE) {
                     self.close_all_menus();
                     self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
@@ -1560,7 +1585,9 @@ impl Store {
                     api_type: Some("openai".into()),
                     ..LlmRouteConfig::default()
                 };
-                self.mark_onboarding_provider_dirty("Provider family updated");
+                self.mark_onboarding_provider_dirty(
+                    t!("status.provider_family_updated").into_owned(),
+                );
                 if from_family_menu {
                     self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL));
                 }
@@ -1577,7 +1604,9 @@ impl Store {
                     api_type: Some("openai".into()),
                     ..LlmRouteConfig::default()
                 };
-                self.mark_onboarding_provider_dirty("Provider model updated");
+                self.mark_onboarding_provider_dirty(
+                    t!("status.provider_model_updated").into_owned(),
+                );
                 if from_model_menu {
                     self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_ROUTE));
                 }
@@ -1588,35 +1617,45 @@ impl Store {
                     return None;
                 }
                 self.state.onboarding.provider.route.route_id = value.trim().to_owned();
-                self.mark_onboarding_provider_dirty("Provider route updated")
+                self.mark_onboarding_provider_dirty(
+                    t!("status.provider_route_updated").into_owned(),
+                )
             }
             OnboardingAction::SetRouteLabel(value) => {
                 if self.block_onboarding_provider_edit_if_pending() {
                     return None;
                 }
                 self.state.onboarding.provider.route.label = non_empty_string(value);
-                self.mark_onboarding_provider_dirty("Provider route label updated")
+                self.mark_onboarding_provider_dirty(
+                    t!("status.provider_route_label_updated").into_owned(),
+                )
             }
             OnboardingAction::SetBaseUrl(value) => {
                 if self.block_onboarding_provider_edit_if_pending() {
                     return None;
                 }
                 self.state.onboarding.provider.route.base_url = non_empty_string(value);
-                self.mark_onboarding_provider_dirty("Provider base URL updated")
+                self.mark_onboarding_provider_dirty(
+                    t!("status.provider_base_url_updated").into_owned(),
+                )
             }
             OnboardingAction::SetApiKeyEnv(value) => {
                 if self.block_onboarding_provider_edit_if_pending() {
                     return None;
                 }
                 self.state.onboarding.provider.route.api_key_env = non_empty_string(value);
-                self.mark_onboarding_provider_dirty("Provider API key env updated")
+                self.mark_onboarding_provider_dirty(
+                    t!("status.provider_api_key_env_updated").into_owned(),
+                )
             }
             OnboardingAction::SetApiType(value) => {
                 if self.block_onboarding_provider_edit_if_pending() {
                     return None;
                 }
                 self.state.onboarding.provider.route.api_type = non_empty_string(value);
-                self.mark_onboarding_provider_dirty("Provider API type updated")
+                self.mark_onboarding_provider_dirty(
+                    t!("status.provider_api_type_updated").into_owned(),
+                )
             }
             OnboardingAction::SetApiKey(value) => {
                 if self.block_onboarding_provider_edit_if_pending() {
@@ -1629,8 +1668,9 @@ impl Store {
                 // M22-E: a new key invalidates the prior test
                 // failure — the user is implicitly retrying.
                 self.state.onboarding.provider_test_failure_reason = None;
-                self.state.onboarding.last_message = Some("API key updated".into());
-                self.state.status = "Onboarding API key updated".into();
+                self.state.onboarding.last_message =
+                    Some(t!("status.api_key_updated").into_owned());
+                self.state.status = t!("status.onboarding_api_key_updated").into_owned();
                 self.refresh_active_menu_and_advance();
                 None
             }
@@ -1643,8 +1683,9 @@ impl Store {
                 self.state.onboarding.provider_pending = None;
                 self.state.onboarding.provider_save_target = None;
                 self.state.onboarding.provider_test_failure_reason = None;
-                self.state.onboarding.last_message = Some("API key cleared".into());
-                self.state.status = "Onboarding API key cleared".into();
+                self.state.onboarding.last_message =
+                    Some(t!("status.api_key_cleared").into_owned());
+                self.state.status = t!("status.onboarding_api_key_cleared").into_owned();
                 self.refresh_active_menu_and_advance();
                 None
             }
@@ -1665,11 +1706,10 @@ impl Store {
                 let path = path.trim().to_owned();
                 if path.is_empty() {
                     self.state.onboarding.workspace_candidate = None;
-                    self.state.status = "Workspace candidate cleared".into();
+                    self.state.status = t!("status.workspace_candidate_cleared").into_owned();
                 } else {
                     self.state.onboarding.workspace_candidate = Some(path);
-                    self.state.status =
-                        "Workspace candidate staged; use /onboard workspace-validate".into();
+                    self.state.status = t!("status.workspace_candidate_staged").into_owned();
                 }
                 self.state.onboarding.workspace_validation =
                     crate::model::OnboardingWorkspaceValidation::Unvalidated;
@@ -1684,7 +1724,7 @@ impl Store {
                 self.state.onboarding.workspace_candidate = None;
                 self.state.onboarding.workspace_validation =
                     crate::model::OnboardingWorkspaceValidation::Unvalidated;
-                self.state.status = "Workspace selection reset".into();
+                self.state.status = t!("status.workspace_selection_reset").into_owned();
                 self.refresh_active_menu_if_open();
                 None
             }
@@ -1693,20 +1733,27 @@ impl Store {
                 self.state.onboarding.permission_profile_mismatch = None;
                 self.state.status = match update {
                     Some(update) => {
-                        let mode = update.mode.map(|m| m.label()).unwrap_or("(unchanged mode)");
-                        let approval = update
-                            .approval_policy
-                            .as_deref()
-                            .unwrap_or("(unchanged approval)");
+                        let unchanged_mode = t!("status.unchanged_mode").into_owned();
+                        let unchanged_approval = t!("status.unchanged_approval").into_owned();
+                        let unchanged_network = t!("status.unchanged_network").into_owned();
+                        let mode = update
+                            .mode
+                            .map(|m| m.label().to_string())
+                            .unwrap_or(unchanged_mode);
+                        let approval = update.approval_policy.clone().unwrap_or(unchanged_approval);
                         let network = update
                             .network
-                            .map(|n| n.label())
-                            .unwrap_or("(unchanged network)");
-                        format!(
-                            "Permission profile staged: {mode} · {approval} · {network} (server confirms on session open)"
+                            .map(|n| n.label().to_string())
+                            .unwrap_or(unchanged_network);
+                        t!(
+                            "status.permission_profile_staged",
+                            mode = mode,
+                            approval = approval,
+                            network = network
                         )
+                        .into_owned()
                     }
-                    None => "Permission profile staging cleared".into(),
+                    None => t!("status.permission_profile_staging_cleared").into_owned(),
                 };
                 self.refresh_active_menu_if_open();
                 None
@@ -1718,7 +1765,7 @@ impl Store {
             OnboardingAction::Finish => self.onboarding_finish_command(),
             OnboardingAction::Reset => {
                 self.state.onboarding = Default::default();
-                self.state.status = "Onboarding wizard reset".into();
+                self.state.status = t!("status.onboarding_wizard_reset").into_owned();
                 self.refresh_active_menu_if_open();
                 None
             }
@@ -1815,7 +1862,7 @@ impl Store {
                 self.push_local_activity(
                     ActivityKind::Warning,
                     "onboarding",
-                    "Unknown onboarding command",
+                    t!("status.unknown_onboarding_command").into_owned(),
                     Some(onboarding_usage()),
                 );
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
@@ -1868,7 +1915,7 @@ impl Store {
                 self.push_local_activity(
                     ActivityKind::Warning,
                     "login",
-                    "Unknown login command",
+                    t!("status.unknown_login_command").into_owned(),
                     Some(login_usage()),
                 );
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_LOGIN));
@@ -1926,7 +1973,7 @@ impl Store {
                 self.push_local_activity(
                     ActivityKind::Warning,
                     "provider",
-                    "Unknown provider command",
+                    t!("status.unknown_provider_command").into_owned(),
                     Some(provider_usage()),
                 );
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_PROVIDER));
@@ -1938,9 +1985,7 @@ impl Store {
     fn onboarding_select_inline(&mut self, args: &str) -> Option<AppUiCommand> {
         let parts = args.split_whitespace().collect::<Vec<_>>();
         if parts.len() < 3 {
-            self.state.status =
-                "Usage: /onboard select <family_id> <model_id> <route_id> [base_url] [api_key_env]"
-                    .into();
+            self.state.status = t!("status.usage_onboard_select").into_owned();
             return None;
         }
         let selection = LlmSelectionConfig {
@@ -1958,15 +2003,19 @@ impl Store {
         self.dispatch_onboarding_action(OnboardingAction::SetProviderSelection(selection), None)
     }
 
-    fn mark_onboarding_provider_dirty(&mut self, message: &'static str) -> Option<AppUiCommand> {
+    fn mark_onboarding_provider_dirty(
+        &mut self,
+        message: impl Into<String>,
+    ) -> Option<AppUiCommand> {
         self.state.onboarding.provider_tested = false;
         self.state.onboarding.provider_pending = None;
         self.state.onboarding.provider_save_target = None;
         // M22-E: any staged-input edit invalidates the last test
         // failure — the reason was tied to the old selection/key.
         self.state.onboarding.provider_test_failure_reason = None;
-        self.state.onboarding.last_message = Some(message.into());
-        self.state.status = message.into();
+        let message = message.into();
+        self.state.onboarding.last_message = Some(message.clone());
+        self.state.status = message;
         self.refresh_active_menu_if_open();
         None
     }
@@ -1982,18 +2031,17 @@ impl Store {
 
     fn onboarding_send_code_command(&mut self) -> Option<AppUiCommand> {
         if self.local_profile_create_supported() {
-            self.state.status =
-                "Local solo onboarding uses profile/local/create; OTP send is hidden".into();
+            self.state.status = t!("status.local_onboarding_otp_send_hidden").into_owned();
             return None;
         }
         if !self.require_appui_method(crate::model::APPUI_METHOD_AUTH_SEND_CODE) {
             return None;
         }
         if !self.state.onboarding.has_email() {
-            self.state.status = "Onboarding email is empty; use /onboard email <address>".into();
+            self.state.status = t!("status.onboarding_email_empty").into_owned();
             return None;
         }
-        self.state.onboarding.last_message = Some("Sending OTP code".into());
+        self.state.onboarding.last_message = Some(t!("status.sending_otp_code").into_owned());
         Some(AppUiCommand::AuthSendCode(AuthSendCodeParams {
             email: self.state.onboarding.email.clone(),
         }))
@@ -2001,19 +2049,17 @@ impl Store {
 
     fn onboarding_verify_code_command(&mut self) -> Option<AppUiCommand> {
         if self.local_profile_create_supported() {
-            self.state.status =
-                "Local solo onboarding uses profile/local/create; OTP verify is hidden".into();
+            self.state.status = t!("status.local_onboarding_otp_verify_hidden").into_owned();
             return None;
         }
         if !self.require_appui_method(crate::model::APPUI_METHOD_AUTH_VERIFY) {
             return None;
         }
         if !self.state.onboarding.has_email() || !self.state.onboarding.has_otp_code() {
-            self.state.status =
-                "Onboarding email or OTP is empty; use /onboard email and /onboard code".into();
+            self.state.status = t!("status.onboarding_email_or_otp_empty").into_owned();
             return None;
         }
-        self.state.onboarding.last_message = Some("Verifying OTP code".into());
+        self.state.onboarding.last_message = Some(t!("status.verifying_otp_code").into_owned());
         Some(AppUiCommand::AuthVerify(AuthVerifyParams {
             email: self.state.onboarding.email.clone(),
             code: self.state.onboarding.otp_code.clone(),
@@ -2034,8 +2080,7 @@ impl Store {
         // attributed to the new snapshot, blaming the wrong
         // username, and the backend would receive a duplicate.
         if self.state.onboarding.local_profile_create_pending {
-            self.state.status =
-                "Local profile creation already in progress; wait for the server response".into();
+            self.state.status = t!("status.local_profile_create_in_progress").into_owned();
             return None;
         }
         // M22-B: client-side pre-flight validation catches obvious
@@ -2058,7 +2103,7 @@ impl Store {
         self.state.onboarding.local_profile_create_pending_username =
             Some(self.state.onboarding.username.clone());
         self.state.onboarding.local_profile_recovery = None;
-        self.state.onboarding.last_message = Some("Creating local solo profile".into());
+        self.state.onboarding.last_message = Some(t!("status.creating_local_profile").into_owned());
         Some(AppUiCommand::ProfileLocalCreate(ProfileLocalCreateParams {
             name: self.state.onboarding.name.clone(),
             username: self.state.onboarding.username.clone(),
@@ -2098,7 +2143,7 @@ impl Store {
             .onboarding
             .build_fetch_models_params(self.current_profile_for_onboarding().as_deref())
         else {
-            self.state.status = "Onboarding provider route is incomplete".into();
+            self.state.status = t!("status.onboarding_provider_route_incomplete").into_owned();
             return None;
         };
         Some(AppUiCommand::ProfileLlmFetchModels(params))
@@ -2119,17 +2164,17 @@ impl Store {
             .onboarding
             .build_upsert_params(current_profile.as_deref())
         else {
-            self.state.status = "Onboarding provider selection is incomplete".into();
+            self.state.status = t!("status.onboarding_provider_selection_incomplete").into_owned();
             return None;
         };
         if !self.state.onboarding.has_api_key() {
-            self.state.status = "Onboarding API key is empty; use /onboard key <secret>".into();
+            self.state.status = t!("status.onboarding_api_key_empty_onboard").into_owned();
             return None;
         }
-        self.state.onboarding.last_message = Some("Saving provider".into());
+        self.state.onboarding.last_message = Some(t!("status.saving_provider").into_owned());
         self.state.onboarding.provider_pending = Some(OnboardingProviderPending::Save);
         self.state.onboarding.provider_save_target = Some(OnboardingProviderSaveTarget::Primary);
-        self.state.status = "Saving provider configuration".into();
+        self.state.status = t!("status.saving_provider_config").into_owned();
         self.refresh_active_menu_if_open();
         Some(AppUiCommand::ProfileLlmUpsert(params))
     }
@@ -2149,17 +2194,18 @@ impl Store {
             .onboarding
             .build_fallback_upsert_params(current_profile.as_deref())
         else {
-            self.state.status = "Onboarding fallback provider selection is incomplete".into();
+            self.state.status = t!("status.onboarding_fallback_selection_incomplete").into_owned();
             return None;
         };
         if !self.state.onboarding.has_api_key() {
-            self.state.status = "Onboarding API key is empty; use /provider key <secret>".into();
+            self.state.status = t!("status.onboarding_api_key_empty_provider").into_owned();
             return None;
         }
-        self.state.onboarding.last_message = Some("Saving fallback provider".into());
+        self.state.onboarding.last_message =
+            Some(t!("status.saving_fallback_provider").into_owned());
         self.state.onboarding.provider_pending = Some(OnboardingProviderPending::Save);
         self.state.onboarding.provider_save_target = Some(OnboardingProviderSaveTarget::Fallback);
-        self.state.status = "Saving fallback provider configuration".into();
+        self.state.status = t!("status.saving_fallback_provider_config").into_owned();
         self.refresh_active_menu_if_open();
         Some(AppUiCommand::ProfileLlmUpsert(params))
     }
@@ -2179,16 +2225,16 @@ impl Store {
             .onboarding
             .build_test_params(current_profile.as_deref())
         else {
-            self.state.status = "Onboarding provider selection is incomplete".into();
+            self.state.status = t!("status.onboarding_provider_selection_incomplete").into_owned();
             return None;
         };
         if !self.state.onboarding.has_api_key() {
-            self.state.status = "Onboarding API key is empty; use /onboard key <secret>".into();
+            self.state.status = t!("status.onboarding_api_key_empty_onboard").into_owned();
             return None;
         }
-        self.state.onboarding.last_message = Some("Testing provider".into());
+        self.state.onboarding.last_message = Some(t!("status.testing_provider").into_owned());
         self.state.onboarding.provider_pending = Some(OnboardingProviderPending::Test);
-        self.state.status = "Testing provider connection".into();
+        self.state.status = t!("status.testing_provider_connection").into_owned();
         self.refresh_active_menu_if_open();
         Some(AppUiCommand::ProfileLlmTest(params))
     }
@@ -2211,9 +2257,7 @@ impl Store {
             if self.local_profile_create_supported() {
                 return self.onboarding_create_local_profile_command(true);
             }
-            self.state.status =
-                "Cannot open session: profile unresolved. Use /onboard profile <profile_id>."
-                    .into();
+            self.state.status = t!("status.cannot_open_profile_unresolved").into_owned();
             return None;
         };
         if let Some(reason) = self.open_session_provider_block_reason(&profile_id) {
@@ -2232,14 +2276,12 @@ impl Store {
         if !self.state.onboarding.workspace_ready_for_finish() {
             let reason = match &self.state.onboarding.workspace_validation {
                 crate::model::OnboardingWorkspaceValidation::Invalid { reason } => {
-                    format!("Cannot open session: workspace invalid — {reason}.")
+                    t!("status.cannot_open_workspace_invalid", reason = reason).into_owned()
                 }
                 crate::model::OnboardingWorkspaceValidation::Validating => {
-                    "Workspace validation in progress; try /onboard finish again in a moment."
-                        .to_owned()
+                    t!("status.workspace_validation_in_progress").into_owned()
                 }
-                _ => "Cannot open session: workspace not validated. Use /onboard workspace <path> then /onboard workspace-validate."
-                    .to_owned(),
+                _ => t!("status.cannot_open_workspace_not_validated").into_owned(),
             };
             self.state.status = reason;
             self.refresh_active_menu_if_open();
@@ -2258,7 +2300,7 @@ impl Store {
         }
         let session_id =
             octos_core::SessionKey::with_profile_topic(&profile_id, "local", "tui", "coding");
-        self.state.status = format!("Opening coding session for profile {profile_id}");
+        self.state.status = t!("status.opening_coding_session", profile = profile_id).into_owned();
         Some(AppUiCommand::OpenSession(SessionOpenParams {
             session_id,
             topic: None,
@@ -2268,7 +2310,7 @@ impl Store {
         }))
     }
 
-    /// M22-C: true when the AppUI target is a non-local network
+    /// M22-C: true when the Octos UI target is a non-local network
     /// transport (e.g. `wss://remote.example/...`). Local stdio
     /// and `ws://localhost` are treated as same-host, so the
     /// filesystem probe is meaningful.
@@ -2317,13 +2359,9 @@ impl Store {
         {
             self.state.onboarding.workspace_validation =
                 crate::model::OnboardingWorkspaceValidation::Invalid {
-                    reason: format!(
-                        "could not resolve a project folder from `{raw_target}`. Stage one with `/onboard workspace <path>` (e.g. `/onboard workspace .` for the current folder), or relaunch with `--cwd <dir>`."
-                    ),
+                    reason: t!("status.no_usable_workspace_cwd", target = raw_target).into_owned(),
                 };
-            self.state.status =
-                "Set a project folder: /onboard workspace <path> (try `.` for the current folder)"
-                    .into();
+            self.state.status = t!("status.workspace_cwd_invalid").into_owned();
             self.refresh_active_menu_if_open();
             return;
         }
@@ -2340,9 +2378,7 @@ impl Store {
                     writable: true,
                     has_workspace_toml: false,
                 };
-            self.state.status = format!(
-                "Workspace staged at {target} — remote transport, server will validate on session/open"
-            );
+            self.state.status = t!("status.workspace_staged_remote", target = target).into_owned();
             self.refresh_active_menu_if_open();
             return;
         }
@@ -2352,9 +2388,11 @@ impl Store {
             Err(err) => {
                 self.state.onboarding.workspace_validation =
                     crate::model::OnboardingWorkspaceValidation::Invalid {
-                        reason: format!("path '{target}' is not accessible: {err}"),
+                        reason: t!("status.path_not_accessible", target = target, err = err)
+                            .into_owned(),
                     };
-                self.state.status = format!("Workspace '{target}' is not accessible");
+                self.state.status =
+                    t!("status.workspace_not_accessible", target = target).into_owned();
                 self.refresh_active_menu_if_open();
                 return;
             }
@@ -2362,9 +2400,9 @@ impl Store {
         if !metadata.is_dir() {
             self.state.onboarding.workspace_validation =
                 crate::model::OnboardingWorkspaceValidation::Invalid {
-                    reason: format!("path '{target}' is not a directory"),
+                    reason: t!("status.path_not_directory", target = target).into_owned(),
                 };
-            self.state.status = format!("Workspace '{target}' is not a directory");
+            self.state.status = t!("status.workspace_not_directory", target = target).into_owned();
             self.refresh_active_menu_if_open();
             return;
         }
@@ -2378,9 +2416,9 @@ impl Store {
         if canonical == "/" || canonical.is_empty() {
             self.state.onboarding.workspace_validation =
                 crate::model::OnboardingWorkspaceValidation::Invalid {
-                    reason: "workspace cannot be the filesystem root".into(),
+                    reason: t!("status.workspace_cannot_be_root").into_owned(),
                 };
-            self.state.status = "Workspace cannot be /; stage a project directory".into();
+            self.state.status = t!("status.workspace_cannot_be_root_status").into_owned();
             self.refresh_active_menu_if_open();
             return;
         }
@@ -2392,13 +2430,23 @@ impl Store {
                 writable,
                 has_workspace_toml,
             };
-        let writable_label = if writable { "writable" } else { "read-only" };
-        let toml_label = if has_workspace_toml {
-            " (has .octos-workspace.toml)"
+        let writable_label = if writable {
+            t!("status.workspace_writable").into_owned()
         } else {
-            ""
+            t!("status.workspace_read_only").into_owned()
         };
-        self.state.status = format!("Workspace OK at {canonical} — {writable_label}{toml_label}");
+        let toml_label = if has_workspace_toml {
+            t!("status.workspace_has_toml").into_owned()
+        } else {
+            String::new()
+        };
+        self.state.status = t!(
+            "status.workspace_ok",
+            canonical = canonical,
+            writable = writable_label,
+            toml = toml_label
+        )
+        .into_owned();
         self.refresh_active_menu_if_open();
     }
 
@@ -2439,7 +2487,7 @@ impl Store {
         if self.profile_has_saved_primary_provider(profile_id) {
             return None;
         }
-        Some("Cannot open session: save a primary LLM provider first.".into())
+        Some(t!("status.cannot_open_save_primary_first").into_owned())
     }
 
     fn profile_has_saved_primary_provider(&self, profile_id: &str) -> bool {
@@ -2512,7 +2560,7 @@ impl Store {
         {
             return true;
         }
-        self.state.status = format!("AppUI method `{method}` is not advertised");
+        self.state.status = t!("status.appui_method_not_advertised", method = method).into_owned();
         false
     }
 
@@ -2525,13 +2573,14 @@ impl Store {
         {
             return true;
         }
-        self.state.status = format!("AppUI feature `{feature}` is not advertised");
+        self.state.status =
+            t!("status.appui_feature_not_advertised", feature = feature).into_owned();
         false
     }
 
     fn require_mutating_appui_method(&mut self, method: &'static str) -> bool {
         if self.state.readonly {
-            self.state.status = format!("Read-only mode: {method} disabled");
+            self.state.status = t!("status.readonly_method_disabled", method = method).into_owned();
             return false;
         }
         self.require_appui_method(method)
@@ -2549,7 +2598,7 @@ impl Store {
         if self.state.menu_stack.close().is_some() {
             self.refresh_active_menu();
             if let Some(frame) = self.state.menu_stack.active() {
-                self.state.status = format!("Menu: {}", frame.id);
+                self.state.status = t!("status.menu_label", id = frame.id.to_string()).into_owned();
             }
             return true;
         }
@@ -2682,16 +2731,16 @@ impl Store {
                 .or_else(|| onboarding.profile_id.clone())
                 .unwrap_or_else(|| onboarding.username.clone());
             OnboardingDoctorOutcome::Pass {
-                detail: format!("profile id: {label}"),
+                detail: t!("status.doctor_profile_id", label = label).into_owned(),
             }
         } else if local_create_supported {
             OnboardingDoctorOutcome::Fail {
-                reason: "no local profile yet".into(),
-                recovery: "Use /onboard name / username / email, then /onboard finish.".into(),
+                reason: t!("status.doctor_no_local_profile").into_owned(),
+                recovery: t!("status.doctor_no_local_profile_recovery").into_owned(),
             }
         } else {
             OnboardingDoctorOutcome::Skipped {
-                detail: "profile/local/create not advertised by server".into(),
+                detail: t!("status.doctor_local_create_unadvertised").into_owned(),
             }
         };
 
@@ -2709,63 +2758,64 @@ impl Store {
             .filter(|provider| provider.has_api_key);
         let provider_check = if let Some(provider) = published_primary {
             OnboardingDoctorOutcome::Pass {
-                detail: format!(
-                    "server published primary provider: {} / {}",
-                    provider
+                detail: t!(
+                    "status.doctor_server_primary",
+                    family = provider
                         .family_id
                         .clone()
                         .unwrap_or_else(|| provider.provider.clone()),
-                    provider
+                    model = provider
                         .model_id
                         .clone()
                         .unwrap_or_else(|| provider.model.clone())
-                ),
+                )
+                .into_owned(),
             }
         } else if onboarding.provider_saved {
             OnboardingDoctorOutcome::Pass {
-                detail: format!(
-                    "saved primary provider: {}",
-                    onboarding
+                detail: t!(
+                    "status.doctor_saved_primary",
+                    label = onboarding
                         .saved_primary_provider_label
                         .clone()
                         .unwrap_or_else(|| onboarding.provider_label())
-                ),
+                )
+                .into_owned(),
             }
         } else if onboarding.selection_ready() && onboarding.has_api_key() {
             OnboardingDoctorOutcome::Warn {
-                reason: "provider selected with API key but not saved as primary".into(),
-                recovery: "Use /onboard save to persist; /onboard test to verify first.".into(),
+                reason: t!("status.doctor_provider_unsaved").into_owned(),
+                recovery: t!("status.doctor_provider_unsaved_recovery").into_owned(),
             }
         } else if onboarding.selection_ready() {
             OnboardingDoctorOutcome::Warn {
-                reason: "provider selected but API key missing".into(),
-                recovery: "Use /onboard key <secret>.".into(),
+                reason: t!("status.doctor_provider_no_key").into_owned(),
+                recovery: t!("status.doctor_provider_no_key_recovery").into_owned(),
             }
         } else {
             OnboardingDoctorOutcome::Fail {
-                reason: "no provider selected".into(),
-                recovery: "Use /onboard family / model / route, /onboard key, /onboard save."
-                    .into(),
+                reason: t!("status.doctor_no_provider").into_owned(),
+                recovery: t!("status.doctor_no_provider_recovery").into_owned(),
             }
         };
 
         // Workspace check.
         let workspace_check = if onboarding_workspace_cwd(&self.state.workspace.root).is_some() {
             OnboardingDoctorOutcome::Pass {
-                detail: format!(
-                    "workspace cwd resolvable from `{}`",
-                    self.state.workspace.root
-                ),
+                detail: t!(
+                    "status.doctor_workspace_resolvable",
+                    root = self.state.workspace.root
+                )
+                .into_owned(),
             }
         } else {
             OnboardingDoctorOutcome::Fail {
-                reason: format!(
-                    "workspace cwd is `{}` (not a usable path)",
-                    self.state.workspace.root
-                ),
-                recovery:
-                    "Restart Octos with `--cwd <path>` or set workspace.root via the transport launch."
-                        .into(),
+                reason: t!(
+                    "status.doctor_workspace_unusable",
+                    root = self.state.workspace.root
+                )
+                .into_owned(),
+                recovery: t!("status.doctor_workspace_unusable_recovery").into_owned(),
             }
         };
 
@@ -2786,23 +2836,28 @@ impl Store {
                 .filter(|method| caps.supports_method(method))
                 .count();
             OnboardingDoctorOutcome::Pass {
-                detail: format!("{advertised}/{} onboarding methods advertised", known.len()),
+                detail: t!(
+                    "status.doctor_methods_advertised",
+                    advertised = advertised,
+                    total = known.len()
+                )
+                .into_owned(),
             }
         } else {
             OnboardingDoctorOutcome::Fail {
-                reason: "AppUI capabilities not yet received".into(),
-                recovery: "Wait for `config/capabilities/list` or reconnect the transport.".into(),
+                reason: t!("status.doctor_caps_not_received").into_owned(),
+                recovery: t!("status.doctor_caps_not_received_recovery").into_owned(),
             }
         };
 
         // Transport check.
         let transport_check = match self.state.target.as_deref() {
             Some(target) if !target.is_empty() => OnboardingDoctorOutcome::Pass {
-                detail: format!("AppUI target: {target}"),
+                detail: t!("status.doctor_appui_target", target = target).into_owned(),
             },
             _ => OnboardingDoctorOutcome::Fail {
-                reason: "no AppUI transport configured".into(),
-                recovery: "Start the TUI with `octos tui --target <stdio:...|ws://...>`.".into(),
+                reason: t!("status.doctor_no_transport").into_owned(),
+                recovery: t!("status.doctor_no_transport_recovery").into_owned(),
             },
         };
 
@@ -2810,7 +2865,7 @@ impl Store {
             checks: vec![
                 OnboardingDoctorCheck {
                     id: "transport",
-                    title: "AppUI transport",
+                    title: "Octos UI transport",
                     outcome: transport_check,
                 },
                 OnboardingDoctorCheck {
@@ -2845,7 +2900,8 @@ impl Store {
             .map(|check| format!("{}: {}", check.id, check.outcome.label()))
             .collect::<Vec<_>>()
             .join(" · ");
-        self.state.status = format!("Onboarding doctor — {summary_line}");
+        self.state.status =
+            t!("status.onboarding_doctor_summary", summary = summary_line).into_owned();
         for check in &report.checks {
             let detail = match &check.outcome {
                 crate::model::OnboardingDoctorOutcome::Pass { detail }
@@ -2924,7 +2980,8 @@ impl Store {
                 self.state.menu_stack.replace(id);
                 self.refresh_active_menu();
                 if let Some(frame) = self.state.menu_stack.active() {
-                    self.state.status = format!("Menu: {}", frame.id);
+                    self.state.status =
+                        t!("status.menu_label", id = frame.id.to_string()).into_owned();
                 }
                 None
             }
@@ -2939,7 +2996,7 @@ impl Store {
             MenuAction::Local(action) => self.dispatch_local_action(action, None),
             MenuAction::SendAppUi(command) => Some(command),
             MenuAction::SubmitPrompt(prompt) => {
-                self.start_prompt_turn(prompt, "Queued menu prompt")
+                self.start_prompt_turn(prompt, t!("status.queued_menu_prompt").into_owned())
             }
             MenuAction::Noop => None,
         }
@@ -3083,59 +3140,87 @@ impl Store {
         let turn = self
             .state
             .active_turn()
-            .map(|(_, turn_id)| format!("active turn {}", short_id(&turn_id.0.to_string())))
-            .unwrap_or_else(|| "idle".into());
+            .map(|(_, turn_id)| {
+                t!(
+                    "status.ps_active_turn",
+                    id = short_id(&turn_id.0.to_string())
+                )
+                .into_owned()
+            })
+            .unwrap_or_else(|| t!("status.ps_idle").into_owned());
         let selected_task = self
             .state
             .active_task()
             .map(|task| {
-                format!(
-                    "selected task: {} [{}]",
-                    task.title,
-                    task_state_label(task.state)
+                t!(
+                    "status.ps_selected_task",
+                    title = task.title,
+                    state = task_state_label(task.state)
                 )
+                .into_owned()
             })
-            .unwrap_or_else(|| "selected task: none".into());
+            .unwrap_or_else(|| t!("status.ps_selected_task_none").into_owned());
         let staged = self.state.pending_messages.len();
-        let status = format!(
-            "Local /ps: {turn}; tasks {} total ({} running, {} pending, {} done, {} failed); {staged} staged",
-            counts.total, counts.running, counts.pending, counts.done, counts.failed
-        );
-        let detail = format!(
-            "run state: {} | {selected_task} | {} activity item(s)",
-            self.state.run_state.label(),
-            self.state.activity.len()
-        );
+        let status = t!(
+            "status.ps_summary",
+            turn = turn,
+            total = counts.total,
+            running = counts.running,
+            pending = counts.pending,
+            done = counts.done,
+            failed = counts.failed,
+            staged = staged
+        )
+        .into_owned();
+        let detail = t!(
+            "status.ps_detail",
+            state = self.state.run_state.label(),
+            selected_task = selected_task,
+            activity = self.state.activity.len()
+        )
+        .into_owned();
 
         self.state.focus = FocusPane::Tasks;
         self.state.status = status.clone();
         self.state.scroll_transcript_to_latest();
-        self.push_local_activity(ActivityKind::Progress, "local /ps", status, Some(detail));
+        self.push_local_activity(
+            ActivityKind::Progress,
+            t!("status.local_ps").into_owned(),
+            status,
+            Some(detail),
+        );
     }
 
     fn show_unknown_slash_command(&mut self, command: &str, draft: &str) {
         let ctx = self.state.availability_context();
-        let status = format!(
-            "Unknown slash command: {command}. Try {}.",
-            slash_command_try_hint(&ctx)
-        );
+        let status = t!(
+            "status.unknown_slash_command",
+            command = command,
+            hint = slash_command_try_hint(&ctx)
+        )
+        .into_owned();
         self.state.status = status.clone();
         self.push_local_activity(
             ActivityKind::Warning,
-            "local slash command",
+            t!("status.local_slash_command").into_owned(),
             status,
-            Some(format!("Ignored input: {draft}")),
+            Some(t!("status.ignored_input", draft = draft).into_owned()),
         );
     }
 
     fn show_unavailable_slash_command(&mut self, command: &str, reason: &str) {
-        let status = format!("{command} is unavailable: {reason}");
+        let status = t!(
+            "status.command_unavailable_reason",
+            command = command,
+            reason = reason
+        )
+        .into_owned();
         self.state.status = status.clone();
         self.push_local_activity(
             ActivityKind::Warning,
-            "local slash command",
+            t!("status.local_slash_command").into_owned(),
             status,
-            Some("The command was resolved by the registry but did not pass availability gates."),
+            Some(t!("status.command_gate_failed").into_owned()),
         );
     }
 
@@ -3186,7 +3271,7 @@ impl Store {
 
     fn review_start_command(&mut self, inline_args: &str) -> Option<AppUiCommand> {
         if self.state.active_turn().is_some() {
-            self.state.status = "Cannot start review while a turn is active".into();
+            self.state.status = t!("status.cannot_start_review_active_turn").into_owned();
             return None;
         }
         if !self.require_appui_feature(crate::model::APPUI_FEATURE_REVIEW_START_V1) {
@@ -3201,11 +3286,15 @@ impl Store {
         let prompt = inline_args.trim();
         let prompt = (!prompt.is_empty()).then(|| prompt.to_owned());
         let turn_id = TurnId::new();
-        self.state.status = "Starting backend code review".into();
+        self.state.status = t!("status.starting_code_review").into_owned();
         self.state.set_run_state_in_progress();
         self.state.push_activity(
-            ActivityItem::new(ActivityKind::Progress, "code review", "requested")
-                .with_turn(turn_id.clone()),
+            ActivityItem::new(
+                ActivityKind::Progress,
+                t!("status.activity_code_review").into_owned(),
+                t!("status.review_requested").into_owned(),
+            )
+            .with_turn(turn_id.clone()),
         );
         Some(AppUiCommand::StartReview(ReviewStartParams {
             session_id,
@@ -3220,14 +3309,13 @@ impl Store {
 
     pub fn interrupt_staged_command(&mut self) -> Option<AppUiCommand> {
         if !self.state.has_pending_messages() {
-            self.state.status = "No staged message to send".into();
+            self.state.status = t!("status.no_staged_message").into_owned();
             return None;
         }
 
         let command = self.interrupt_command();
         if command.is_some() {
-            self.state.status =
-                "Interrupt requested; staged message will submit when the turn stops".into();
+            self.state.status = t!("status.interrupt_staged_submit").into_owned();
         }
         command
     }
@@ -3238,11 +3326,11 @@ impl Store {
             .active_turn()
             .map(|(session_id, turn_id)| (session_id.clone(), turn_id.clone()))
         else {
-            self.state.status = "No active turn to interrupt".into();
+            self.state.status = t!("status.no_active_turn_interrupt").into_owned();
             return None;
         };
 
-        self.state.status = "Interrupt requested for active turn".into();
+        self.state.status = t!("status.interrupt_requested_active_turn").into_owned();
         Some(AppUiCommand::InterruptTurn(TurnInterruptParams {
             session_id,
             turn_id,
@@ -3254,11 +3342,16 @@ impl Store {
         action: ApprovalModalAction,
     ) -> Option<AppUiCommand> {
         let Some(approval) = self.state.approval.take() else {
-            self.state.status = "No active approval request".into();
+            self.state.status = t!("status.no_active_approval").into_owned();
             return None;
         };
 
-        self.state.status = format!("Approval {}: {}", action.status_label(), approval.title);
+        self.state.status = t!(
+            "status.approval_action",
+            action = action.status_label(),
+            title = approval.title
+        )
+        .into_owned();
         if self.state.active_turn().is_some() {
             self.state.set_run_state_in_progress();
         } else if self.state.run_state.is_active() {
@@ -3280,17 +3373,17 @@ impl Store {
         if !self.state.pending_messages.is_empty() {
             let cleared = self.state.pending_messages.len();
             self.state.pending_messages.clear();
-            self.state.status = format!("Cleared {cleared} staged message(s)");
+            self.state.status = t!("status.cleared_staged_messages", count = cleared).into_owned();
             return;
         }
 
         if !self.state.composer.is_empty() {
             self.state.clear_current_composer_draft();
-            self.state.status = "Cleared composer draft".into();
+            self.state.status = t!("status.cleared_composer_draft").into_owned();
             return;
         }
 
-        self.state.status = "No composer draft or staged message to clear".into();
+        self.state.status = t!("status.nothing_to_clear").into_owned();
     }
 
     /// `/copy` (and the `Ctrl+Y` keybinding): stage the last assistant reply
@@ -3305,10 +3398,10 @@ impl Store {
             Some(text) => {
                 let chars = text.chars().count();
                 self.state.pending_clipboard = Some(text);
-                self.state.status = format!("Copied last reply to clipboard ({chars} chars)");
+                self.state.status = t!("status.copied_last_reply", chars = chars).into_owned();
             }
             None => {
-                self.state.status = "Nothing to copy yet (no assistant reply)".into();
+                self.state.status = t!("status.nothing_to_copy").into_owned();
             }
         }
     }
@@ -3316,7 +3409,7 @@ impl Store {
     pub fn show_pending_approval(&mut self) -> bool {
         let title = {
             let Some(approval) = self.state.approval.as_mut() else {
-                self.state.status = "No pending approval to show".into();
+                self.state.status = t!("status.no_pending_approval").into_owned();
                 return false;
             };
 
@@ -3326,7 +3419,7 @@ impl Store {
 
         self.state.approval_auto_open = true;
         self.state.focus = FocusPane::Composer;
-        self.state.status = format!("Approval shown: {title}");
+        self.state.status = t!("status.approval_shown", title = title).into_owned();
         true
     }
 
@@ -3421,7 +3514,8 @@ impl Store {
             picker.focus_next_question();
             let active = picker.active + 1;
             let total = picker.questions.len();
-            self.state.status = format!("Question {active}/{total}");
+            self.state.status =
+                t!("status.question_progress", active = active, total = total).into_owned();
             false
         }
     }
@@ -3453,18 +3547,17 @@ impl Store {
             .as_ref()
             .is_some_and(|picker| picker.questions.is_empty())
         {
-            self.state.status =
-                "This question has no answerable options; press Esc to dismiss it".into();
+            self.state.status = t!("status.question_no_options").into_owned();
             return None;
         }
 
         let Some(picker) = self.state.user_question.take() else {
-            self.state.status = "No active question to answer".into();
+            self.state.status = t!("status.no_active_question").into_owned();
             return None;
         };
 
         let params = picker.to_respond_params();
-        self.state.status = format!("Answered question: {}", picker.title);
+        self.state.status = t!("status.answered_question", title = picker.title).into_owned();
         if self.state.active_turn().is_some() {
             self.state.set_run_state_in_progress();
         } else if self.state.run_state.is_active() {
@@ -3478,7 +3571,7 @@ impl Store {
     pub fn show_pending_user_question(&mut self) -> bool {
         let title = {
             let Some(picker) = self.state.user_question.as_mut() else {
-                self.state.status = "No pending question to show".into();
+                self.state.status = t!("status.no_pending_question").into_owned();
                 return false;
             };
             picker.visible = true;
@@ -3487,13 +3580,13 @@ impl Store {
 
         self.state.user_question_auto_open = true;
         self.state.focus = FocusPane::Composer;
-        self.state.status = format!("Question shown: {title}");
+        self.state.status = t!("status.question_shown", title = title).into_owned();
         true
     }
 
     pub fn read_task_output_command(&mut self) -> Option<AppUiCommand> {
         let Some(task) = self.state.active_task_context() else {
-            self.state.status = "No selected task output to read".into();
+            self.state.status = t!("status.no_task_output_to_read").into_owned();
             return None;
         };
 
@@ -3507,7 +3600,7 @@ impl Store {
             task.output_tail.clone(),
             cursor,
         );
-        self.state.status = format!("Requested task output: {}", task.title);
+        self.state.status = t!("status.requested_task_output", title = task.title).into_owned();
 
         Some(AppUiCommand::ReadTaskOutput(TaskOutputReadParams {
             session_id: task.session_id,
@@ -3525,7 +3618,7 @@ impl Store {
     /// arrives via the `task/updated` notification.
     pub fn cancel_task_command(&mut self) -> Option<AppUiCommand> {
         let Some(task) = self.state.active_task() else {
-            self.state.status = "No selected task to cancel".into();
+            self.state.status = t!("status.no_task_to_cancel").into_owned();
             return None;
         };
         let cancellable = matches!(
@@ -3536,8 +3629,12 @@ impl Store {
         let title = task.title.clone();
         let state_label = task_state_label(task.state);
         if !cancellable {
-            self.state.status =
-                format!("Task \"{title}\" is already {state_label}; nothing to cancel");
+            self.state.status = t!(
+                "status.task_already_terminal",
+                title = title,
+                state = state_label
+            )
+            .into_owned();
             return None;
         }
         // octos#1380: only send task/cancel when the server actually advertises
@@ -3558,15 +3655,14 @@ impl Store {
                 capabilities.supports_method(octos_core::ui_protocol::methods::TASK_CANCEL)
             });
         if !task_control_supported {
-            self.state.status =
-                "Task control is not available on this server; cancel is disabled".into();
+            self.state.status = t!("status.task_control_unavailable").into_owned();
             return None;
         }
         let session_id = self
             .state
             .active_session()
             .map(|session| session.id.clone());
-        self.state.status = format!("Requested cancel: {title}");
+        self.state.status = t!("status.requested_cancel", title = title).into_owned();
         Some(AppUiCommand::CancelTask(
             octos_core::ui_protocol::TaskCancelParams {
                 task_id,
@@ -3578,7 +3674,7 @@ impl Store {
 
     pub fn read_diff_preview_command(&mut self) -> Option<AppUiCommand> {
         let Some(session_id) = self.active_session().map(|session| session.id.clone()) else {
-            self.state.status = "No active session for diff preview".into();
+            self.state.status = t!("status.no_session_for_diff").into_owned();
             return None;
         };
         let preview_id = self
@@ -3588,12 +3684,12 @@ impl Store {
             .and_then(ApprovalModalState::diff_preview_id)
             .or_else(|| self.state.active_diff_preview_id());
         let Some(preview_id) = preview_id else {
-            self.state.status = "No diff preview id is available for the selected task".into();
+            self.state.status = t!("status.no_diff_preview_id").into_owned();
             return None;
         };
 
         self.state.diff_preview.open_loading(preview_id.clone());
-        self.state.status = "Requested diff preview".into();
+        self.state.status = t!("status.requested_diff_preview").into_owned();
         Some(AppUiCommand::GetDiffPreview(DiffPreviewGetParams {
             session_id,
             preview_id,
@@ -3606,8 +3702,7 @@ impl Store {
         {
             approval.visible = false;
             self.state.approval_auto_open = false;
-            self.state.status =
-                "Approval pane hidden; auto-open disabled until approval is shown again".into();
+            self.state.status = t!("status.approval_pane_hidden").into_owned();
             return true;
         }
 
@@ -3616,38 +3711,37 @@ impl Store {
         {
             picker.visible = false;
             self.state.user_question_auto_open = false;
-            self.state.status =
-                "Question pane hidden; auto-open disabled until question is shown again".into();
+            self.state.status = t!("status.question_pane_hidden").into_owned();
             return true;
         }
 
         if self.state.task_output.active {
             self.state.task_output.close();
-            self.state.status = "Closed task output".into();
+            self.state.status = t!("status.closed_task_output").into_owned();
             return true;
         }
 
         if self.state.artifact_detail.active {
             self.state.artifact_detail.close();
-            self.state.status = "Closed artifact detail".into();
+            self.state.status = t!("status.closed_artifact_detail").into_owned();
             return true;
         }
 
         if self.state.thread_graph_detail.active {
             self.state.thread_graph_detail.close();
-            self.state.status = "Closed thread graph".into();
+            self.state.status = t!("status.closed_thread_graph").into_owned();
             return true;
         }
 
         if self.state.turn_state_detail.active {
             self.state.turn_state_detail.close();
-            self.state.status = "Closed turn state".into();
+            self.state.status = t!("status.closed_turn_state").into_owned();
             return true;
         }
 
         if self.state.diff_preview.active {
             self.state.diff_preview.close();
-            self.state.status = "Closed inline diff preview".into();
+            self.state.status = t!("status.closed_inline_diff").into_owned();
             return true;
         }
 
@@ -3655,38 +3749,40 @@ impl Store {
     }
 
     pub fn show_diff_preview_placeholder(&mut self) {
-        self.state.status =
-            "Diff preview unavailable: protocol does not expose preview ids/content to the TUI yet"
-                .into();
+        self.state.status = t!("status.diff_preview_unavailable").into_owned();
     }
 
     pub fn select_next_diff_hunk(&mut self) {
         self.state.diff_preview.select_next_hunk();
         if let Some(context) = self.state.diff_preview.selected_hunk_context() {
-            self.state.status = format!(
-                "Selected diff hunk: {} {}",
-                context.path, context.hunk_header
-            );
+            self.state.status = t!(
+                "status.selected_diff_hunk",
+                path = context.path,
+                header = context.hunk_header
+            )
+            .into_owned();
         } else {
-            self.state.status = "No diff hunk is available to select".into();
+            self.state.status = t!("status.no_diff_hunk").into_owned();
         }
     }
 
     pub fn select_prev_diff_hunk(&mut self) {
         self.state.diff_preview.select_prev_hunk();
         if let Some(context) = self.state.diff_preview.selected_hunk_context() {
-            self.state.status = format!(
-                "Selected diff hunk: {} {}",
-                context.path, context.hunk_header
-            );
+            self.state.status = t!(
+                "status.selected_diff_hunk",
+                path = context.path,
+                header = context.hunk_header
+            )
+            .into_owned();
         } else {
-            self.state.status = "No diff hunk is available to select".into();
+            self.state.status = t!("status.no_diff_hunk").into_owned();
         }
     }
 
     pub fn stage_selected_diff_context(&mut self) {
         let Some(context) = self.state.diff_preview.selected_hunk_context() else {
-            self.state.status = "No selected diff hunk context to stage".into();
+            self.state.status = t!("status.no_diff_hunk_context").into_owned();
             return;
         };
         let path = context.path.clone();
@@ -3694,14 +3790,14 @@ impl Store {
 
         if self.state.active_turn().is_some() {
             self.state.pending_messages.push(prompt);
-            self.state.status = format!("Staged selected diff hunk context for next turn: {path}");
+            self.state.status = t!("status.staged_diff_context", path = path).into_owned();
         } else {
             if !self.state.composer.trim().is_empty() {
                 self.state.composer_cursor = None;
                 self.state.insert_composer_text("\n\n");
             }
             self.state.insert_composer_text(&prompt);
-            self.state.status = format!("Added selected diff hunk context to composer: {path}");
+            self.state.status = t!("status.added_diff_context", path = path).into_owned();
         }
 
         self.state.focus = FocusPane::Composer;
@@ -3854,7 +3950,7 @@ impl Store {
                 self.state.onboarding.last_message = Some(event.message.clone());
                 self.state.push_activity(ActivityItem::new(
                     ActivityKind::Progress,
-                    "local profile",
+                    t!("status.activity_local_profile").into_owned(),
                     event.message.clone(),
                 ));
                 self.state.status = event.message;
@@ -3965,14 +4061,14 @@ impl Store {
                 }
                 self.state
                     .set_session_agents(&result.session_id, result.agents);
-                self.state.status = format!("Agent list refreshed: {count} agent(s)");
+                self.state.status = t!("status.agent_list_refreshed", count = count).into_owned();
             }
             AutonomyResult::AgentStatus(result) => {
                 let agent_id = result.agent.agent_id.clone();
                 self.reconcile_task_from_agent_record(&result.session_id, &result.agent);
                 self.state
                     .upsert_session_agent(&result.session_id, result.agent);
-                self.state.status = format!("Agent {agent_id} status updated");
+                self.state.status = t!("status.agent_status_updated", id = agent_id).into_owned();
             }
             AutonomyResult::AgentOutput(result) => {
                 let bytes = result.text.len();
@@ -3982,14 +4078,20 @@ impl Store {
                     result.text.clone(),
                     result.cursor,
                 );
-                self.state.status = format!("Agent {} output: {bytes} bytes", result.agent_id);
+                self.state.status = t!(
+                    "status.agent_output_bytes",
+                    id = result.agent_id,
+                    bytes = bytes
+                )
+                .into_owned();
             }
             AutonomyResult::AgentArtifacts(result) => {
                 let count = result.artifacts.len();
                 let agent_id = result.agent_id.clone();
                 self.state
                     .set_agent_artifacts(&result.session_id, &agent_id, result.artifacts);
-                self.state.status = format!("Agent {agent_id} artifacts: {count} item(s)");
+                self.state.status =
+                    t!("status.agent_artifacts_count", id = agent_id, count = count).into_owned();
             }
             AutonomyResult::AgentArtifactRead(result) => {
                 let title = result.artifact.title.clone();
@@ -3998,7 +4100,12 @@ impl Store {
                     &result.artifact,
                     result.content,
                 );
-                self.state.status = format!("Agent {} artifact loaded: {title}", result.agent_id);
+                self.state.status = t!(
+                    "status.agent_artifact_loaded",
+                    id = result.agent_id,
+                    title = title
+                )
+                .into_owned();
             }
             AutonomyResult::TaskArtifactRead(result) => {
                 let title = result.artifact.title.clone();
@@ -4007,46 +4114,70 @@ impl Store {
                     &result.artifact,
                     result.content,
                 );
-                self.state.status = format!("Task {} artifact loaded: {title}", result.task_id);
+                self.state.status = t!(
+                    "status.task_artifact_loaded",
+                    id = result.task_id,
+                    title = title
+                )
+                .into_owned();
             }
             AutonomyResult::ThreadGraph(result) => {
                 let count = result.threads.len();
                 self.state.thread_graph_detail.open(&result);
-                self.state.status = format!("Thread graph loaded: {count} thread(s)");
+                self.state.status = t!("status.thread_graph_loaded", count = count).into_owned();
             }
             AutonomyResult::TurnState(result) => {
                 let state = result.state.as_str();
                 self.state.turn_state_detail.open(&result);
-                self.state.status = format!(
-                    "Turn {} state: {state}",
-                    short_id(&result.turn_id.0.to_string())
-                );
+                self.state.status = t!(
+                    "status.turn_state",
+                    id = short_id(&result.turn_id.0.to_string()),
+                    state = state
+                )
+                .into_owned();
             }
             AutonomyResult::AgentInterrupt(result) => {
                 if let Some(agent) = result.agent.clone() {
                     self.state.upsert_session_agent(&result.session_id, agent);
                 }
-                self.state.status = format!(
-                    "Agent {} interrupt {}",
-                    result.agent_id,
-                    if result.ok { "accepted" } else { "rejected" }
-                );
+                let outcome = if result.ok {
+                    t!("status.accepted")
+                } else {
+                    t!("status.rejected")
+                };
+                self.state.status = t!(
+                    "status.agent_interrupt",
+                    id = result.agent_id,
+                    outcome = outcome
+                )
+                .into_owned();
             }
             AutonomyResult::AgentClose(result) => {
                 if let Some(agent) = result.agent.clone() {
                     self.state.upsert_session_agent(&result.session_id, agent);
                 }
-                self.state.status = format!(
-                    "Agent {} close {}",
-                    result.agent_id,
-                    if result.ok { "accepted" } else { "rejected" }
-                );
+                let outcome = if result.ok {
+                    t!("status.accepted")
+                } else {
+                    t!("status.rejected")
+                };
+                self.state.status = t!(
+                    "status.agent_close",
+                    id = result.agent_id,
+                    outcome = outcome
+                )
+                .into_owned();
             }
             AutonomyResult::GoalGet(result) => {
                 let session_id = result.session_id.clone();
                 let summary = match result.goal.as_ref() {
-                    Some(goal) => format!("Goal {}: {}", goal.status, goal.objective),
-                    None => "No active goal".into(),
+                    Some(goal) => t!(
+                        "status.goal_summary",
+                        status = goal.status,
+                        objective = goal.objective
+                    )
+                    .into_owned(),
+                    None => t!("status.no_active_goal").into_owned(),
                 };
                 let fresh_goal = result.goal.clone();
                 self.state.set_session_goal(&session_id, result.goal, None);
@@ -4059,9 +4190,14 @@ impl Store {
             AutonomyResult::GoalSet(result) => {
                 let session_id = result.session_id.clone();
                 let summary = match result.goal.as_ref() {
-                    Some(goal) => format!("Goal {}: {}", goal.status, goal.objective),
-                    None if result.ok => "Goal accepted (no record returned)".into(),
-                    None => "Goal set rejected".into(),
+                    Some(goal) => t!(
+                        "status.goal_summary",
+                        status = goal.status,
+                        objective = goal.objective
+                    )
+                    .into_owned(),
+                    None if result.ok => t!("status.goal_accepted_no_record").into_owned(),
+                    None => t!("status.goal_set_rejected").into_owned(),
                 };
                 self.state
                     .set_session_goal(&session_id, result.goal, result.transition_actor);
@@ -4071,9 +4207,9 @@ impl Store {
                 if result.cleared {
                     self.state
                         .set_session_goal(&result.session_id, None, result.transition_actor);
-                    self.state.status = "Goal cleared".into();
+                    self.state.status = t!("status.goal_cleared").into_owned();
                 } else {
-                    self.state.status = "Goal clear rejected".into();
+                    self.state.status = t!("status.goal_clear_rejected").into_owned();
                 }
                 // Goal cleared / clear-rejected: a previously-staged
                 // pause/resume against this session no longer makes
@@ -4086,13 +4222,14 @@ impl Store {
                 let mode = result.loop_state.mode.clone();
                 self.state
                     .upsert_session_loop(&result.session_id, result.loop_state);
-                self.state.status = format!("Loop {loop_id} created ({mode})");
+                self.state.status =
+                    t!("status.loop_created", id = loop_id, mode = mode).into_owned();
             }
             AutonomyResult::LoopList(result) => {
                 let count = result.loops.len();
                 self.state
                     .set_session_loops(&result.session_id, result.loops);
-                self.state.status = format!("Loop list refreshed: {count} loop(s)");
+                self.state.status = t!("status.loop_list_refreshed", count = count).into_owned();
             }
             AutonomyResult::LoopMutation { method, result } => {
                 let loop_id = result.loop_id.clone();
@@ -4121,10 +4258,18 @@ impl Store {
                     "loop/fire_now" => "fire_now",
                     _ => "mutation",
                 };
-                self.state.status = format!(
-                    "Loop {loop_id} {verb} {}",
-                    if result.ok { "accepted" } else { "rejected" }
-                );
+                let outcome = if result.ok {
+                    t!("status.accepted")
+                } else {
+                    t!("status.rejected")
+                };
+                self.state.status = t!(
+                    "status.loop_mutation",
+                    id = loop_id,
+                    verb = verb,
+                    outcome = outcome
+                )
+                .into_owned();
             }
         }
         None
@@ -4149,23 +4294,21 @@ impl Store {
         let goal = match fresh_goal {
             Some(goal) => goal,
             None => {
-                self.state.status = "Cannot transition: server reports no goal.".into();
+                self.state.status = t!("status.cannot_transition_no_goal").into_owned();
                 return None;
             }
         };
         if !matches!(goal.status.as_str(), "active" | "paused" | "budget_limited") {
-            self.state.status = format!(
-                "Cannot transition goal in `{}` state (model-owned).",
-                goal.status
-            );
+            self.state.status =
+                t!("status.cannot_transition_goal_state", state = goal.status).into_owned();
             return None;
         }
         let verb = match pending.action {
-            crate::model::SessionGoalSetAction::Pause => "Pausing",
-            crate::model::SessionGoalSetAction::Resume => "Resuming",
-            crate::model::SessionGoalSetAction::Set => "Updating",
+            crate::model::SessionGoalSetAction::Pause => t!("status.goal_verb_pausing"),
+            crate::model::SessionGoalSetAction::Resume => t!("status.goal_verb_resuming"),
+            crate::model::SessionGoalSetAction::Set => t!("status.goal_verb_updating"),
         };
-        self.state.status = format!("{verb} goal");
+        self.state.status = t!("status.verb_goal", verb = verb).into_owned();
         Some(AppUiCommand::SetSessionGoal(
             crate::model::SessionGoalSetParams {
                 session_id: pending.session_id,
@@ -4424,15 +4567,19 @@ impl Store {
                     self.state.onboarding.local_profile_create_pending = false;
                     self.state.onboarding.local_profile_create_pending_username = None;
                     self.state.status = if is_transport_error {
-                        format!(
-                            "Local profile create cancelled by transport error [{}]: {}",
-                            error.code, error.message
+                        t!(
+                            "status.local_create_cancelled_transport",
+                            code = error.code,
+                            message = error.message
                         )
+                        .into_owned()
                     } else {
-                        format!(
-                            "Local profile create cancelled [{}]: {}",
-                            error.code, error.message
+                        t!(
+                            "status.local_create_cancelled",
+                            code = error.code,
+                            message = error.message
                         )
+                        .into_owned()
                     };
                 } else if error.code == "frame_too_large" {
                     // Recoverable pre-send rejection: the frame (e.g. a large
@@ -4443,14 +4590,17 @@ impl Store {
                     // left the session stuck in Error, unrecoverable). The
                     // local-create attribution above runs first so the wizard's
                     // pending-clear is preserved.
-                    self.state.status = format!(
-                        "Message too large — {}. Shorten it or attach as a file.",
-                        error.message
-                    );
+                    self.state.status =
+                        t!("status.message_too_large", message = error.message).into_owned();
                 } else if is_client_synth_error {
                     // Surfaced for the user but does NOT touch the
                     // local-create pending state.
-                    self.state.status = format!("Error [{}]: {}", error.code, error.message);
+                    self.state.status = t!(
+                        "status.error_code_message",
+                        code = error.code,
+                        message = error.message
+                    )
+                    .into_owned();
                 } else if attribute_to_local_create {
                     self.state
                         .onboarding
@@ -4462,14 +4612,26 @@ impl Store {
                         .as_ref()
                         .map(|recovery| (recovery.message.clone(), recovery.focus_field));
                     if let Some((message, focus_field)) = recovery_message_and_focus {
-                        self.state.status = format!("Local profile setup blocked: {message}");
+                        self.state.status =
+                            t!("status.local_profile_setup_blocked", message = message)
+                                .into_owned();
                         self.refresh_active_menu_if_open();
                         self.focus_local_profile_field(focus_field);
                     } else {
-                        self.state.status = format!("Error [{}]: {}", error.code, error.message);
+                        self.state.status = t!(
+                            "status.error_code_message",
+                            code = error.code,
+                            message = error.message
+                        )
+                        .into_owned();
                     }
                 } else {
-                    self.state.status = format!("Error [{}]: {}", error.code, error.message);
+                    self.state.status = t!(
+                        "status.error_code_message",
+                        code = error.code,
+                        message = error.message
+                    )
+                    .into_owned();
                 }
                 self.state.push_activity(
                     ActivityItem::new(
@@ -4494,15 +4656,19 @@ impl Store {
     }
 
     pub fn apply_diff_preview_result(&mut self, result: DiffPreviewGetResult) {
-        let title = result
-            .preview
-            .title
-            .clone()
-            .unwrap_or_else(|| format!("{} file diff", result.preview.files.len()));
+        let title = result.preview.title.clone().unwrap_or_else(|| {
+            t!("status.file_diff_count", count = result.preview.files.len()).into_owned()
+        });
         let status = result.status.clone();
         let file_count = result.preview.files.len();
         self.state.diff_preview.apply_result(result);
-        self.state.status = format!("Diff preview {status}: {title} ({file_count} files)");
+        self.state.status = t!(
+            "status.diff_preview_result",
+            status = status,
+            title = title,
+            file_count = file_count
+        )
+        .into_owned();
     }
 
     fn apply_capabilities_event(&mut self, event: CapabilitiesClientEvent) {
@@ -4608,7 +4774,7 @@ impl Store {
         self.state.mcp_config_catalog = Some(event.result);
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
-            "mcp config",
+            t!("status.activity_mcp_config").into_owned(),
             event.message.clone(),
         ));
         self.state.status = event.message;
@@ -4617,7 +4783,7 @@ impl Store {
     fn apply_mcp_config_mutation_event(&mut self, event: McpConfigMutationClientEvent) {
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
-            "mcp config",
+            t!("status.activity_mcp_config").into_owned(),
             event.message.clone(),
         ));
         self.state.status = event.message;
@@ -4750,23 +4916,23 @@ impl Store {
 
         let mut sections = Vec::new();
         if result.messages.is_some() {
-            sections.push(format!("{message_count} message(s)"));
+            sections.push(t!("status.message_count", count = message_count).into_owned());
         }
         if result.threads.is_some() {
-            sections.push(format!("{thread_count} thread(s)"));
+            sections.push(t!("status.thread_count", count = thread_count).into_owned());
         }
         if result.turns.is_some() {
-            sections.push(format!("{turn_count} turn(s)"));
+            sections.push(t!("status.turn_count", count = turn_count).into_owned());
         }
         if approval_count > 0 || pending_approvals_present {
-            sections.push(format!("{approval_count} pending approval(s)"));
+            sections.push(t!("status.pending_approval_count", count = approval_count).into_owned());
         }
         let summary = if sections.is_empty() {
-            "session state".into()
+            t!("status.session_state").into_owned()
         } else {
             sections.join(", ")
         };
-        self.state.status = format!("Session hydrated: {summary}");
+        self.state.status = t!("status.session_hydrated", summary = summary).into_owned();
     }
 
     fn apply_review_start_result(&mut self, result: ReviewStartResult) {
@@ -4774,17 +4940,26 @@ impl Store {
         let backend = result.backend.as_deref().unwrap_or("backend");
         let agent_count = result.agent_count.unwrap_or_default();
         let status = if result.accepted {
-            format!("Review started: {agent_count} specialist(s) via {backend}")
+            t!(
+                "status.review_started",
+                count = agent_count,
+                backend = backend
+            )
+            .into_owned()
         } else {
-            "Review request was not accepted".to_string()
+            t!("status.review_not_accepted").into_owned()
         };
         self.state.push_activity(
-            ActivityItem::new(ActivityKind::Progress, "code review", status.clone())
-                .with_turn(result.turn_id.clone())
-                .with_detail(format!(
-                    "workflow={workflow}, session={}",
-                    result.session_id
-                )),
+            ActivityItem::new(
+                ActivityKind::Progress,
+                t!("status.activity_code_review").into_owned(),
+                status.clone(),
+            )
+            .with_turn(result.turn_id.clone())
+            .with_detail(format!(
+                "workflow={workflow}, session={}",
+                result.session_id
+            )),
         );
         if result.accepted {
             self.state.set_run_state_in_progress();
@@ -4814,8 +4989,8 @@ impl Store {
         self.state.push_activity(
             ActivityItem::new(
                 ActivityKind::Approval,
-                "pending approvals",
-                format!("{count} pending approval(s)"),
+                t!("status.activity_pending_approvals").into_owned(),
+                t!("status.pending_approval_count", count = count).into_owned(),
             )
             .with_turn(event.turn_id.clone())
             .with_detail(title.clone()),
@@ -4848,8 +5023,12 @@ impl Store {
         };
         let title = event.title.clone();
         self.state.push_activity(
-            ActivityItem::new(ActivityKind::Approval, "pending question", title.clone())
-                .with_turn(event.turn_id.clone()),
+            ActivityItem::new(
+                ActivityKind::Approval,
+                t!("status.activity_pending_question").into_owned(),
+                title.clone(),
+            )
+            .with_turn(event.turn_id.clone()),
         );
         let mut picker = UserQuestionPickerState::from_event(event);
         picker.visible = self.state.user_question_auto_open;
@@ -4862,7 +5041,7 @@ impl Store {
         self.state.profile_llm_catalog = Some(event.result);
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
-            "provider catalog",
+            t!("status.activity_provider_catalog").into_owned(),
             event.message.clone(),
         ));
         self.state.status = event.message;
@@ -5018,7 +5197,7 @@ impl Store {
         self.state.profile_skill_registry = Some(event.result);
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
-            "skill registry",
+            t!("status.activity_skill_registry").into_owned(),
             event.message.clone(),
         ));
         self.state.status = event.message;
@@ -5063,16 +5242,16 @@ impl Store {
                 self.state.push_activity(
                     ActivityItem::new(
                         ActivityKind::Warning,
-                        "permission profile mismatch",
+                        t!("status.activity_permission_profile_mismatch").into_owned(),
                         reason.clone(),
                     )
-                    .with_detail("Server clamped or rejected the staged onboarding choice."),
+                    .with_detail(t!("status.server_clamped_onboarding_choice").into_owned()),
                 );
             }
         }
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
-            "runtime status",
+            t!("status.activity_runtime_status").into_owned(),
             message.clone(),
         ));
         self.state.status = message;
@@ -5098,7 +5277,7 @@ impl Store {
         self.state.tool_config_catalog = Some(event.result);
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
-            "tool config",
+            t!("status.activity_tool_config").into_owned(),
             event.message.clone(),
         ));
         self.state.status = event.message;
@@ -5107,7 +5286,7 @@ impl Store {
     fn apply_tool_config_mutation_event(&mut self, event: ToolConfigMutationClientEvent) {
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
-            "tool config",
+            t!("status.activity_tool_config").into_owned(),
             event.message.clone(),
         ));
         self.state.status = event.message;
@@ -5188,7 +5367,12 @@ impl Store {
             self.state
                 .diff_preview
                 .open_loading_for_turn(preview_id.clone(), event.turn_id.clone());
-            self.state.status = format!("Opening diff preview: {operation} {path}");
+            self.state.status = t!(
+                "status.opening_diff_preview",
+                operation = operation,
+                path = path
+            )
+            .into_owned();
             if !request_already_in_flight {
                 return Some(AppUiCommand::GetDiffPreview(DiffPreviewGetParams {
                     session_id: event.session_id,
@@ -5388,8 +5572,12 @@ impl Store {
                 }
                 self.state.push_activity(item);
                 self.state.set_run_state_in_progress();
-                self.state.status =
-                    format!("Tool started: {} ({})", event.tool_name, event.tool_call_id);
+                self.state.status = t!(
+                    "status.tool_started",
+                    name = event.tool_name,
+                    id = event.tool_call_id
+                )
+                .into_owned();
                 None
             }
             UiNotification::ToolProgress(event) => {
@@ -5432,7 +5620,7 @@ impl Store {
                         self.state.push_activity(
                             ActivityItem::new(
                                 ActivityKind::Warning,
-                                "Recovery suggestion",
+                                t!("status.activity_recovery_suggestion").into_owned(),
                                 recovery.clone(),
                             )
                             .with_turn(event.turn_id)
@@ -5471,7 +5659,7 @@ impl Store {
                 self.state.approval = Some(approval);
                 self.state.focus = FocusPane::Composer;
                 self.state.set_run_state_blocked(title.clone());
-                self.state.status = format!("Approval requested: {title}");
+                self.state.status = t!("status.approval_requested", title = title).into_owned();
                 if let Some(preview_id) = diff_preview_id {
                     let request_already_in_flight = self.state.diff_preview.loading
                         && self.state.diff_preview.requested_preview_id.as_ref()
@@ -5479,7 +5667,8 @@ impl Store {
                     self.state
                         .diff_preview
                         .open_loading_for_turn(preview_id.clone(), Some(diff_preview_turn_id));
-                    self.state.status = format!("Opening inline diff preview: {title}");
+                    self.state.status =
+                        t!("status.opening_inline_diff_preview", title = title).into_owned();
                     if !request_already_in_flight {
                         return Some(AppUiCommand::GetDiffPreview(DiffPreviewGetParams {
                             session_id,
@@ -5597,7 +5786,7 @@ impl Store {
                 self.state.push_activity(
                     ActivityItem::new(
                         ActivityKind::Progress,
-                        "agent output",
+                        t!("status.activity_agent_output").into_owned(),
                         format!("Agent output refreshed: {} ({bytes} bytes)", event.agent_id),
                     )
                     .with_detail(compact_preview(&event.text)),
@@ -5613,7 +5802,7 @@ impl Store {
                 );
                 self.state.push_activity(ActivityItem::new(
                     ActivityKind::Tool,
-                    "agent artifacts",
+                    t!("status.activity_agent_artifacts").into_owned(),
                     format!("{count} artifact(s) refreshed for {}", event.agent_id),
                 ));
                 None
@@ -5628,7 +5817,7 @@ impl Store {
                 );
                 self.state.push_activity(ActivityItem::new(
                     ActivityKind::Progress,
-                    "session goal",
+                    t!("status.activity_session_goal").into_owned(),
                     status_label,
                 ));
                 self.state.status = format!("Goal updated: {objective}");
@@ -5641,9 +5830,9 @@ impl Store {
                         .set_session_goal(&event.session_id, None, Some(actor));
                 }
                 self.state.status = if event.cleared {
-                    "Goal cleared".into()
+                    t!("status.goal_cleared").into_owned()
                 } else {
-                    "Goal clear requested".into()
+                    t!("status.goal_clear_requested").into_owned()
                 };
                 None
             }
@@ -5756,7 +5945,7 @@ impl Store {
                     });
                     let mut notice = ActivityItem::new(
                         ActivityKind::Progress,
-                        "context compacted",
+                        t!("status.activity_context_compacted").into_owned(),
                         format!(
                             "{} → {} tokens",
                             humanize_token_count(before),
@@ -5880,7 +6069,8 @@ impl Store {
                         .with_detail(AppState::envelope_tool_detail_for_thread(&thread_id)),
                 );
                 self.state.set_run_state_in_progress();
-                self.state.status = format!("Tool started: {name} ({tool_call_id})");
+                self.state.status =
+                    t!("status.tool_started", name = name, id = tool_call_id).into_owned();
                 None
             }
             Payload::ToolProgress {
@@ -6123,7 +6313,7 @@ impl Store {
         self.state.user_question = Some(picker);
         self.state.focus = FocusPane::Composer;
         self.state.set_run_state_blocked(title.clone());
-        self.state.status = format!("Question asked: {title}");
+        self.state.status = t!("status.question_asked", title = title).into_owned();
         None
     }
 
@@ -6278,7 +6468,7 @@ impl Store {
                     );
                     session.messages.push(Message::assistant(text));
                     (
-                        format!("Turn completed in {title} at seq {seq}"),
+                        t!("status.turn_completed", title = title, seq = seq).into_owned(),
                         true,
                         true,
                     )
@@ -6286,7 +6476,7 @@ impl Store {
                 Some(live_reply) => {
                     session.live_reply = Some(live_reply);
                     (
-                        format!("Ignored completed stale turn in {title}"),
+                        t!("status.turn_completed_stale", title = title).into_owned(),
                         false,
                         false,
                     )
@@ -6294,7 +6484,7 @@ impl Store {
                 None => (
                     {
                         session.messages.push(Message::assistant(fallback_summary));
-                        format!("Turn completed in {title} at seq {seq}")
+                        t!("status.turn_completed", title = title, seq = seq).into_owned()
                     },
                     true,
                     true,
@@ -6443,7 +6633,8 @@ impl Store {
         }
 
         let prompt = self.state.pending_messages[0].clone();
-        let command = self.start_prompt_turn(prompt, "Submitted staged message");
+        let command =
+            self.start_prompt_turn(prompt, t!("status.submitted_staged_message").into_owned());
         if command.is_some() {
             self.state.pending_messages.remove(0);
         }
@@ -6555,31 +6746,41 @@ impl Store {
 
     fn turn_completion_fallback_message(&self, turn_id: &TurnId) -> String {
         let summary = self.summarize_turn_activity(turn_id);
-        format!(
-            "Session Summary\n- Result: Turn completed, but the TUI did not receive a final assistant answer.\n- Activity: {} action(s) recorded.\n- Files changed: {}.\n- Validation: {}.\n- Risks / follow-up: Review the activity above and continue the turn if the requested answer is incomplete.",
-            summary.action_count,
-            format_limited_list(&summary.files_changed, "none observed"),
-            format_limited_list(&summary.validation, "not reported"),
+        t!(
+            "status.summary_completed_no_answer",
+            count = summary.action_count,
+            files =
+                format_limited_list(&summary.files_changed, &t!("status.summary_none_observed")),
+            validation =
+                format_limited_list(&summary.validation, &t!("status.summary_not_reported")),
         )
+        .into_owned()
     }
 
     fn turn_partial_completion_fallback_message(&self, turn_id: &TurnId) -> String {
         let summary = self.summarize_turn_activity(turn_id);
-        format!(
-            "Session Summary\n- Result: Turn completed, but the TUI only received a partial live answer.\n- Activity: {} action(s) recorded.\n- Files changed: {}.\n- Validation: {}.\n- Risks / follow-up: The server may have persisted a fuller answer; continue if the visible answer is incomplete.",
-            summary.action_count,
-            format_limited_list(&summary.files_changed, "none observed"),
-            format_limited_list(&summary.validation, "not reported"),
+        t!(
+            "status.summary_partial_answer",
+            count = summary.action_count,
+            files =
+                format_limited_list(&summary.files_changed, &t!("status.summary_none_observed")),
+            validation =
+                format_limited_list(&summary.validation, &t!("status.summary_not_reported")),
         )
+        .into_owned()
     }
 
     fn turn_error_fallback_message(&self, turn_id: &TurnId, code: &str, message: &str) -> String {
         let summary = self.summarize_turn_activity(turn_id);
-        let failed = format_limited_list(&summary.failures, "none recorded");
-        format!(
-            "Session Summary\n- Result: Turn failed before producing a final answer.\n- Error: {code}: {message}\n- Activity: {} action(s) recorded.\n- Failures: {failed}.\n- Risks / follow-up: Fix the error above or continue the turn with a more specific instruction.",
-            summary.action_count,
+        let failed = format_limited_list(&summary.failures, &t!("status.summary_none_recorded"));
+        t!(
+            "status.summary_failed",
+            code = code,
+            message = message,
+            count = summary.action_count,
+            failed = failed,
         )
+        .into_owned()
     }
 
     fn summarize_turn_activity(&self, turn_id: &TurnId) -> TurnActivitySummary {
@@ -6707,7 +6908,7 @@ fn slash_command_try_hint(ctx: &crate::menu::AvailabilityContext<'_>) -> String 
         .map(|visible| visible.command.slash_name())
         .collect::<Vec<_>>();
     match names.len() {
-        0 => "a registered command".into(),
+        0 => t!("status.hint_registered_command").into_owned(),
         1 => names[0].clone(),
         2 => format!("{} or {}", names[0], names[1]),
         _ => {
@@ -6809,9 +7010,7 @@ fn parse_onboarding_permission_mode(
             }
         }
         other => {
-            return Err(format!(
-                "Unknown permission profile mode '{other}'. Use: default, read-only, workspace-write, workspace-write-never, full-access, or clear."
-            ));
+            return Err(t!("status.unknown_permission_profile_mode", mode = other).into_owned());
         }
     };
     Ok(Some(update))
@@ -6892,8 +7091,8 @@ fn permission_profile_stamp_mismatch(
 
 fn onboarding_pending_status(pending: OnboardingProviderPending) -> String {
     match pending {
-        OnboardingProviderPending::Test => "Provider test already in progress".into(),
-        OnboardingProviderPending::Save => "Provider save already in progress".into(),
+        OnboardingProviderPending::Test => t!("status.provider_test_in_progress").into_owned(),
+        OnboardingProviderPending::Save => t!("status.provider_save_in_progress").into_owned(),
     }
 }
 
@@ -7000,31 +7199,27 @@ fn stdio_command_cwd(command: &str) -> Option<String> {
 }
 
 fn onboarding_usage() -> String {
-    "Usage: /onboard [name|username|email|create-profile|profile|select|family|model|route|base-url|api-key-env|key|send-code|verify|catalog|save|test|finish|reset]".into()
+    t!("status.usage_onboard").into_owned()
 }
 
 fn login_usage() -> String {
-    "Usage: /login [email <address>|send-code [email]|code <otp>|verify [otp]|status|me|logout]"
-        .into()
+    t!("status.usage_login").into_owned()
 }
 
 fn provider_usage() -> String {
-    "Usage: /provider [catalog|list|select <family_id> <model_id> <route_id> [base_url] [api_key_env]|family|model|route|base-url|api-key-env|api-type|key|test|save|add-fallback]".into()
+    t!("status.usage_provider").into_owned()
 }
 
 fn skills_usage() -> String {
-    "Usage: /skills [list|search <query>|install <repo> [--branch <branch>] [--force]|remove <name>]"
-        .into()
+    t!("status.usage_skills").into_owned()
 }
 
 fn mcp_usage() -> String {
-    "Usage: /mcp [list|status|enable <server>|disable <server>|test <server>|upsert <server> {json}|delete <server>]"
-        .into()
+    t!("status.usage_mcp").into_owned()
 }
 
 fn tools_usage() -> String {
-    "Usage: /tools [list|status|enable <tool>|disable <tool>|test <tool>|upsert <tool> {json}|delete <tool>]"
-        .into()
+    t!("status.usage_tools").into_owned()
 }
 
 fn parse_single_name(input: &str, _usage: &str) -> Option<String> {
@@ -7063,25 +7258,25 @@ fn parse_skill_install_args(input: &str) -> Result<(String, Option<String>, bool
                 .next()
                 .and_then(|value| non_empty_string(value.to_owned()))
             else {
-                return Err("Usage: /skills install <repo> [--branch <branch>] [--force]".into());
+                return Err(t!("status.usage_skills_install").into_owned());
             };
             branch = Some(value);
         } else if let Some(value) = part.strip_prefix("--branch=") {
             let Some(value) = non_empty_string(value.to_owned()) else {
-                return Err("Usage: /skills install <repo> [--branch <branch>] [--force]".into());
+                return Err(t!("status.usage_skills_install").into_owned());
             };
             branch = Some(value);
         } else if part.starts_with('-') {
-            return Err(format!("Unknown /skills install flag: {part}"));
+            return Err(t!("status.unknown_skills_install_flag", flag = part).into_owned());
         } else if repo.is_none() {
             repo = Some(part.to_owned());
         } else {
-            return Err("Usage: /skills install <repo> [--branch <branch>] [--force]".into());
+            return Err(t!("status.usage_skills_install").into_owned());
         }
     }
 
     let Some(repo) = repo.and_then(non_empty_string) else {
-        return Err("Usage: /skills install <repo> [--branch <branch>] [--force]".into());
+        return Err(t!("status.usage_skills_install").into_owned());
     };
     Ok((repo, branch, force))
 }
@@ -7390,27 +7585,18 @@ fn tool_invocation_detail(tool_name: &str, arguments: &Value) -> Option<String> 
 fn tool_failure_recovery_hint(tool_name: &str, output_preview: Option<&str>) -> Option<String> {
     let output = output_preview?.to_ascii_lowercase();
     if output.contains("enotfound") && output.contains("registry.npmjs.org") {
-        return Some(
-            "npm registry DNS failed; retry with an alternate registry, fix DNS/network, or use a local scaffold"
-                .into(),
-        );
+        return Some(t!("status.recovery_npm_dns").into_owned());
     }
 
     if output.contains("command timed out") {
-        return Some(
-            "command timed out; narrow the command, add a timeout, or ask for missing context"
-                .into(),
-        );
+        return Some(t!("status.recovery_command_timeout").into_owned());
     }
 
     if output.contains("permission denied")
         || output.contains("operation not permitted")
         || output.contains("eacces")
     {
-        return Some(
-            "permission blocked; ask for the exact permission/escalation or choose a writable path"
-                .into(),
-        );
+        return Some(t!("status.recovery_permission_blocked").into_owned());
     }
 
     if output.contains("could not resolve host")
@@ -7418,19 +7604,13 @@ fn tool_failure_recovery_hint(tool_name: &str, output_preview: Option<&str>) -> 
         || output.contains("network request")
         || output.contains("timeout")
     {
-        return Some(
-            "network access failed; ask for network/proxy/registry permission or use an offline fallback"
-                .into(),
-        );
+        return Some(t!("status.recovery_network_failed").into_owned());
     }
 
     if matches!(tool_name, "web_search" | "web_fetch" | "deep_search")
         && (output.contains("restricted") || output.contains("not configured"))
     {
-        return Some(
-            "search/fetch is restricted; ask for provider configuration or proceed with an explicit offline caveat"
-                .into(),
-        );
+        return Some(t!("status.recovery_search_restricted").into_owned());
     }
 
     None
@@ -7457,10 +7637,13 @@ fn diff_hunk_context_prompt(context: &DiffHunkContext) -> String {
         Some(old_path) if old_path != &context.path => format!("{old_path} -> {}", context.path),
         _ => context.path.clone(),
     };
-    let mut text = format!(
-        "Use this selected diff hunk as context for the next coding turn.\nfile: {path}\nstatus: {}\nhunk: {}\n```diff\n",
-        context.file_status, context.hunk_header
-    );
+    let mut text = t!(
+        "status.diff_hunk_prompt",
+        path = path,
+        status = context.file_status,
+        hunk = context.hunk_header
+    )
+    .into_owned();
     for line in &context.lines {
         text.push_str(diff_context_line_prefix(&line.kind));
         text.push_str(&line.content);
@@ -7690,7 +7873,10 @@ mod tests {
             Some("the deep-research report")
         );
         assert!(
-            store.state.status.contains("Copied"),
+            store
+                .state
+                .status
+                .contains(t!("status.copied_last_reply", chars = 24).as_ref()),
             "status should confirm the copy, got: {}",
             store.state.status
         );
@@ -7704,7 +7890,10 @@ mod tests {
 
         assert!(store.state.pending_clipboard.is_none());
         assert!(
-            store.state.status.contains("Nothing to copy"),
+            store
+                .state
+                .status
+                .contains(t!("status.nothing_to_copy").as_ref()),
             "status should explain the no-op, got: {}",
             store.state.status
         );
@@ -7744,6 +7933,88 @@ mod tests {
             store.state.status
         );
         assert_eq!(rust_i18n::locale().to_string(), before);
+    }
+
+    #[test]
+    fn onboarding_language_step_is_first() {
+        let mut store = protocol_store_without_sessions();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+        ]));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+
+        let root = store
+            .state
+            .active_menu
+            .as_ref()
+            .expect("onboarding menu is built");
+        let MenuBuildResult::Ready(spec) = root else {
+            panic!("expected ready onboarding menu");
+        };
+        assert_eq!(
+            spec.items.first().map(|item| item.id.as_str()),
+            Some("onboard.language"),
+            "language must be the first onboarding row"
+        );
+    }
+
+    #[test]
+    fn onboarding_language_selection_sets_zh_locale_in_child_process() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+            .args([
+                "--exact",
+                "store::tests::onboarding_language_selection_child_sets_zh_locale",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .output()
+            .expect("run child locale-selection test");
+        assert!(
+            output.status.success(),
+            "child locale-selection test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "spawned by onboarding_language_selection_sets_zh_locale_in_child_process"]
+    fn onboarding_language_selection_child_sets_zh_locale() {
+        rust_i18n::set_locale("en");
+
+        let mut store = protocol_store_without_sessions();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+        ]));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+
+        assert!(store.accept_active_menu_item().is_none());
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.id.as_str()),
+            Some(crate::menu::registry::MENU_ONBOARD_LANGUAGE)
+        );
+
+        store.select_next_menu_item();
+        let language_menu = store
+            .state
+            .active_menu
+            .as_ref()
+            .expect("language menu is built");
+        let MenuBuildResult::Ready(spec) = language_menu else {
+            panic!("expected ready language menu");
+        };
+        assert_eq!(
+            spec.items.get(1).map(|item| item.id.as_str()),
+            Some("onboard.language.zh"),
+            "zh should be the second available onboarding language"
+        );
+
+        assert!(store.accept_active_menu_item().is_none());
+        assert_eq!(rust_i18n::locale().to_string(), "zh");
     }
 
     #[test]
@@ -7945,7 +8216,7 @@ mod tests {
             state: AppState::new(
                 vec![],
                 0,
-                "AppUI connected".into(),
+                "Octos UI connected".into(),
                 Some("stdio:octos serve --stdio".into()),
                 false,
             ),
@@ -8075,7 +8346,7 @@ mod tests {
             store.state.onboarding.provider_pending,
             Some(OnboardingProviderPending::Test)
         );
-        assert_eq!(store.state.status, "Testing provider connection");
+        assert_eq!(store.state.status, t!("status.testing_provider_connection"));
 
         store.apply_client_event(ClientEvent::ProfileLlmMutation(
             ProfileLlmMutationClientEvent {
@@ -8766,7 +9037,7 @@ mod tests {
                     &[],
                 ),
             },
-            message: "AppUI capabilities refreshed: 1 methods".into(),
+            message: "Octos UI capabilities refreshed: 1 methods".into(),
         }));
 
         assert!(store.state.sessions.is_empty());
@@ -9590,7 +9861,7 @@ mod tests {
                     &[],
                 ),
             },
-            message: "AppUI capabilities refreshed: 3 methods".into(),
+            message: "Octos UI capabilities refreshed: 3 methods".into(),
         }));
 
         assert!(store.state.sessions.is_empty());
@@ -9619,7 +9890,7 @@ mod tests {
                     &[],
                 ),
             },
-            message: "AppUI capabilities refreshed: 3 methods".into(),
+            message: "Octos UI capabilities refreshed: 3 methods".into(),
         }));
 
         let Some(menu) = store.state.active_menu.as_ref() else {
@@ -9649,7 +9920,7 @@ mod tests {
                     &[],
                 ),
             },
-            message: "AppUI capabilities refreshed: 1 method".into(),
+            message: "Octos UI capabilities refreshed: 1 method".into(),
         }));
 
         assert!(
@@ -9676,7 +9947,7 @@ mod tests {
                     &[],
                 ),
             },
-            message: "AppUI capabilities refreshed: 2 methods".into(),
+            message: "Octos UI capabilities refreshed: 2 methods".into(),
         }));
 
         assert!(
@@ -10012,8 +10283,16 @@ mod tests {
             result.is_none(),
             "session/open must not fire while workspace validation is Invalid"
         );
+        let expected_status =
+            if let crate::model::OnboardingWorkspaceValidation::Invalid { reason } =
+                &store.state.onboarding.workspace_validation
+            {
+                t!("status.cannot_open_workspace_invalid", reason = reason).into_owned()
+            } else {
+                panic!("expected invalid workspace validation");
+            };
         assert!(
-            store.state.status.contains("workspace invalid"),
+            store.state.status == expected_status,
             "expected blocked-status message, got: {}",
             store.state.status
         );
@@ -10208,12 +10487,8 @@ mod tests {
 
         match &store.state.onboarding.workspace_validation {
             crate::model::OnboardingWorkspaceValidation::Invalid { reason } => {
-                // The error is actionable: it names the override command and
-                // the `.`-for-current-folder shortcut.
-                assert!(
-                    reason.contains("could not resolve a project folder"),
-                    "reason should explain no folder resolved: {reason}"
-                );
+                let expected = t!("status.no_usable_workspace_cwd", target = "stdio");
+                assert_eq!(reason, expected.as_ref());
                 assert!(
                     reason.contains("/onboard workspace"),
                     "reason should name the override command: {reason}"
@@ -10982,7 +11257,7 @@ mod tests {
                     &[],
                 ),
             },
-            message: "AppUI capabilities refreshed: 1 methods".into(),
+            message: "Octos UI capabilities refreshed: 1 methods".into(),
         }));
         let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
             panic!("expected onboarding menu");
@@ -11016,7 +11291,7 @@ mod tests {
                     &[],
                 ),
             },
-            message: "AppUI capabilities refreshed: 1 methods".into(),
+            message: "Octos UI capabilities refreshed: 1 methods".into(),
         }));
         let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
             panic!("expected onboarding menu");
@@ -11095,7 +11370,7 @@ mod tests {
                     &[],
                 ),
             },
-            message: "AppUI capabilities refreshed: 1 methods".into(),
+            message: "Octos UI capabilities refreshed: 1 methods".into(),
         }));
 
         assert!(!store.state.menu_stack.is_active());

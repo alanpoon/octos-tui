@@ -34,8 +34,8 @@ use crate::menu::{
         APPUI_METHOD_TOOL_STATUS_LIST, APPUI_ONBOARDING_METHODS_ANY,
         APPUI_PERMISSION_MENU_METHODS_ANY, APPUI_PROVIDER_MENU_METHODS_ANY,
         APPUI_TOOL_SETTINGS_MENU_METHODS_ANY, MENU_COST, MENU_HELP, MENU_KEYMAP, MENU_LOGIN,
-        MENU_MCP, MENU_MODEL, MENU_ONBOARD, MENU_PERMISSIONS, MENU_PROVIDER, MENU_SKILLS,
-        MENU_STATUS, MENU_STATUS_LINE, MENU_THEME, MENU_TITLE, MENU_TOOL_SETTINGS,
+        MENU_MCP, MENU_MODEL, MENU_ONBOARD, MENU_ONBOARD_LANGUAGE, MENU_PERMISSIONS, MENU_PROVIDER,
+        MENU_SKILLS, MENU_STATUS, MENU_STATUS_LINE, MENU_THEME, MENU_TITLE, MENU_TOOL_SETTINGS,
     },
 };
 use crate::model::{
@@ -55,6 +55,7 @@ pub fn core_menu_registry() -> MenuRegistry {
     for provider in [
         Provider::Help,
         Provider::Onboard,
+        Provider::OnboardLanguage,
         Provider::OnboardFamily,
         Provider::OnboardModel,
         Provider::OnboardRoute,
@@ -86,6 +87,7 @@ pub fn core_menu_registry() -> MenuRegistry {
 enum Provider {
     Help,
     Onboard,
+    OnboardLanguage,
     OnboardFamily,
     OnboardModel,
     OnboardRoute,
@@ -112,6 +114,7 @@ impl MenuProvider for Provider {
         MenuId::from(match self {
             Self::Help => MENU_HELP,
             Self::Onboard => MENU_ONBOARD,
+            Self::OnboardLanguage => MENU_ONBOARD_LANGUAGE,
             Self::OnboardFamily => crate::menu::registry::MENU_ONBOARD_FAMILY,
             Self::OnboardModel => crate::menu::registry::MENU_ONBOARD_MODEL,
             Self::OnboardRoute => crate::menu::registry::MENU_ONBOARD_ROUTE,
@@ -138,6 +141,7 @@ impl MenuProvider for Provider {
         match self {
             Self::Help => MenuBuildResult::Ready(help_menu(ctx)),
             Self::Onboard => onboarding_menu(ctx),
+            Self::OnboardLanguage => MenuBuildResult::Ready(onboarding_language_menu()),
             Self::OnboardFamily => onboarding_family_menu(ctx),
             Self::OnboardModel => onboarding_model_menu(ctx),
             Self::OnboardRoute => onboarding_route_menu(ctx),
@@ -194,13 +198,13 @@ fn help_menu(ctx: &MenuContext<'_>) -> MenuSpec {
 
     MenuSpec {
         id: MenuId::from(MENU_HELP),
-        title: "Slash Commands".into(),
-        subtitle: Some("Commands are resolved by the shared registry.".into()),
+        title: t!("menu.help.title").into_owned(),
+        subtitle: Some(t!("menu.help.subtitle").into_owned()),
         items,
         tabs: Vec::new(),
         searchable: true,
-        search_placeholder: Some("Filter commands".into()),
-        footer_hint: Some("Enter open/run | Esc close".into()),
+        search_placeholder: Some(t!("menu.help.search").into_owned()),
+        footer_hint: Some(t!("menu.help.footer").into_owned()),
         // No right-hand preview: the static "Routing" blurb was internal plumbing
         // info (not actionable) and, with the two-pane split, its text collided
         // with the command column. Each command already carries its own inline
@@ -210,43 +214,117 @@ fn help_menu(ctx: &MenuContext<'_>) -> MenuSpec {
     }
 }
 
-fn lang_menu(_ctx: &MenuContext<'_>) -> MenuSpec {
-    use crate::cli::Lang;
-    let current = rust_i18n::locale().to_string();
-    let items = [
-        ("en", "English", Lang::En),
-        ("zh", "中文 (Chinese)", Lang::Zh),
-    ]
-    .into_iter()
-    .enumerate()
-    .map(|(idx, (id, label, lang))| {
-        let mut state = MenuItemState::default();
-        state.current = current.as_str() == lang.code();
-        let mut item = MenuItem::new(
-            id,
-            label,
-            MenuAction::Local(LocalAction::SetLanguageCode(lang)),
-        )
-        .with_state(state);
-        if let Some(shortcut) = numeric_shortcut(idx) {
-            item = item.with_shortcut(shortcut);
+fn available_language_choices() -> Vec<crate::cli::Lang> {
+    let mut langs = Vec::new();
+    for locale in rust_i18n::available_locales!() {
+        if let Some(lang) = crate::cli::Lang::from_env_value(locale) {
+            if !langs.contains(&lang) {
+                langs.push(lang);
+            }
         }
-        item
-    })
-    .collect();
+    }
+    if langs.is_empty() {
+        langs.extend([crate::cli::Lang::En, crate::cli::Lang::Zh]);
+    }
+    langs.sort_by_key(|lang| match lang {
+        crate::cli::Lang::En => 0,
+        crate::cli::Lang::Zh => 1,
+    });
+    langs
+}
+
+fn current_language() -> crate::cli::Lang {
+    let current = rust_i18n::locale().to_string();
+    crate::cli::Lang::from_env_value(&current).unwrap_or(crate::cli::Lang::En)
+}
+
+fn language_label(lang: crate::cli::Lang) -> String {
+    match lang {
+        crate::cli::Lang::En => t!("menu.lang.item.en.label").into_owned(),
+        crate::cli::Lang::Zh => t!("menu.lang.item.zh.label").into_owned(),
+    }
+}
+
+fn language_description(lang: crate::cli::Lang) -> String {
+    match lang {
+        crate::cli::Lang::En => t!("menu.lang.item.en.desc").into_owned(),
+        crate::cli::Lang::Zh => t!("menu.lang.item.zh.desc").into_owned(),
+    }
+}
+
+fn language_menu_items(id_prefix: &str) -> Vec<MenuItem> {
+    let current = current_language();
+    available_language_choices()
+        .into_iter()
+        .enumerate()
+        .map(|(idx, lang)| {
+            let state = MenuItemState {
+                current: lang == current,
+                ..MenuItemState::default()
+            };
+            let mut item = MenuItem::new(
+                format!("{id_prefix}.{}", lang.code()),
+                language_label(lang),
+                MenuAction::Local(LocalAction::SetLanguageCode(lang)),
+            )
+            .with_description(language_description(lang))
+            .with_state(state);
+            if let Some(shortcut) = numeric_shortcut(idx) {
+                item = item.with_shortcut(shortcut);
+            }
+            item
+        })
+        .collect()
+}
+
+fn lang_menu(_ctx: &MenuContext<'_>) -> MenuSpec {
+    let items = language_menu_items("lang");
 
     MenuSpec {
         id: MenuId::from(crate::menu::registry::MENU_LANG),
-        title: "Language".into(),
-        subtitle: Some("UI display language.".into()),
+        title: t!("menu.lang.title").into_owned(),
+        subtitle: Some(t!("menu.lang.subtitle").into_owned()),
         items,
         tabs: Vec::new(),
         searchable: false,
         search_placeholder: None,
-        footer_hint: Some("Enter apply | Esc close".into()),
+        footer_hint: Some(t!("menu.footer.enter_apply_esc_close").into_owned()),
         preview: None,
         mode: MenuMode::SingleSelect,
     }
+}
+
+fn onboarding_language_menu() -> MenuSpec {
+    let progress = crate::menu::wizard::WizardProgress {
+        current: crate::menu::wizard::WizardStep::Language,
+        done: [false; crate::menu::wizard::WizardStep::ALL.len()],
+    };
+    MenuSpec {
+        id: MenuId::from(MENU_ONBOARD_LANGUAGE),
+        title: t!("onboarding.language.title").into_owned(),
+        subtitle: Some(progress.subtitle()),
+        items: language_menu_items("onboard.language"),
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("onboarding.language.footer").into_owned()),
+        preview: Some(progress.explanation_preview()),
+        mode: MenuMode::SingleSelect,
+    }
+}
+
+fn onboarding_language_row() -> MenuItem {
+    MenuItem::new(
+        "onboard.language",
+        format!(
+            "{}: {}",
+            t!("onboarding.language.label"),
+            language_label(current_language())
+        ),
+        MenuAction::OpenMenu(MenuId::from(MENU_ONBOARD_LANGUAGE)),
+    )
+    .with_description(t!("onboarding.language.description"))
+    .with_state(MenuItemState::required(true))
 }
 
 fn thinking_menu(ctx: &MenuContext<'_>) -> MenuSpec {
@@ -255,22 +333,32 @@ fn thinking_menu(ctx: &MenuContext<'_>) -> MenuSpec {
     let items = [
         (
             "default",
-            "Default",
-            "Use the server default (no per-session override).",
+            t!("menu.thinking.item.default.label"),
+            t!("menu.thinking.item.default.desc"),
             None,
         ),
         (
             "low",
-            "Low",
-            "Minimal reasoning — fastest, cheapest.",
+            t!("menu.thinking.item.low.label"),
+            t!("menu.thinking.item.low.desc"),
             Some(L::Low),
         ),
-        ("medium", "Medium", "Balanced reasoning.", Some(L::Medium)),
-        ("high", "High", "Thorough reasoning.", Some(L::High)),
+        (
+            "medium",
+            t!("menu.thinking.item.medium.label"),
+            t!("menu.thinking.item.medium.desc"),
+            Some(L::Medium),
+        ),
+        (
+            "high",
+            t!("menu.thinking.item.high.label"),
+            t!("menu.thinking.item.high.desc"),
+            Some(L::High),
+        ),
         (
             "max",
-            "Max",
-            "Maximum reasoning (DeepSeek V4; others clamp to high).",
+            t!("menu.thinking.item.max.label"),
+            t!("menu.thinking.item.max.desc"),
             Some(L::Max),
         ),
     ]
@@ -295,13 +383,13 @@ fn thinking_menu(ctx: &MenuContext<'_>) -> MenuSpec {
 
     MenuSpec {
         id: MenuId::from(crate::menu::registry::MENU_THINKING),
-        title: "Thinking effort".into(),
-        subtitle: Some("Reasoning effort for thinking models (this session).".into()),
+        title: t!("menu.thinking.title").into_owned(),
+        subtitle: Some(t!("menu.thinking.subtitle").into_owned()),
         items,
         tabs: Vec::new(),
         searchable: false,
         search_placeholder: None,
-        footer_hint: Some("Enter apply | Esc close".into()),
+        footer_hint: Some(t!("menu.footer.enter_apply_esc_close").into_owned()),
         preview: None,
         mode: MenuMode::SingleSelect,
     }
@@ -310,11 +398,15 @@ fn thinking_menu(ctx: &MenuContext<'_>) -> MenuSpec {
 fn theme_menu(ctx: &MenuContext<'_>) -> MenuSpec {
     let current = ctx.theme_name.unwrap_or("codex");
     let items = [
-        ("terminal", "Terminal", "Use terminal defaults."),
-        ("codex", "Codex", "Neutral dark palette with blue accents."),
-        ("claude", "Claude", "Warm dark palette."),
-        ("slate", "Slate", "Cool dark palette."),
-        ("solarized", "Solarized", "Solarized dark palette."),
+        ("terminal", "Terminal", t!("menu.theme.item.terminal.desc")),
+        ("codex", "Codex", t!("menu.theme.item.codex.desc")),
+        ("claude", "Claude", t!("menu.theme.item.claude.desc")),
+        ("slate", "Slate", t!("menu.theme.item.slate.desc")),
+        (
+            "solarized",
+            "Solarized",
+            t!("menu.theme.item.solarized.desc"),
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -337,15 +429,15 @@ fn theme_menu(ctx: &MenuContext<'_>) -> MenuSpec {
 
     MenuSpec {
         id: MenuId::from(MENU_THEME),
-        title: "Theme".into(),
-        subtitle: Some("Local TUI palette. Does not require AppUI.".into()),
+        title: t!("menu.theme.title").into_owned(),
+        subtitle: Some(t!("menu.theme.subtitle").into_owned()),
         items,
         tabs: Vec::new(),
         searchable: true,
-        search_placeholder: Some("Filter themes".into()),
-        footer_hint: Some("Enter apply | Esc close".into()),
+        search_placeholder: Some(t!("menu.theme.search").into_owned()),
+        footer_hint: Some(t!("menu.footer.enter_apply_esc_close").into_owned()),
         preview: Some(MenuPreview::KeyValues {
-            title: Some("Current".into()),
+            title: Some(t!("menu.theme.preview_title").into_owned()),
             rows: vec![MenuPreviewRow {
                 label: "theme".into(),
                 value: current.into(),
@@ -358,8 +450,8 @@ fn theme_menu(ctx: &MenuContext<'_>) -> MenuSpec {
 fn status_line_menu(ctx: &MenuContext<'_>) -> MenuSpec {
     component_menu(
         MENU_STATUS_LINE,
-        "Status Line",
-        "Choose bottom status line components.",
+        t!("menu.statusline.title").into_owned(),
+        t!("menu.statusline.subtitle").into_owned(),
         &status_line_items(ctx.app.clone()),
         LocalAction::SaveStatusLine,
     )
@@ -368,8 +460,8 @@ fn status_line_menu(ctx: &MenuContext<'_>) -> MenuSpec {
 fn title_menu(ctx: &MenuContext<'_>) -> MenuSpec {
     component_menu(
         MENU_TITLE,
-        "Terminal Title",
-        "Choose terminal title components.",
+        t!("menu.title.title").into_owned(),
+        t!("menu.title.subtitle").into_owned(),
         &title_items(ctx.app.clone()),
         LocalAction::SaveTerminalTitle,
     )
@@ -377,8 +469,8 @@ fn title_menu(ctx: &MenuContext<'_>) -> MenuSpec {
 
 fn component_menu(
     id: &'static str,
-    title: &'static str,
-    subtitle: &'static str,
+    title: String,
+    subtitle: String,
     rows: &[(&'static str, String, bool)],
     save: fn(Vec<String>) -> LocalAction,
 ) -> MenuSpec {
@@ -401,15 +493,15 @@ fn component_menu(
 
     MenuSpec {
         id: MenuId::from(id),
-        title: title.into(),
-        subtitle: Some(subtitle.into()),
+        title,
+        subtitle: Some(subtitle),
         items,
         tabs: Vec::new(),
         searchable: true,
-        search_placeholder: Some("Filter components".into()),
-        footer_hint: Some("Space toggle | Enter save | Esc close".into()),
+        search_placeholder: Some(t!("menu.component.search").into_owned()),
+        footer_hint: Some(t!("menu.component.footer").into_owned()),
         preview: Some(MenuPreview::Text {
-            title: Some("Preview".into()),
+            title: Some(t!("menu.component.preview_title").into_owned()),
             body: selected.join(" | "),
         }),
         mode: MenuMode::MultiSelect {
@@ -422,42 +514,62 @@ fn component_menu(
 
 fn keymap_menu() -> MenuSpec {
     let rows = [
-        ("global.quit", "Ctrl+Q", "Quit the TUI."),
-        ("global.interrupt", "Ctrl+C", "Interrupt the active turn."),
+        (
+            "global.quit",
+            "Ctrl+Q",
+            t!("menu.keymap.item.global_quit.desc"),
+        ),
+        (
+            "global.interrupt",
+            "Ctrl+C",
+            t!("menu.keymap.item.global_interrupt.desc"),
+        ),
         (
             "composer.submit",
             "Enter",
-            "Submit composer or exact slash command.",
+            t!("menu.keymap.item.composer_submit.desc"),
         ),
         (
             "composer.move-line",
             "Ctrl+A/E",
-            "Move composer cursor to line start/end.",
+            t!("menu.keymap.item.composer_move_line.desc"),
         ),
         (
             "composer.move-char",
             "Ctrl+B/F",
-            "Move composer cursor left/right.",
+            t!("menu.keymap.item.composer_move_char.desc"),
         ),
         (
             "composer.move-word",
             "Alt+B/F",
-            "Move composer cursor by word.",
+            t!("menu.keymap.item.composer_move_word.desc"),
         ),
         (
             "composer.delete-word",
             "Ctrl+W",
-            "Delete previous composer word.",
+            t!("menu.keymap.item.composer_delete_word.desc"),
         ),
         (
             "composer.kill-line",
             "Ctrl+K",
-            "Delete composer text to line end.",
+            t!("menu.keymap.item.composer_kill_line.desc"),
         ),
-        ("menu.accept", "Enter", "Accept highlighted menu row."),
-        ("menu.cancel", "Esc", "Close the active menu."),
-        ("menu.next", "Down/J", "Move to next row."),
-        ("menu.previous", "Up/K", "Move to previous row."),
+        (
+            "menu.accept",
+            "Enter",
+            t!("menu.keymap.item.menu_accept.desc"),
+        ),
+        (
+            "menu.cancel",
+            "Esc",
+            t!("menu.keymap.item.menu_cancel.desc"),
+        ),
+        ("menu.next", "Down/J", t!("menu.keymap.item.menu_next.desc")),
+        (
+            "menu.previous",
+            "Up/K",
+            t!("menu.keymap.item.menu_previous.desc"),
+        ),
     ];
     let items = rows
         .into_iter()
@@ -468,16 +580,16 @@ fn keymap_menu() -> MenuSpec {
 
     MenuSpec {
         id: MenuId::from(MENU_KEYMAP),
-        title: "Keymap".into(),
-        subtitle: Some("Current TUI key bindings.".into()),
+        title: t!("menu.keymap.title").into_owned(),
+        subtitle: Some(t!("menu.keymap.subtitle").into_owned()),
         items,
         tabs: keymap_tabs(),
         searchable: true,
-        search_placeholder: Some("Filter key bindings".into()),
-        footer_hint: Some("Esc close".into()),
+        search_placeholder: Some(t!("menu.keymap.search").into_owned()),
+        footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
         preview: Some(MenuPreview::Text {
-            title: Some("Editing".into()),
-            body: "This slice exposes the menu surface. Persisted keymap editing remains a follow-up provider action.".into(),
+            title: Some(t!("menu.keymap.preview_title").into_owned()),
+            body: t!("menu.keymap.preview_body").into_owned(),
         }),
         mode: MenuMode::SingleSelect,
     }
@@ -485,10 +597,18 @@ fn keymap_menu() -> MenuSpec {
 
 fn status_menu(ctx: &MenuContext<'_>) -> MenuSpec {
     let mut items = vec![
-        MenuItem::new("status.snapshot", "Snapshot status", MenuAction::Noop)
-            .with_description(ctx.app.status.unwrap_or("no status supplied")),
-        MenuItem::new("status.connection", "Connection", MenuAction::Noop)
-            .with_description(ctx.app.target.unwrap_or("local/offline")),
+        MenuItem::new(
+            "status.snapshot",
+            t!("menu.status.item.snapshot.label"),
+            MenuAction::Noop,
+        )
+        .with_description(ctx.app.status.unwrap_or("no status supplied")),
+        MenuItem::new(
+            "status.connection",
+            t!("menu.status.item.connection.label"),
+            MenuAction::Noop,
+        )
+        .with_description(ctx.app.target.unwrap_or("local/offline")),
     ];
 
     items.extend(status_runtime_items(ctx));
@@ -501,7 +621,7 @@ fn status_menu(ctx: &MenuContext<'_>) -> MenuSpec {
             items.push(
                 MenuItem::new(
                     "status.refresh",
-                    "Refresh server status",
+                    t!("menu.status.item.refresh.label"),
                     MenuAction::SendAppUi(AppUiCommand::ReadSessionStatus(
                         SessionStatusReadParams { session_id },
                     )),
@@ -510,17 +630,25 @@ fn status_menu(ctx: &MenuContext<'_>) -> MenuSpec {
             );
         } else {
             items.push(
-                MenuItem::new("status.refresh", "Refresh server status", MenuAction::Noop)
-                    .disabled(format!(
-                        "AppUI method `{}` is not advertised",
-                        AppUiActionKind::SessionStatusRead.method()
-                    )),
+                MenuItem::new(
+                    "status.refresh",
+                    t!("menu.status.item.refresh.label"),
+                    MenuAction::Noop,
+                )
+                .disabled(format!(
+                    "Octos UI method `{}` is not advertised",
+                    AppUiActionKind::SessionStatusRead.method()
+                )),
             );
         }
     } else {
         items.push(
-            MenuItem::new("status.refresh", "Refresh server status", MenuAction::Noop)
-                .disabled("server status requires an open AppUI session"),
+            MenuItem::new(
+                "status.refresh",
+                t!("menu.status.item.refresh.label"),
+                MenuAction::Noop,
+            )
+            .disabled("server status requires an open Octos UI session"),
         );
     }
 
@@ -528,15 +656,15 @@ fn status_menu(ctx: &MenuContext<'_>) -> MenuSpec {
 
     MenuSpec {
         id: MenuId::from(MENU_STATUS),
-        title: "Status".into(),
-        subtitle: Some("Snapshot-backed status; server-owned fields are capability gated.".into()),
+        title: t!("menu.status.title").into_owned(),
+        subtitle: Some(t!("menu.status.subtitle").into_owned()),
         items,
         tabs: Vec::new(),
         searchable: false,
         search_placeholder: None,
-        footer_hint: Some("Esc close".into()),
+        footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
         preview: Some(MenuPreview::KeyValues {
-            title: Some("Snapshot".into()),
+            title: Some(t!("menu.status.preview_title").into_owned()),
             rows: status_preview_rows(ctx),
         }),
         mode: MenuMode::SingleSelect,
@@ -547,9 +675,9 @@ fn cost_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let Some(session_id) = ctx.app.selected_session_id.cloned() else {
         return MenuBuildResult::Unavailable(MenuStatusSpec {
             id: MenuId::from(MENU_COST),
-            title: "Cost unavailable".into(),
-            message: "Usage totals require an open AppUI session.".into(),
-            footer_hint: Some("Esc close".into()),
+            title: t!("menu.cost.unavailable_title").into_owned(),
+            message: t!("menu.cost.unavailable_no_session").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
         });
     };
 
@@ -559,16 +687,16 @@ fn cost_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     {
         return MenuBuildResult::Unavailable(MenuStatusSpec {
             id: MenuId::from(MENU_COST),
-            title: "Cost unavailable".into(),
+            title: t!("menu.cost.unavailable_title").into_owned(),
             message: method_missing_reason(ctx, AppUiActionKind::SessionStatusRead.method()),
-            footer_hint: Some("Esc close".into()),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
         });
     }
 
     let mut items = vec![
         MenuItem::new(
             "cost.refresh",
-            "Refresh usage",
+            t!("menu.cost.item.refresh.label"),
             MenuAction::SendAppUi(AppUiCommand::ReadSessionStatus(SessionStatusReadParams {
                 session_id,
             })),
@@ -579,44 +707,60 @@ fn cost_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     if let Some(status) = ctx.app.runtime_status {
         if let Some(usage) = &status.usage {
             items.extend([
-                usage_item("cost.input", "Input Tokens", usage.input_tokens),
-                usage_item("cost.output", "Output Tokens", usage.output_tokens),
+                usage_item(
+                    "cost.input",
+                    t!("menu.cost.item.input_tokens.label").into_owned(),
+                    usage.input_tokens,
+                ),
+                usage_item(
+                    "cost.output",
+                    t!("menu.cost.item.output_tokens.label").into_owned(),
+                    usage.output_tokens,
+                ),
                 usage_item(
                     "cost.cached_input",
-                    "Cached Input",
+                    t!("menu.cost.item.cached_input.label").into_owned(),
                     usage.cached_input_tokens,
                 ),
                 usage_item(
                     "cost.cached_output",
-                    "Cached Output",
+                    t!("menu.cost.item.cached_output.label").into_owned(),
                     usage.cached_output_tokens,
                 ),
                 cost_item(usage.estimated_cost_micros_usd),
             ]);
         } else {
             items.push(
-                MenuItem::new("cost.empty", "No usage totals", MenuAction::Noop)
-                    .disabled("session/status/read returned no usage totals yet"),
+                MenuItem::new(
+                    "cost.empty",
+                    t!("menu.cost.item.empty.label"),
+                    MenuAction::Noop,
+                )
+                .disabled("session/status/read returned no usage totals yet"),
             );
         }
     } else {
         items.push(
-            MenuItem::new("cost.cached", "Server usage totals", MenuAction::Noop)
-                .disabled("session/status/read is advertised but no result is cached yet"),
+            MenuItem::new(
+                "cost.cached",
+                t!("menu.cost.item.cached.label"),
+                MenuAction::Noop,
+            )
+            .disabled("session/status/read is advertised but no result is cached yet"),
         );
     }
 
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(MENU_COST),
-        title: "Cost".into(),
-        subtitle: Some("Server-reported token and cost usage.".into()),
+        title: t!("menu.cost.title").into_owned(),
+        subtitle: Some(t!("menu.cost.subtitle").into_owned()),
         items,
         tabs: Vec::new(),
         searchable: false,
         search_placeholder: None,
-        footer_hint: Some("Enter refresh | Esc close".into()),
+        footer_hint: Some(t!("menu.cost.footer").into_owned()),
         preview: Some(MenuPreview::KeyValues {
-            title: Some("Runtime".into()),
+            title: Some(t!("menu.runtime_preview_title").into_owned()),
             rows: status_preview_rows(ctx),
         }),
         mode: MenuMode::SingleSelect,
@@ -627,9 +771,9 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     if !supports_any_method(ctx, APPUI_ONBOARDING_METHODS_ANY) {
         return MenuBuildResult::Unavailable(MenuStatusSpec {
             id: MenuId::from(MENU_ONBOARD),
-            title: "Onboarding unavailable".into(),
+            title: t!("menu.onboard.unavailable_title").into_owned(),
             message: method_missing_reason(ctx, APPUI_METHOD_AUTH_STATUS),
-            footer_hint: Some("Esc close".into()),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
         });
     }
 
@@ -651,69 +795,87 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
 
     let mut items = if local_profile_create {
         vec![
+            onboarding_language_row(),
             MenuItem::new(
                 "onboard.local.status",
                 onboarding_local_profile_label(state),
                 MenuAction::Noop,
             )
-            .with_description("Use /onboard name, /onboard username, and /onboard email."),
+            .with_description(t!("menu.onboard.item.local_status.desc")),
             MenuItem::new(
                 "onboard.local.name",
                 if state.has_name() {
-                    format!("Name: {}", state.name)
+                    format!("{}: {}", t!("onboarding.field.full_name"), state.name)
                 } else {
-                    "Name: not set".into()
+                    format!(
+                        "{}: {}",
+                        t!("onboarding.field.full_name"),
+                        t!("onboarding.value_not_set")
+                    )
                 },
                 MenuAction::Noop,
             )
-            .with_description("Use /onboard name <display name>.")
+            .with_description(t!("menu.onboard.item.local_name.desc"))
             .with_state(MenuItemState::required(state.has_name())),
             MenuItem::new(
                 "onboard.local.username",
                 if state.has_username() {
-                    format!("Username: {}", state.username)
+                    format!("{}: {}", t!("onboarding.field.username"), state.username)
                 } else {
-                    "Username: not set".into()
+                    format!(
+                        "{}: {}",
+                        t!("onboarding.field.username"),
+                        t!("onboarding.value_not_set")
+                    )
                 },
                 MenuAction::Noop,
             )
-            .with_description("Use /onboard username <local handle>.")
+            .with_description(t!("menu.onboard.item.local_username.desc"))
             .with_state(MenuItemState::required(state.has_username())),
             MenuItem::new(
                 "onboard.local.email",
                 if state.has_email() {
-                    format!("Email: {}", state.email)
+                    format!("{}: {}", t!("onboarding.field.email"), state.email)
                 } else {
-                    "Email: not set".into()
+                    format!(
+                        "{}: {}",
+                        t!("onboarding.field.email"),
+                        t!("onboarding.value_not_set")
+                    )
                 },
                 MenuAction::Noop,
             )
-            .with_description("Use /onboard email <address>. Email is local metadata only.")
+            .with_description(t!("menu.onboard.item.local_email.desc"))
             .with_state(MenuItemState::required(state.has_email())),
             MenuItem::new(
                 "onboard.local.create",
-                "Create local profile",
+                t!("menu.onboard.item.local_create.label"),
                 MenuAction::Local(LocalAction::Onboarding(
                     OnboardingAction::CreateLocalProfile,
                 )),
             )
-            .with_description("Uses profile/local/create; no OTP is sent.")
+            .with_description(t!("menu.onboard.item.local_create.desc"))
             .maybe_disabled(onboarding_local_profile_disabled_reason(state)),
         ]
     } else {
         vec![
-            MenuItem::new("onboard.status.auth", onboarding_auth_label(state), MenuAction::Noop)
-                .with_description("Use /onboard email <address>, /onboard send-code, /onboard code <otp>, then /onboard verify."),
+            onboarding_language_row(),
+            MenuItem::new(
+                "onboard.status.auth",
+                onboarding_auth_label(state),
+                MenuAction::Noop,
+            )
+            .with_description(t!("menu.onboard.item.auth_status.desc")),
             MenuItem::new(
                 "onboard.auth.status",
-                "Refresh auth status",
+                t!("menu.onboard.item.auth_refresh.label"),
                 MenuAction::SendAppUi(AppUiCommand::AuthStatus(AuthStatusParams::default())),
             )
             .with_description("Uses auth/status.")
             .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_AUTH_STATUS)),
             MenuItem::new(
                 "onboard.auth.send",
-                "Send email OTP",
+                t!("menu.onboard.item.auth_send.label"),
                 MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SendCode)),
             )
             .with_description("Uses auth/send_code with the wizard email.")
@@ -721,18 +883,17 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                 ctx,
                 state,
                 APPUI_METHOD_AUTH_SEND_CODE,
-                "email is empty",
             )),
             MenuItem::new(
                 "onboard.auth.verify",
-                "Verify OTP",
+                t!("menu.onboard.item.auth_verify.label"),
                 MenuAction::Local(LocalAction::Onboarding(OnboardingAction::VerifyCode)),
             )
-            .with_description("Uses auth/verify. The token is held in memory and never rendered.")
+            .with_description(t!("menu.onboard.item.auth_verify.desc"))
             .maybe_disabled(onboarding_verify_disabled_reason(ctx, state)),
             MenuItem::new(
                 "onboard.auth.me",
-                "Refresh account",
+                t!("menu.onboard.item.auth_me.label"),
                 MenuAction::SendAppUi(AppUiCommand::AuthMe(AuthMeParams {
                     token: state.auth_token.clone(),
                 })),
@@ -745,12 +906,10 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     items.push(
         MenuItem::new(
             "onboard.catalog.refresh",
-            "Refresh dashboard provider catalog",
+            t!("menu.onboard.item.catalog_refresh.label"),
             MenuAction::Local(LocalAction::Onboarding(OnboardingAction::RefreshCatalog)),
         )
-        .with_description(
-            "Uses profile/llm/catalog. The catalog schema is owned by octos/dashboard.",
-        )
+        .with_description(t!("menu.onboard.item.catalog_refresh.desc"))
         .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_CATALOG)),
     );
 
@@ -759,35 +918,47 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     items.extend([
         MenuItem::new(
             "onboard.provider.current",
-            format!("Provider: {}", state.provider_label()),
+            format!(
+                "{}: {}",
+                t!("menu.onboard.item.provider_current.label"),
+                state.provider_label()
+            ),
             MenuAction::Noop,
         )
-        .with_description("Use /onboard family, /onboard model, /onboard route, /onboard base-url, and /onboard api-key-env for custom providers.")
+        .with_description(t!("menu.onboard.item.provider_current.desc"))
         .with_state(MenuItemState::required(state.selection_ready())),
         MenuItem::new(
             "onboard.provider.key",
             if state.has_api_key() {
-                format!("API key: {}", state.api_key_label())
+                format!(
+                    "{}: {}",
+                    t!("menu.onboard.item.api_key.label"),
+                    state.api_key_label()
+                )
             } else {
-                "API key: not set".into()
+                format!(
+                    "{}: {}",
+                    t!("menu.onboard.item.api_key.label"),
+                    t!("onboarding.value_not_set")
+                )
             },
             MenuAction::Noop,
         )
-        .with_description("Use /onboard key <secret>. The secret is masked in state, logs, and snapshots.")
+        .with_description(t!("menu.onboard.item.api_key.desc"))
         .with_state(MenuItemState::required(state.has_api_key())),
         MenuItem::new(
             "onboard.provider.fetch",
-            "Fetch route models",
+            t!("menu.onboard.item.fetch_models.label"),
             MenuAction::Local(LocalAction::Onboarding(OnboardingAction::FetchModels)),
         )
-        .with_description("Uses profile/llm/fetch_models for custom OpenAI-compatible routes.")
+        .with_description(t!("menu.onboard.item.fetch_models.desc"))
         .maybe_disabled(onboarding_fetch_models_disabled_reason(ctx, state)),
         MenuItem::new(
             "onboard.provider.test",
-            "Test provider",
+            t!("menu.onboard.item.test_provider.label"),
             MenuAction::Local(LocalAction::Onboarding(OnboardingAction::TestProvider)),
         )
-        .with_description("Uses profile/llm/test with the selected dashboard schema route.")
+        .with_description(t!("menu.onboard.item.test_provider.desc"))
         .maybe_disabled(onboarding_provider_disabled_reason(
             ctx,
             state,
@@ -795,10 +966,10 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         )),
         MenuItem::new(
             "onboard.provider.save",
-            "Save provider to profile",
+            t!("menu.onboard.item.save_provider.label"),
             MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SaveProvider)),
         )
-        .with_description("Uses profile/llm/upsert and persists to the same profile JSON as the dashboard.")
+        .with_description(t!("menu.onboard.item.save_provider.desc"))
         .maybe_disabled(onboarding_provider_disabled_reason(
             ctx,
             state,
@@ -806,17 +977,17 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         )),
         MenuItem::new(
             "onboard.providers.refresh",
-            "Refresh configured providers",
+            t!("menu.onboard.item.providers_refresh.label"),
             MenuAction::Local(LocalAction::Onboarding(OnboardingAction::RefreshProviders)),
         )
         .with_description("Uses profile/llm/list.")
         .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_MODEL_LIST)),
         MenuItem::new(
             "onboard.finish",
-            "Finish and open coding session",
+            t!("menu.onboard.item.finish.label"),
             MenuAction::Local(LocalAction::Onboarding(OnboardingAction::Finish)),
         )
-        .with_description("Uses session/open with the resolved profile.")
+        .with_description(t!("menu.onboard.item.finish.desc"))
         .maybe_disabled(onboarding_finish_disabled_reason(
             ctx,
             state,
@@ -824,7 +995,7 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         )),
         MenuItem::new(
             "onboard.reset",
-            "Reset wizard state",
+            t!("menu.onboard.item.reset.label"),
             MenuAction::Local(LocalAction::Onboarding(OnboardingAction::Reset)),
         ),
     ]);
@@ -837,15 +1008,15 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
 
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(MENU_ONBOARD),
-        title: "Onboarding".into(),
-        subtitle: Some("Login, select a dashboard-catalog model route, save it to the profile JSON, then open a session.".into()),
+        title: t!("menu.onboard.title").into_owned(),
+        subtitle: Some(t!("menu.onboard.subtitle").into_owned()),
         items,
         tabs: Vec::new(),
         searchable: true,
-        search_placeholder: Some("Filter onboarding actions".into()),
-        footer_hint: Some("Use /onboard <field> <value> for text input | Enter run | Esc close".into()),
+        search_placeholder: Some(t!("menu.onboard.search").into_owned()),
+        footer_hint: Some(t!("menu.onboard.footer").into_owned()),
         preview: Some(MenuPreview::KeyValues {
-            title: Some("Wizard State".into()),
+            title: Some(t!("menu.onboard.preview_title").into_owned()),
             rows: onboarding_preview_rows(state, current_profile),
         }),
         mode: MenuMode::SingleSelect,
@@ -865,32 +1036,40 @@ fn onboarding_provider_setup_menu(
         MenuItem::new(
             "onboard.catalog.refresh",
             if ctx.app.profile_llm_catalog.is_some() {
-                "Reload provider catalog"
+                t!("menu.onboard.item.catalog_reload.label")
             } else {
-                "Load provider catalog"
+                t!("menu.onboard.item.catalog_load.label")
             },
             MenuAction::Local(LocalAction::Onboarding(OnboardingAction::RefreshCatalog)),
         )
-        .with_description("Load dashboard model families and provider routes")
+        .with_description(t!("menu.onboard.item.catalog_load.desc"))
         .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_CATALOG)),
     ];
 
     items.extend([
         MenuItem::new(
             "onboard.provider.family",
-            format!("Model family: {}", onboarding_family_label(state)),
+            format!(
+                "{}: {}",
+                t!("menu.onboard.item.family.label"),
+                onboarding_family_label(state)
+            ),
             MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY)),
         )
-        .with_description("Choose family")
+        .with_description(t!("menu.onboard.item.family.desc"))
         .with_state(MenuItemState::required(
             !state.provider.family_id.trim().is_empty(),
         )),
         MenuItem::new(
             "onboard.provider.model",
-            format!("Model: {}", onboarding_model_label(state)),
+            format!(
+                "{}: {}",
+                t!("menu.onboard.item.model.label"),
+                onboarding_model_label(state)
+            ),
             MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL)),
         )
-        .with_description("Choose model")
+        .with_description(t!("menu.onboard.item.model.desc"))
         .with_state(MenuItemState::required(
             !state.provider.model_id.trim().is_empty(),
         ))
@@ -900,37 +1079,45 @@ fn onboarding_provider_setup_menu(
                 .family_id
                 .trim()
                 .is_empty()
-                .then_some("choose family first".into())
+                .then(|| t!("onboarding.disabled.choose_family_first").into_owned())
         }),
         MenuItem::new(
             "onboard.provider.route",
-            format!("Provider route: {}", onboarding_route_label(state)),
+            format!(
+                "{}: {}",
+                t!("menu.onboard.item.route.label"),
+                onboarding_route_label(state)
+            ),
             MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_ROUTE)),
         )
-        .with_description("Choose official or alternative provider")
+        .with_description(t!("menu.onboard.item.route.desc"))
         .with_state(MenuItemState::required(
             !state.provider.route.route_id.trim().is_empty(),
         ))
         .maybe_disabled(
-            (!onboarding_model_selected(state)).then_some("choose family and model first".into()),
+            (!onboarding_model_selected(state))
+                .then(|| t!("onboarding.disabled.choose_family_model_first").into_owned()),
         ),
     ]);
 
     items.extend([
         onboarding_edit_item(
             "onboard.provider.key",
-            "API key",
+            t!("menu.onboard.item.api_key.label").as_ref(),
             state.has_api_key().then_some(state.api_key_label()),
             "/onboard key ",
         )
         .with_state(MenuItemState::required(state.has_api_key()))
-        .maybe_disabled((!state.selection_ready()).then_some("choose provider first".into())),
+        .maybe_disabled(
+            (!state.selection_ready())
+                .then(|| t!("onboarding.disabled.choose_provider_first").into_owned()),
+        ),
         MenuItem::new(
             "onboard.provider.test",
             onboarding_provider_test_label(state),
             MenuAction::Local(LocalAction::Onboarding(OnboardingAction::TestProvider)),
         )
-        .with_description("Verify the selected provider route")
+        .with_description(t!("menu.onboard.item.verify_provider.desc"))
         .with_state(onboarding_provider_test_state(state))
         .maybe_disabled(onboarding_provider_disabled_reason(
             ctx,
@@ -942,7 +1129,7 @@ fn onboarding_provider_setup_menu(
             onboarding_provider_save_label(state),
             MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SaveProvider)),
         )
-        .with_description("Persist provider to the profile JSON")
+        .with_description(t!("menu.onboard.item.persist_provider.desc"))
         .with_state(onboarding_provider_save_state(state))
         .maybe_disabled(onboarding_provider_disabled_reason(
             ctx,
@@ -956,7 +1143,7 @@ fn onboarding_provider_setup_menu(
                 OnboardingAction::SaveProviderFallback,
             )),
         )
-        .with_description("Append or replace this route under config.llm.fallbacks")
+        .with_description(t!("menu.onboard.item.fallback_provider.desc"))
         .with_state(onboarding_provider_save_state(state))
         .maybe_disabled(onboarding_provider_disabled_reason(
             ctx,
@@ -1007,7 +1194,7 @@ fn onboarding_provider_setup_menu(
         items,
         tabs: Vec::new(),
         searchable: true,
-        search_placeholder: Some("Filter setup actions".into()),
+        search_placeholder: Some(t!("menu.onboard.search").into_owned()),
         footer_hint: Some(progress.footer_hint(&next_action)),
         preview: Some(onboarding_provider_preview(
             &progress,
@@ -1029,13 +1216,16 @@ fn onboarding_provider_preview(
 ) -> MenuPreview {
     let mut preview = progress.explanation_preview();
     if let MenuPreview::Text { body, .. } = &mut preview {
-        body.push_str("\n\nConfigured (read-only here):");
+        body.push_str("\n\n");
+        body.push_str(&t!("onboarding.preview.provider.configured_title"));
         body.push_str(&format!(
-            "\n• Profile: {}",
+            "\n• {}: {}",
+            t!("onboarding.preview.provider.profile"),
             state.profile_label(current_profile)
         ));
         body.push_str(&format!(
-            "\n• Selected provider: {}",
+            "\n• {}: {}",
+            t!("onboarding.preview.provider.selected"),
             state.provider_label()
         ));
         // `onboarding_provider_saved_status_label` already carries its own prefix.
@@ -1073,10 +1263,10 @@ fn onboarding_workspace_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let mut items = vec![
         MenuItem::new(
             "onboard.workspace.validate",
-            "Validate workspace",
+            t!("menu.onboard.item.workspace_validate.label"),
             MenuAction::Local(LocalAction::Onboarding(OnboardingAction::ValidateWorkspace)),
         )
-        .with_description("Probe the staged path; required before you can activate."),
+        .with_description(t!("menu.onboard.item.workspace_validate.desc")),
         // The final ACTIVATE step: after model config + test + save succeed and
         // the workspace validates, this is the one explicit action that opens
         // the coding session and drops the user into the working surface.
@@ -1151,12 +1341,17 @@ fn onboarding_workspace_preview(
 ) -> MenuPreview {
     let mut preview = progress.explanation_preview();
     if let MenuPreview::Text { body, .. } = &mut preview {
-        body.push_str("\n\nStaged (set via commands — not selectable here):");
+        body.push_str("\n\n");
+        body.push_str(&t!("onboarding.preview.workspace.staged_title"));
         body.push_str(&format!(
-            "\n• Workspace: {}",
+            "\n• {}: {}",
+            t!("onboarding.preview.workspace.workspace"),
             onboarding_workspace_display(state, active_workspace)
         ));
-        body.push_str("\n    /onboard workspace <path>   (try `.` for the current folder)");
+        body.push_str(&format!(
+            "\n    {}",
+            t!("onboarding.preview.workspace.workspace_hint")
+        ));
         // `onboarding_workspace_status_label` already carries the `Status:` prefix.
         body.push_str(&format!("\n• {}", onboarding_workspace_status_label(state)));
         // `onboarding_permission_profile_label` already carries the `Permissions:` prefix.
@@ -1164,7 +1359,10 @@ fn onboarding_workspace_preview(
             "\n• {}",
             onboarding_permission_profile_label(state)
         ));
-        body.push_str("\n    /onboard permissions <default|read-only|workspace-write|full-access>");
+        body.push_str(&format!(
+            "\n    {}",
+            t!("onboarding.preview.workspace.permissions_hint")
+        ));
     }
     preview
 }
@@ -1217,6 +1415,7 @@ fn onboarding_next_action_hint(
 
 fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResult {
     let items = vec![
+        onboarding_language_row(),
         MenuItem::new(
             "onboard.local.status",
             t!("onboarding.local.title"),
@@ -1255,10 +1454,11 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
         .maybe_disabled(onboarding_local_profile_disabled_reason(state)),
     ];
 
-    // Wizard framing: this is Step 1 (Profile). The local-create branch is only
-    // reached when `profile/local/create` is supported AND no profile is
-    // resolved yet, so progress is computed with `local_create_supported = true`
-    // and `current_profile = None`.
+    // Wizard framing: the language step is already satisfied by the default
+    // English locale, so this screen is the first required profile input step.
+    // The local-create branch is only reached when `profile/local/create` is
+    // supported AND no profile is resolved yet, so progress is computed with
+    // `local_create_supported = true` and `current_profile = None`.
     let progress = crate::menu::wizard::WizardProgress::from_state(state, None, true);
     let next_action = if state.local_profile_ready() {
         t!("onboarding.wizard.next.local_continue")
@@ -1288,9 +1488,9 @@ fn onboarding_family_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let Some(catalog) = ctx.app.profile_llm_catalog else {
         return MenuBuildResult::Unavailable(MenuStatusSpec {
             id: MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY),
-            title: "Model Family".into(),
-            message: "Load provider catalog first.".into(),
-            footer_hint: Some("Esc back".into()),
+            title: t!("menu.onboard.family.title").into_owned(),
+            message: t!("menu.onboard.unavailable_catalog_msg").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
         });
     };
     let default_state;
@@ -1331,13 +1531,13 @@ fn onboarding_family_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
 
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY),
-        title: "Choose Model Family".into(),
-        subtitle: Some("Dashboard model families.".into()),
+        title: t!("menu.onboard.family.title").into_owned(),
+        subtitle: Some(t!("menu.onboard.family.subtitle").into_owned()),
         items,
         tabs: Vec::new(),
         searchable: true,
-        search_placeholder: Some("Filter families".into()),
-        footer_hint: Some("Enter choose family | Esc back".into()),
+        search_placeholder: Some(t!("menu.onboard.family.search").into_owned()),
+        footer_hint: Some(t!("menu.onboard.family.footer").into_owned()),
         preview: None,
         mode: MenuMode::SingleSelect,
     })
@@ -1355,17 +1555,17 @@ fn onboarding_model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     if family_id.is_empty() {
         return MenuBuildResult::Unavailable(MenuStatusSpec {
             id: MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL),
-            title: "Choose Model".into(),
-            message: "Choose a model family first.".into(),
-            footer_hint: Some("Esc back".into()),
+            title: t!("menu.onboard.model.title").into_owned(),
+            message: t!("menu.onboard.unavailable_family_msg").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
         });
     }
     let Some(catalog) = ctx.app.profile_llm_catalog else {
         return MenuBuildResult::Unavailable(MenuStatusSpec {
             id: MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL),
-            title: "Choose Model".into(),
-            message: "Load provider catalog first.".into(),
-            footer_hint: Some("Esc back".into()),
+            title: t!("menu.onboard.model.title").into_owned(),
+            message: t!("menu.onboard.unavailable_catalog_msg").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
         });
     };
     let Some(models) = catalog
@@ -1376,9 +1576,9 @@ fn onboarding_model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     else {
         return MenuBuildResult::Unavailable(MenuStatusSpec {
             id: MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL),
-            title: "Choose Model".into(),
+            title: t!("menu.onboard.model.title").into_owned(),
             message: format!("No models found for family `{family_id}`."),
-            footer_hint: Some("Esc back".into()),
+            footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
         });
     };
     let mut items = models
@@ -1408,13 +1608,13 @@ fn onboarding_model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
 
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL),
-        title: "Choose Model".into(),
+        title: t!("menu.onboard.model.title").into_owned(),
         subtitle: Some(format!("Family: {family_id}")),
         items,
         tabs: Vec::new(),
         searchable: true,
-        search_placeholder: Some("Filter models".into()),
-        footer_hint: Some("Enter choose model | Esc back".into()),
+        search_placeholder: Some(t!("menu.onboard.model.search").into_owned()),
+        footer_hint: Some(t!("menu.onboard.model.footer").into_owned()),
         preview: None,
         mode: MenuMode::SingleSelect,
     })
@@ -1431,17 +1631,17 @@ fn onboarding_route_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     if !onboarding_model_selected(state) {
         return MenuBuildResult::Unavailable(MenuStatusSpec {
             id: MenuId::from(crate::menu::registry::MENU_ONBOARD_ROUTE),
-            title: "Choose Provider Route".into(),
-            message: "Choose a family and model first.".into(),
-            footer_hint: Some("Esc back".into()),
+            title: t!("menu.onboard.route.title").into_owned(),
+            message: t!("menu.onboard.unavailable_model_msg").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
         });
     }
     let Some(catalog) = ctx.app.profile_llm_catalog else {
         return MenuBuildResult::Unavailable(MenuStatusSpec {
             id: MenuId::from(crate::menu::registry::MENU_ONBOARD_ROUTE),
-            title: "Choose Provider Route".into(),
-            message: "Load provider catalog first.".into(),
-            footer_hint: Some("Esc back".into()),
+            title: t!("menu.onboard.route.title").into_owned(),
+            message: t!("menu.onboard.unavailable_catalog_msg").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
         });
     };
     let mut choices = catalog_choices(&catalog.families)
@@ -1474,7 +1674,7 @@ fn onboarding_route_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
 
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(crate::menu::registry::MENU_ONBOARD_ROUTE),
-        title: "Choose Provider Route".into(),
+        title: t!("menu.onboard.route.title").into_owned(),
         subtitle: Some(format!(
             "{} / {}",
             state.provider.family_id, state.provider.model_id
@@ -1482,8 +1682,8 @@ fn onboarding_route_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         items,
         tabs: Vec::new(),
         searchable: true,
-        search_placeholder: Some("Filter provider routes".into()),
-        footer_hint: Some("Enter choose route | Esc back".into()),
+        search_placeholder: Some(t!("menu.onboard.route.search").into_owned()),
+        footer_hint: Some(t!("menu.onboard.route.footer").into_owned()),
         preview: None,
         mode: MenuMode::SingleSelect,
     })
@@ -1507,29 +1707,25 @@ fn onboarding_edit_item(
     .with_description(t!("onboarding.action_edit"))
 }
 
-fn onboarding_family_label(state: &OnboardingWizardState) -> &str {
-    state
-        .provider
-        .family_id
-        .trim()
-        .is_empty()
-        .then_some("not selected")
-        .unwrap_or(state.provider.family_id.as_str())
+fn onboarding_family_label(state: &OnboardingWizardState) -> String {
+    if state.provider.family_id.trim().is_empty() {
+        t!("onboarding.value_not_set").into_owned()
+    } else {
+        state.provider.family_id.clone()
+    }
 }
 
-fn onboarding_model_label(state: &OnboardingWizardState) -> &str {
-    state
-        .provider
-        .model_id
-        .trim()
-        .is_empty()
-        .then_some("not selected")
-        .unwrap_or(state.provider.model_id.as_str())
+fn onboarding_model_label(state: &OnboardingWizardState) -> String {
+    if state.provider.model_id.trim().is_empty() {
+        t!("onboarding.value_not_set").into_owned()
+    } else {
+        state.provider.model_id.clone()
+    }
 }
 
 fn onboarding_route_label(state: &OnboardingWizardState) -> String {
     if state.provider.route.route_id.trim().is_empty() {
-        "not selected".into()
+        t!("onboarding.value_not_set").into_owned()
     } else {
         state
             .provider
@@ -1547,23 +1743,31 @@ fn onboarding_model_selected(state: &OnboardingWizardState) -> bool {
 
 fn onboarding_auth_label(state: &OnboardingWizardState) -> String {
     if state.auth_verified {
-        "Auth: verified".into()
+        t!("onboarding.auth.verified").into_owned()
     } else if state.auth_code_sent {
-        format!("Auth: code sent to {}", state.email)
+        t!("onboarding.auth.code_sent", email = state.email.clone()).into_owned()
     } else if state.has_email() {
-        format!("Auth: email {}", state.email)
+        t!("onboarding.auth.email", email = state.email.clone()).into_owned()
     } else {
-        "Auth: email not set".into()
+        t!("onboarding.auth.email_not_set").into_owned()
     }
 }
 
 fn onboarding_local_profile_label(state: &OnboardingWizardState) -> String {
     if state.local_profile_created {
-        format!("Local profile: {}", state.profile_label(None))
+        t!(
+            "onboarding.profile.created",
+            profile = state.profile_label(None)
+        )
+        .into_owned()
     } else if state.local_profile_ready() {
-        format!("Local profile: ready for {}", state.username)
+        t!(
+            "onboarding.profile.ready",
+            username = state.username.clone()
+        )
+        .into_owned()
     } else {
-        "Local profile: name, username, and email required".into()
+        t!("onboarding.profile.required").into_owned()
     }
 }
 
@@ -1576,28 +1780,54 @@ fn onboarding_permission_profile_label(state: &OnboardingWizardState) -> String 
     use octos_core::ui_protocol::PermissionProfileMode;
     let staged = match state.staged_permission_profile.as_ref() {
         Some(update) => update,
-        None => return "Permissions: (default — use /onboard permissions <mode>)".into(),
+        None => return t!("onboarding.permissions.default_hint").into_owned(),
     };
     let mode = staged
         .mode
         .map(|m| match m {
-            PermissionProfileMode::ReadOnly => "Read Only",
-            PermissionProfileMode::WorkspaceWrite => "Workspace Write",
-            PermissionProfileMode::DangerFullAccess => "Full Access",
+            PermissionProfileMode::ReadOnly => {
+                t!("menu.permissions.item.read_only.label").into_owned()
+            }
+            PermissionProfileMode::WorkspaceWrite => {
+                t!("menu.permissions.item.workspace_write.label").into_owned()
+            }
+            PermissionProfileMode::DangerFullAccess => {
+                t!("menu.permissions.item.full_access.label").into_owned()
+            }
         })
-        .unwrap_or("(mode unchanged)");
-    let approval = staged.approval_policy.as_deref().unwrap_or("(unchanged)");
+        .unwrap_or_else(|| t!("onboarding.permissions.mode_unchanged").into_owned());
+    let approval = staged
+        .approval_policy
+        .clone()
+        .unwrap_or_else(|| t!("onboarding.permissions.unchanged").into_owned());
     let network = staged
         .network
         .map(|n| match n {
-            octos_core::ui_protocol::PermissionNetworkPolicy::Allow => "network allowed",
-            octos_core::ui_protocol::PermissionNetworkPolicy::Deny => "network blocked",
+            octos_core::ui_protocol::PermissionNetworkPolicy::Allow => {
+                t!("onboarding.permissions.network_allowed").into_owned()
+            }
+            octos_core::ui_protocol::PermissionNetworkPolicy::Deny => {
+                t!("onboarding.permissions.network_blocked").into_owned()
+            }
         })
-        .unwrap_or("(network unchanged)");
+        .unwrap_or_else(|| t!("onboarding.permissions.network_unchanged").into_owned());
     if let Some(mismatch) = state.permission_profile_mismatch.as_deref() {
-        format!("Permissions: staged {mode} · {approval} · {network} — server CLAMPED: {mismatch}")
+        t!(
+            "onboarding.permissions.staged_clamped",
+            mode = mode,
+            approval = approval,
+            network = network,
+            mismatch = mismatch,
+        )
+        .into_owned()
     } else {
-        format!("Permissions: staged {mode} · {approval} · {network}")
+        t!(
+            "onboarding.permissions.staged",
+            mode = mode,
+            approval = approval,
+            network = network,
+        )
+        .into_owned()
     }
 }
 
@@ -1609,11 +1839,11 @@ fn onboarding_local_profile_disabled_reason(state: &OnboardingWizardState) -> Op
     // accepts empty email; flipping the TUI now would invite the
     // user into a guaranteed-failure submission.
     if !state.has_name() {
-        Some("name is empty".into())
+        Some(t!("onboarding.disabled.name_empty").into_owned())
     } else if !state.has_username() {
-        Some("username is empty".into())
+        Some(t!("onboarding.disabled.username_empty").into_owned())
     } else if !state.has_email() {
-        Some("email is empty".into())
+        Some(t!("onboarding.disabled.email_empty").into_owned())
     } else {
         None
     }
@@ -1630,17 +1860,17 @@ fn onboarding_finish_disabled_reason(
     if local_profile_create_supported(ctx) {
         return onboarding_local_profile_disabled_reason(state);
     }
-    Some("profile is unresolved; use /onboard profile <profile_id>".into())
+    Some(t!("onboarding.disabled.profile_unresolved").into_owned())
 }
 
 fn onboarding_disabled_reason(
     ctx: &MenuContext<'_>,
     state: &OnboardingWizardState,
     method: &'static str,
-    missing_input: &'static str,
 ) -> Option<String> {
-    action_missing_reason(ctx, method)
-        .or_else(|| (!state.has_email()).then(|| missing_input.into()))
+    action_missing_reason(ctx, method).or_else(|| {
+        (!state.has_email()).then(|| t!("onboarding.disabled.email_empty").into_owned())
+    })
 }
 
 fn onboarding_verify_disabled_reason(
@@ -1649,9 +1879,9 @@ fn onboarding_verify_disabled_reason(
 ) -> Option<String> {
     action_missing_reason(ctx, APPUI_METHOD_AUTH_VERIFY).or_else(|| {
         if !state.has_email() {
-            Some("email is empty".into())
+            Some(t!("onboarding.disabled.email_empty").into_owned())
         } else if !state.has_otp_code() {
-            Some("OTP code is empty".into())
+            Some(t!("onboarding.disabled.otp_empty").into_owned())
         } else {
             None
         }
@@ -1665,9 +1895,9 @@ fn onboarding_provider_disabled_reason(
 ) -> Option<String> {
     action_missing_reason(ctx, method).or_else(|| {
         if !state.selection_ready() {
-            Some("provider selection is incomplete".into())
+            Some(t!("onboarding.disabled.provider_incomplete").into_owned())
         } else if !state.has_api_key() {
-            Some("API key is empty".into())
+            Some(t!("onboarding.disabled.api_key_empty").into_owned())
         } else {
             None
         }
@@ -1682,7 +1912,7 @@ fn onboarding_open_session_disabled_reason(
     onboarding_finish_disabled_reason(ctx, state, current_profile)
         .or_else(|| {
             (!onboarding_has_saved_primary_provider(ctx, state, current_profile))
-                .then_some("save provider first".into())
+                .then(|| t!("onboarding.disabled.save_provider_first").into_owned())
         })
         // M22-C: finish is disabled until workspace validation
         // reports `Valid` so `session/open` never fires against an
@@ -1694,13 +1924,13 @@ fn onboarding_workspace_disabled_reason(state: &OnboardingWizardState) -> Option
     match &state.workspace_validation {
         crate::model::OnboardingWorkspaceValidation::Valid { .. } => None,
         crate::model::OnboardingWorkspaceValidation::Unvalidated => {
-            Some("validate workspace first".into())
+            Some(t!("onboarding.disabled.validate_workspace_first").into_owned())
         }
         crate::model::OnboardingWorkspaceValidation::Validating => {
-            Some("workspace validation in progress".into())
+            Some(t!("onboarding.disabled.workspace_validating").into_owned())
         }
         crate::model::OnboardingWorkspaceValidation::Invalid { reason } => {
-            Some(format!("workspace invalid: {reason}"))
+            Some(t!("onboarding.disabled.workspace_invalid", reason = reason).into_owned())
         }
     }
 }
@@ -1716,32 +1946,45 @@ fn onboarding_workspace_display(state: &OnboardingWizardState, active_workspace:
                 if trimmed.is_empty() {
                     None
                 } else {
-                    Some(format!("{trimmed} (active)"))
+                    Some(t!("onboarding.workspace.active", path = trimmed).into_owned())
                 }
             })
-            .unwrap_or_else(|| "(use /onboard workspace <path>)".into()),
+            .unwrap_or_else(|| t!("onboarding.workspace.unset").into_owned()),
     }
 }
 
 fn onboarding_workspace_status_label(state: &OnboardingWizardState) -> String {
     match &state.workspace_validation {
-        crate::model::OnboardingWorkspaceValidation::Unvalidated => "Status: not validated".into(),
-        crate::model::OnboardingWorkspaceValidation::Validating => "Status: validating...".into(),
+        crate::model::OnboardingWorkspaceValidation::Unvalidated => {
+            t!("onboarding.workspace.status_unvalidated").into_owned()
+        }
+        crate::model::OnboardingWorkspaceValidation::Validating => {
+            t!("onboarding.workspace.status_validating").into_owned()
+        }
         crate::model::OnboardingWorkspaceValidation::Valid {
             writable,
             has_workspace_toml,
             ..
         } => {
-            let writable_label = if *writable { "writable" } else { "read-only" };
-            let toml_label = if *has_workspace_toml {
-                " · .octos-workspace.toml"
+            let writable_label = if *writable {
+                t!("onboarding.workspace.writable").into_owned()
             } else {
-                ""
+                t!("onboarding.workspace.read_only").into_owned()
             };
-            format!("Status: OK ({writable_label}{toml_label})")
+            let toml_label = if *has_workspace_toml {
+                t!("onboarding.workspace.toml_present").into_owned()
+            } else {
+                String::new()
+            };
+            t!(
+                "onboarding.workspace.status_ok",
+                writable = writable_label,
+                toml = toml_label,
+            )
+            .into_owned()
         }
         crate::model::OnboardingWorkspaceValidation::Invalid { reason } => {
-            format!("Status: INVALID — {reason}")
+            t!("onboarding.workspace.status_invalid", reason = reason).into_owned()
         }
     }
 }
@@ -1768,9 +2011,13 @@ fn onboarding_has_saved_primary_provider(
 
 fn onboarding_provider_test_label(state: &OnboardingWizardState) -> String {
     match state.provider_pending {
-        Some(OnboardingProviderPending::Test) => "Testing connection...".into(),
-        Some(OnboardingProviderPending::Save) => "Test unavailable while saving".into(),
-        None if state.provider_tested => "Connection tested".into(),
+        Some(OnboardingProviderPending::Test) => {
+            t!("onboarding.provider.test_testing").into_owned()
+        }
+        Some(OnboardingProviderPending::Save) => {
+            t!("onboarding.provider.test_unavailable_saving").into_owned()
+        }
+        None if state.provider_tested => t!("onboarding.provider.tested").into_owned(),
         None if state.provider_test_failure_reason.is_some() => {
             // M22-E: surface the typed test failure so the user
             // sees what went wrong and knows to edit the key or
@@ -1779,26 +2026,32 @@ fn onboarding_provider_test_label(state: &OnboardingWizardState) -> String {
                 .provider_test_failure_reason
                 .as_deref()
                 .unwrap_or_default();
-            format!("Test failed — {reason}")
+            t!("onboarding.provider.test_failed", reason = reason).into_owned()
         }
-        None => "Test connection".into(),
+        None => t!("onboarding.provider.test").into_owned(),
     }
 }
 
-fn onboarding_provider_save_label(state: &OnboardingWizardState) -> &'static str {
+fn onboarding_provider_save_label(state: &OnboardingWizardState) -> String {
     match state.provider_pending {
-        Some(OnboardingProviderPending::Save) => "Saving provider...",
-        Some(OnboardingProviderPending::Test) => "Save unavailable while testing",
-        None if state.provider_saved && state.provider_tested => "Provider saved",
-        None => "Save provider",
+        Some(OnboardingProviderPending::Save) => t!("onboarding.provider.saving").into_owned(),
+        Some(OnboardingProviderPending::Test) => {
+            t!("onboarding.provider.save_unavailable_testing").into_owned()
+        }
+        None if state.provider_saved && state.provider_tested => {
+            t!("onboarding.provider.saved").into_owned()
+        }
+        None => t!("onboarding.provider.save").into_owned(),
     }
 }
 
-fn onboarding_provider_fallback_label(state: &OnboardingWizardState) -> &'static str {
+fn onboarding_provider_fallback_label(state: &OnboardingWizardState) -> String {
     match state.provider_pending {
-        Some(OnboardingProviderPending::Save) => "Saving provider...",
-        Some(OnboardingProviderPending::Test) => "Fallback unavailable while testing",
-        None => "Add as fallback",
+        Some(OnboardingProviderPending::Save) => t!("onboarding.provider.saving").into_owned(),
+        Some(OnboardingProviderPending::Test) => {
+            t!("onboarding.provider.fallback_unavailable_testing").into_owned()
+        }
+        None => t!("onboarding.provider.add_fallback").into_owned(),
     }
 }
 
@@ -1807,11 +2060,16 @@ fn onboarding_provider_saved_status_label(state: &OnboardingWizardState) -> Stri
         state.last_saved_provider_target,
         state.last_saved_provider_label.as_deref(),
     ) {
-        format!("Saved provider: {} {label}", save_target_label(target))
+        t!(
+            "onboarding.provider.saved_status_target",
+            target = save_target_label(target),
+            label = label,
+        )
+        .into_owned()
     } else if let Some(label) = state.saved_primary_provider_label.as_deref() {
-        format!("Saved provider: primary {label}")
+        t!("onboarding.provider.saved_status_primary", label = label,).into_owned()
     } else {
-        "Saved provider: none".into()
+        t!("onboarding.provider.saved_status_none").into_owned()
     }
 }
 
@@ -1823,10 +2081,10 @@ fn onboarding_provider_saved_status_state(state: &OnboardingWizardState) -> Menu
     }
 }
 
-fn save_target_label(target: OnboardingProviderSaveTarget) -> &'static str {
+fn save_target_label(target: OnboardingProviderSaveTarget) -> String {
     match target {
-        OnboardingProviderSaveTarget::Primary => "primary",
-        OnboardingProviderSaveTarget::Fallback => "fallback",
+        OnboardingProviderSaveTarget::Primary => t!("onboarding.provider.primary").into_owned(),
+        OnboardingProviderSaveTarget::Fallback => t!("onboarding.provider.fallback").into_owned(),
     }
 }
 
@@ -2131,9 +2389,9 @@ fn login_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     if !supports_any_method(ctx, crate::menu::registry::APPUI_LOGIN_MENU_METHODS_ANY) {
         return MenuBuildResult::Unavailable(MenuStatusSpec {
             id: MenuId::from(MENU_LOGIN),
-            title: "Login unavailable".into(),
+            title: t!("menu.login.unavailable_title").into_owned(),
             message: method_missing_reason(ctx, APPUI_METHOD_AUTH_STATUS),
-            footer_hint: Some("Esc close".into()),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
         });
     }
 
@@ -2148,14 +2406,14 @@ fn login_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let mut items = vec![
         MenuItem::new(
             "login.status",
-            "Auth status",
+            t!("menu.login.item.auth_status.label"),
             MenuAction::SendAppUi(AppUiCommand::AuthStatus(AuthStatusParams::default())),
         )
         .with_description("Uses auth/status.")
         .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_AUTH_STATUS)),
         MenuItem::new(
             "login.me",
-            "Current account",
+            t!("menu.login.item.current_account.label"),
             MenuAction::SendAppUi(AppUiCommand::AuthMe(AuthMeParams {
                 token: state.auth_token.clone(),
             })),
@@ -2164,7 +2422,7 @@ fn login_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_AUTH_ME)),
         MenuItem::new(
             "login.logout",
-            "Logout",
+            t!("menu.login.item.logout.label"),
             MenuAction::SendAppUi(AppUiCommand::AuthLogout(AuthLogoutParams {
                 token: state.auth_token.clone(),
             })),
@@ -2189,12 +2447,12 @@ fn login_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                 },
                 MenuAction::Noop,
             )
-            .with_description("Use /login email <address>."),
+            .with_description(t!("menu.login.item.email.desc")),
         );
         items.push(
             MenuItem::new(
                 "login.otp.send",
-                "Email OTP: send code",
+                t!("menu.login.item.otp_send.label"),
                 MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SendCode)),
             )
             .with_description("Uses auth/send_code.")
@@ -2202,25 +2460,24 @@ fn login_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                 ctx,
                 state,
                 APPUI_METHOD_AUTH_SEND_CODE,
-                "email is empty",
             )),
         );
         items.push(
             MenuItem::new(
                 "login.code",
                 if state.has_otp_code() {
-                    String::from("OTP code: set")
+                    t!("menu.login.item.otp_code_set.label").into_owned()
                 } else {
-                    String::from("OTP code: not set")
+                    t!("menu.login.item.otp_code_unset.label").into_owned()
                 },
                 MenuAction::Noop,
             )
-            .with_description("Use /login code <otp>."),
+            .with_description(t!("menu.login.item.otp_code.desc")),
         );
         items.push(
             MenuItem::new(
                 "login.otp.verify",
-                "Email OTP: verify code",
+                t!("menu.login.item.otp_verify.label"),
                 MenuAction::Local(LocalAction::Onboarding(OnboardingAction::VerifyCode)),
             )
             .with_description("Uses auth/verify.")
@@ -2230,15 +2487,15 @@ fn login_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
 
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(MENU_LOGIN),
-        title: "Login".into(),
-        subtitle: Some("Server-owned authentication methods.".into()),
+        title: t!("menu.login.title").into_owned(),
+        subtitle: Some(t!("menu.login.subtitle").into_owned()),
         items,
         tabs: Vec::new(),
         searchable: false,
         search_placeholder: None,
-        footer_hint: Some("Enter run | Esc close".into()),
+        footer_hint: Some(t!("menu.footer.enter_run_esc_close").into_owned()),
         preview: Some(MenuPreview::KeyValues {
-            title: Some("Login State".into()),
+            title: Some(t!("menu.login.preview_title").into_owned()),
             rows: [
                 MenuPreviewRow {
                     label: "email".into(),
@@ -2311,8 +2568,12 @@ fn model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     } else {
         MenuAction::Noop
     };
-    let mut refresh = MenuItem::new("model.refresh", "Refresh models", refresh_action)
-        .with_description("Uses profile/llm/list.");
+    let mut refresh = MenuItem::new(
+        "model.refresh",
+        t!("menu.model.item.refresh.label"),
+        refresh_action,
+    )
+    .with_description("Uses profile/llm/list.");
     if !can_list {
         refresh = refresh.disabled(method_missing_reason(ctx, APPUI_METHOD_MODEL_LIST));
     }
@@ -2321,8 +2582,12 @@ fn model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     if let Some(models) = models {
         if models.is_empty() {
             items.push(
-                MenuItem::new("model.empty", "No server models", MenuAction::Noop)
-                    .disabled("profile/llm/list returned no models for this profile"),
+                MenuItem::new(
+                    "model.empty",
+                    t!("menu.model.item.empty.label"),
+                    MenuAction::Noop,
+                )
+                .disabled("profile/llm/list returned no models for this profile"),
             );
         } else {
             for (idx, model) in models.iter().enumerate() {
@@ -2363,27 +2628,30 @@ fn model_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         }
     } else {
         items.push(
-            MenuItem::new("model.cached", "Server model list", MenuAction::Noop).disabled(
-                if can_list {
-                    "No cached profile/llm/list result yet; refresh models first".into()
-                } else {
-                    method_missing_reason(ctx, APPUI_METHOD_MODEL_LIST)
-                },
-            ),
+            MenuItem::new(
+                "model.cached",
+                t!("menu.model.item.cached.label"),
+                MenuAction::Noop,
+            )
+            .disabled(if can_list {
+                "No cached profile/llm/list result yet; refresh models first".into()
+            } else {
+                method_missing_reason(ctx, APPUI_METHOD_MODEL_LIST)
+            }),
         );
     }
 
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(MENU_MODEL),
-        title: "Model".into(),
-        subtitle: Some("Server-returned profile LLM models.".into()),
+        title: t!("menu.model.title").into_owned(),
+        subtitle: Some(t!("menu.model.subtitle").into_owned()),
         items,
         tabs: Vec::new(),
         searchable: true,
-        search_placeholder: Some("Filter models".into()),
-        footer_hint: Some("Enter select or refresh | Esc close".into()),
+        search_placeholder: Some(t!("menu.model.search").into_owned()),
+        footer_hint: Some(t!("menu.model.footer").into_owned()),
         preview: Some(MenuPreview::KeyValues {
-            title: Some("Runtime".into()),
+            title: Some(t!("menu.runtime_preview_title").into_owned()),
             rows: model_preview_rows(ctx),
         }),
         mode: MenuMode::SingleSelect,
@@ -2394,9 +2662,9 @@ fn provider_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     if !supports_any_method(ctx, APPUI_PROVIDER_MENU_METHODS_ANY) {
         return MenuBuildResult::Unavailable(MenuStatusSpec {
             id: MenuId::from(MENU_PROVIDER),
-            title: "Providers unavailable".into(),
+            title: t!("menu.provider.unavailable_title").into_owned(),
             message: method_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_CATALOG),
-            footer_hint: Some("Esc close".into()),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
         });
     }
 
@@ -2411,7 +2679,7 @@ fn provider_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let mut items = vec![
         MenuItem::new(
             "provider.catalog",
-            "Refresh provider catalog",
+            t!("menu.provider.item.catalog_refresh.label"),
             MenuAction::SendAppUi(AppUiCommand::ProfileLlmCatalog(
                 ProfileLlmCatalogParams::default(),
             )),
@@ -2420,7 +2688,7 @@ fn provider_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_LLM_CATALOG)),
         MenuItem::new(
             "provider.list",
-            "Refresh configured providers",
+            t!("menu.provider.item.list_refresh.label"),
             MenuAction::SendAppUi(AppUiCommand::ProfileLlmList(ProfileLlmListParams {
                 profile_id: profile_id.clone(),
             })),
@@ -2437,14 +2705,14 @@ fn provider_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             format!("Staged provider: {}", state.provider_label()),
             MenuAction::Noop,
         )
-        .with_description("Use /provider select <family> <model> <route> [base_url] [api_key_env], or choose a catalog row.")
+        .with_description(t!("menu.provider.item.staged.desc"))
         .with_state(MenuItemState::required(state.selection_ready())),
         MenuItem::new(
             "provider.saved",
             onboarding_provider_saved_status_label(state),
             MenuAction::Noop,
         )
-        .with_description("Last successful primary or fallback save")
+        .with_description(t!("menu.onboard.item.saved_provider.desc"))
         .with_state(onboarding_provider_saved_status_state(state)),
         MenuItem::new(
             "provider.key",
@@ -2455,14 +2723,16 @@ fn provider_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             },
             MenuAction::Noop,
         )
-        .with_description("Use /provider key <secret>. The secret is masked in state, logs, and snapshots.")
+        .with_description(
+            "Use /provider key <secret>. The secret is masked in state, logs, and snapshots.",
+        )
         .with_state(MenuItemState::required(state.has_api_key())),
         MenuItem::new(
             "provider.fetch",
-            "Fetch route models",
+            t!("menu.onboard.item.fetch_models.label"),
             MenuAction::Local(LocalAction::Onboarding(OnboardingAction::FetchModels)),
         )
-        .with_description("Uses profile/llm/fetch_models for custom OpenAI-compatible routes.")
+        .with_description(t!("menu.onboard.item.fetch_models.desc"))
         .maybe_disabled(onboarding_fetch_models_disabled_reason(ctx, state)),
         MenuItem::new(
             "provider.test",
@@ -2481,7 +2751,7 @@ fn provider_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             onboarding_provider_save_label(state),
             MenuAction::Local(LocalAction::Onboarding(OnboardingAction::SaveProvider)),
         )
-        .with_description("Uses profile/llm/upsert and persists to the same profile JSON as the dashboard.")
+        .with_description(t!("menu.onboard.item.save_provider.desc"))
         .with_state(onboarding_provider_save_state(state))
         .maybe_disabled(onboarding_provider_disabled_reason(
             ctx,
@@ -2540,15 +2810,15 @@ fn provider_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
 
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(MENU_PROVIDER),
-        title: "Provider".into(),
-        subtitle: Some("Profile-owned LLM setup; catalog and state come from AppUI.".into()),
+        title: t!("menu.provider.title").into_owned(),
+        subtitle: Some(t!("menu.provider.subtitle").into_owned()),
         items,
         tabs: Vec::new(),
         searchable: true,
-        search_placeholder: Some("Filter providers".into()),
-        footer_hint: Some("Enter run | Esc close".into()),
+        search_placeholder: Some(t!("menu.provider.search").into_owned()),
+        footer_hint: Some(t!("menu.footer.enter_run_esc_close").into_owned()),
         preview: Some(MenuPreview::KeyValues {
-            title: Some("Provider State".into()),
+            title: Some(t!("menu.provider.preview_title").into_owned()),
             rows: [
                 MenuPreviewRow {
                     label: "profile".into(),
@@ -2591,10 +2861,10 @@ fn provider_saved_items(ctx: &MenuContext<'_>) -> Vec<MenuItem> {
         return vec![
             MenuItem::new(
                 "provider.saved.unloaded",
-                "Saved providers: not loaded",
+                t!("menu.provider.item.saved_unloaded.label"),
                 MenuAction::Noop,
             )
-            .with_description("Run Refresh configured providers to read profile/llm/list.")
+            .with_description(t!("menu.provider.item.saved_unloaded.desc"))
             .disabled("not loaded"),
         ];
     };
@@ -2603,17 +2873,17 @@ fn provider_saved_items(ctx: &MenuContext<'_>) -> Vec<MenuItem> {
     if let Some(primary) = profile_llm.primary_provider() {
         items.push(configured_provider_item(
             "provider.saved.primary",
-            "Saved primary",
+            t!("menu.provider.item.saved_primary.prefix").as_ref(),
             primary,
         ));
     } else {
         items.push(
             MenuItem::new(
                 "provider.saved.primary.empty",
-                "Saved primary: not set",
+                t!("menu.provider.item.saved_primary_empty.label"),
                 MenuAction::Noop,
             )
-            .with_description("Save a tested provider as primary before opening a coding session.")
+            .with_description(t!("menu.provider.item.saved_primary_empty.desc"))
             .with_state(MenuItemState::required(false)),
         );
     }
@@ -2623,17 +2893,17 @@ fn provider_saved_items(ctx: &MenuContext<'_>) -> Vec<MenuItem> {
         items.push(
             MenuItem::new(
                 "provider.saved.fallback.empty",
-                "Saved fallbacks: none",
+                t!("menu.provider.item.saved_fallback_empty.label"),
                 MenuAction::Noop,
             )
-            .with_description("Use Add fallback model to persist secondary routes.")
+            .with_description(t!("menu.provider.item.saved_fallback_empty.desc"))
             .with_state(MenuItemState::required(false)),
         );
     } else {
         items.extend(fallbacks.iter().enumerate().map(|(idx, provider)| {
             configured_provider_item(
                 format!("provider.saved.fallback.{idx}"),
-                &format!("Saved fallback {}", idx + 1),
+                t!("menu.provider.item.saved_fallback.prefix", n = idx + 1).as_ref(),
                 provider,
             )
         }));
@@ -2737,9 +3007,9 @@ fn mcp_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     if !supports_any_method(ctx, APPUI_MCP_MENU_METHODS_ANY) {
         return MenuBuildResult::Unavailable(MenuStatusSpec {
             id: MenuId::from(MENU_MCP),
-            title: "MCP unavailable".into(),
+            title: t!("menu.mcp.unavailable_title").into_owned(),
             message: method_missing_reason(ctx, APPUI_METHOD_MCP_CONFIG_LIST),
-            footer_hint: Some("Esc close".into()),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
         });
     }
 
@@ -2750,7 +3020,7 @@ fn mcp_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     items.push(
         MenuItem::new(
             "mcp.config.refresh",
-            "Refresh MCP config",
+            t!("menu.mcp.item.config_refresh.label"),
             MenuAction::SendAppUi(AppUiCommand::ListMcpConfig(McpConfigListParams {
                 session_id: session_id.clone(),
                 profile_id: profile_id.clone(),
@@ -2765,7 +3035,7 @@ fn mcp_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         items.push(
             MenuItem::new(
                 "mcp.refresh",
-                "Refresh MCP status",
+                t!("menu.mcp.item.status_refresh.label"),
                 MenuAction::SendAppUi(AppUiCommand::ListMcpStatus(McpStatusListParams {
                     session_id,
                     include_disabled: true,
@@ -2779,7 +3049,7 @@ fn mcp_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     items.push(
         MenuItem::new(
             "mcp.config.upsert",
-            "Add/update MCP config",
+            t!("menu.mcp.item.upsert.label"),
             MenuAction::Local(LocalAction::EditComposer("/mcp upsert ".into())),
         )
         .with_description("Edit as: /mcp upsert <server> {json}")
@@ -2792,8 +3062,12 @@ fn mcp_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     if let Some(config) = ctx.app.mcp_config_catalog {
         if config.servers.is_empty() {
             items.push(
-                MenuItem::new("mcp.empty", "No MCP servers", MenuAction::Noop)
-                    .disabled("mcp/config/list returned no configured servers"),
+                MenuItem::new(
+                    "mcp.empty",
+                    t!("menu.mcp.item.empty.label"),
+                    MenuAction::Noop,
+                )
+                .disabled("mcp/config/list returned no configured servers"),
             );
         } else {
             for server in &config.servers {
@@ -2863,8 +3137,12 @@ fn mcp_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     } else if let Some(catalog) = ctx.app.mcp_catalog {
         if catalog.servers.is_empty() {
             items.push(
-                MenuItem::new("mcp.status.empty", "No MCP servers", MenuAction::Noop)
-                    .disabled("mcp/status/list returned no servers for this session"),
+                MenuItem::new(
+                    "mcp.status.empty",
+                    t!("menu.mcp.item.empty.label"),
+                    MenuAction::Noop,
+                )
+                .disabled("mcp/status/list returned no servers for this session"),
             );
         } else {
             for server in &catalog.servers {
@@ -2885,22 +3163,26 @@ fn mcp_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         }
     } else {
         items.push(
-            MenuItem::new("mcp.cached", "Server MCP config", MenuAction::Noop)
-                .disabled("Run Refresh MCP config first"),
+            MenuItem::new(
+                "mcp.cached",
+                t!("menu.mcp.item.cached.label"),
+                MenuAction::Noop,
+            )
+            .disabled("Run Refresh MCP config first"),
         );
     }
 
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(MENU_MCP),
-        title: "MCP".into(),
-        subtitle: Some("Server-owned MCP configuration and status.".into()),
+        title: t!("menu.mcp.title").into_owned(),
+        subtitle: Some(t!("menu.mcp.subtitle").into_owned()),
         items,
         tabs: Vec::new(),
         searchable: true,
-        search_placeholder: Some("Filter MCP entries".into()),
-        footer_hint: Some("Enter run | Esc close".into()),
+        search_placeholder: Some(t!("menu.mcp.search").into_owned()),
+        footer_hint: Some(t!("menu.footer.enter_run_esc_close").into_owned()),
         preview: Some(MenuPreview::KeyValues {
-            title: Some("Runtime".into()),
+            title: Some(t!("menu.runtime_preview_title").into_owned()),
             rows: mcp_preview_rows(ctx),
         }),
         mode: MenuMode::SingleSelect,
@@ -2911,9 +3193,9 @@ fn tool_settings_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     if !supports_any_method(ctx, APPUI_TOOL_SETTINGS_MENU_METHODS_ANY) {
         return MenuBuildResult::Unavailable(MenuStatusSpec {
             id: MenuId::from(MENU_TOOL_SETTINGS),
-            title: "Tool settings unavailable".into(),
+            title: t!("menu.tools.unavailable_title").into_owned(),
             message: method_missing_reason(ctx, APPUI_METHOD_TOOL_CONFIG_LIST),
-            footer_hint: Some("Esc close".into()),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
         });
     }
 
@@ -2924,7 +3206,7 @@ fn tool_settings_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     items.push(
         MenuItem::new(
             "tools.config.refresh",
-            "Refresh tool config",
+            t!("menu.tools.item.config_refresh.label"),
             MenuAction::SendAppUi(AppUiCommand::ListToolConfig(ToolConfigListParams {
                 session_id: session_id.clone(),
                 profile_id: profile_id.clone(),
@@ -2939,7 +3221,7 @@ fn tool_settings_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         items.push(
             MenuItem::new(
                 "tools.status.refresh",
-                "Refresh tool status",
+                t!("menu.tools.item.status_refresh.label"),
                 MenuAction::SendAppUi(AppUiCommand::ListToolStatus(ToolStatusListParams {
                     session_id,
                     include_denied: true,
@@ -2953,7 +3235,7 @@ fn tool_settings_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     items.push(
         MenuItem::new(
             "tools.config.upsert",
-            "Add/update tool config",
+            t!("menu.tools.item.upsert.label"),
             MenuAction::Local(LocalAction::EditComposer("/tools upsert ".into())),
         )
         .with_description("Edit as: /tools upsert <tool> {json}")
@@ -2970,12 +3252,16 @@ fn tool_settings_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     {
         let ready = coding_contract_is_ready(contract);
         items.push(
-            MenuItem::new("tools.contract", "Coding tool contract", MenuAction::Noop)
-                .with_description(coding_contract_description(contract))
-                .with_state(MenuItemState {
-                    required_valid: Some(ready),
-                    ..MenuItemState::default()
-                }),
+            MenuItem::new(
+                "tools.contract",
+                t!("menu.tools.item.contract.label"),
+                MenuAction::Noop,
+            )
+            .with_description(coding_contract_description(contract))
+            .with_state(MenuItemState {
+                required_valid: Some(ready),
+                ..MenuItemState::default()
+            }),
         );
         for tool_name in &contract.missing_required_tools {
             let state = MenuItemState {
@@ -2986,7 +3272,10 @@ fn tool_settings_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             items.push(
                 MenuItem::new(
                     format!("tools.contract.missing.{tool_name}"),
-                    format!("Missing P0 tool: {tool_name}"),
+                    format!(
+                        "{}: {tool_name}",
+                        t!("menu.tools.item.contract_missing.prefix")
+                    ),
                     MenuAction::Noop,
                 )
                 .with_description(coding_contract_missing_tool_description(
@@ -3000,8 +3289,12 @@ fn tool_settings_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     if let Some(config) = ctx.app.tool_config_catalog {
         if config.tools.is_empty() {
             items.push(
-                MenuItem::new("tools.empty", "No tool settings", MenuAction::Noop)
-                    .disabled("tool/config/list returned no configured tools"),
+                MenuItem::new(
+                    "tools.empty",
+                    t!("menu.tools.item.empty.label"),
+                    MenuAction::Noop,
+                )
+                .disabled("tool/config/list returned no configured tools"),
             );
         } else {
             for tool in &config.tools {
@@ -3071,8 +3364,12 @@ fn tool_settings_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     } else if let Some(catalog) = ctx.app.tool_catalog {
         if catalog.tools.is_empty() {
             items.push(
-                MenuItem::new("tools.status.empty", "No tools", MenuAction::Noop)
-                    .disabled("tool/status/list returned no tools for this session"),
+                MenuItem::new(
+                    "tools.status.empty",
+                    t!("menu.tools.item.status_empty.label"),
+                    MenuAction::Noop,
+                )
+                .disabled("tool/status/list returned no tools for this session"),
             );
         } else {
             for tool in &catalog.tools {
@@ -3092,22 +3389,26 @@ fn tool_settings_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         }
     } else {
         items.push(
-            MenuItem::new("tools.cached", "Server tool config", MenuAction::Noop)
-                .disabled("Run Refresh tool config first"),
+            MenuItem::new(
+                "tools.cached",
+                t!("menu.tools.item.cached.label"),
+                MenuAction::Noop,
+            )
+            .disabled("Run Refresh tool config first"),
         );
     }
 
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(MENU_TOOL_SETTINGS),
-        title: "Tool Settings".into(),
-        subtitle: Some("Server-owned search, web, browser, and MCP tool settings.".into()),
+        title: t!("menu.tools.title").into_owned(),
+        subtitle: Some(t!("menu.tools.subtitle").into_owned()),
         items,
         tabs: Vec::new(),
         searchable: true,
-        search_placeholder: Some("Filter tools".into()),
-        footer_hint: Some("Enter run | Esc close".into()),
+        search_placeholder: Some(t!("menu.tools.search").into_owned()),
+        footer_hint: Some(t!("menu.footer.enter_run_esc_close").into_owned()),
         preview: Some(MenuPreview::KeyValues {
-            title: Some("Runtime".into()),
+            title: Some(t!("menu.runtime_preview_title").into_owned()),
             rows: tool_settings_preview_rows(ctx),
         }),
         mode: MenuMode::SingleSelect,
@@ -3126,9 +3427,9 @@ fn skills_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     ) {
         return MenuBuildResult::Unavailable(MenuStatusSpec {
             id: MenuId::from(MENU_SKILLS),
-            title: "Skills unavailable".into(),
+            title: t!("menu.skills.unavailable_title").into_owned(),
             message: method_missing_reason(ctx, APPUI_METHOD_PROFILE_SKILLS_LIST),
-            footer_hint: Some("Esc close".into()),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
         });
     }
 
@@ -3136,7 +3437,7 @@ fn skills_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let mut items = vec![
         MenuItem::new(
             "skills.refresh",
-            "Refresh installed skills",
+            t!("menu.skills.item.refresh.label"),
             MenuAction::SendAppUi(AppUiCommand::ProfileSkillsList(ProfileSkillsListParams {
                 profile_id: profile_id.clone(),
             })),
@@ -3145,20 +3446,20 @@ fn skills_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         .maybe_disabled(action_missing_reason(ctx, APPUI_METHOD_PROFILE_SKILLS_LIST)),
         MenuItem::new(
             "skills.search",
-            "Search registry",
+            t!("menu.skills.item.search.label"),
             MenuAction::Local(LocalAction::EditComposer("/skills search ".into())),
         )
-        .with_description("Type a registry query, then press Enter.")
+        .with_description(t!("menu.skills.item.search.desc"))
         .maybe_disabled(action_missing_reason(
             ctx,
             APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
         )),
         MenuItem::new(
             "skills.install",
-            "Install package or repo",
+            t!("menu.skills.item.install.label"),
             MenuAction::Local(LocalAction::EditComposer("/skills install ".into())),
         )
-        .with_description("Accepts GitHub shorthand, full Git URL, or local skill path.")
+        .with_description(t!("menu.skills.item.install.desc"))
         .maybe_disabled(mutating_action_missing_reason(
             ctx,
             APPUI_METHOD_PROFILE_SKILLS_INSTALL,
@@ -3168,8 +3469,12 @@ fn skills_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     if let Some(skills) = ctx.app.profile_skills {
         if skills.skills.is_empty() {
             items.push(
-                MenuItem::new("skills.none", "No installed skills", MenuAction::Noop)
-                    .disabled("profile/skills/list returned no installed skills"),
+                MenuItem::new(
+                    "skills.none",
+                    t!("menu.skills.item.none.label"),
+                    MenuAction::Noop,
+                )
+                .disabled("profile/skills/list returned no installed skills"),
             );
         } else {
             for skill in &skills.skills {
@@ -3178,7 +3483,7 @@ fn skills_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                 items.push(
                     MenuItem::new(
                         format!("skills.remove.{}", skill.name),
-                        format!("Remove {}", skill.name),
+                        format!("{} {}", t!("menu.skills.item.remove.prefix"), skill.name),
                         MenuAction::SendAppUi(AppUiCommand::ProfileSkillsRemove(
                             ProfileSkillsRemoveParams {
                                 profile_id: profile_id.clone(),
@@ -3199,7 +3504,7 @@ fn skills_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         items.push(
             MenuItem::new(
                 "skills.cache.empty",
-                "Installed skills not loaded",
+                t!("menu.skills.item.cache_empty.label"),
                 MenuAction::Noop,
             )
             .disabled("Run Refresh installed skills first"),
@@ -3213,7 +3518,7 @@ fn skills_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             items.push(
                 MenuItem::new(
                     format!("skills.registry.{}", package.name),
-                    format!("Install {}", package.name),
+                    format!("{} {}", t!("menu.skills.item.install.prefix"), package.name),
                     MenuAction::SendAppUi(AppUiCommand::ProfileSkillsInstall(
                         ProfileSkillsInstallParams {
                             profile_id: profile_id.clone(),
@@ -3235,15 +3540,15 @@ fn skills_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
 
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(MENU_SKILLS),
-        title: "Skills".into(),
-        subtitle: Some("Profile-owned customer skills over AppUI.".into()),
+        title: t!("menu.skills.title").into_owned(),
+        subtitle: Some(t!("menu.skills.subtitle").into_owned()),
         items,
         tabs: Vec::new(),
         searchable: true,
-        search_placeholder: Some("Filter skills".into()),
-        footer_hint: Some("Enter run | Esc close".into()),
+        search_placeholder: Some(t!("menu.skills.search").into_owned()),
+        footer_hint: Some(t!("menu.footer.enter_run_esc_close").into_owned()),
         preview: Some(MenuPreview::KeyValues {
-            title: Some("Profile".into()),
+            title: Some(t!("menu.skills.preview_title").into_owned()),
             rows: vec![
                 MenuPreviewRow {
                     label: "profile".into(),
@@ -3275,18 +3580,18 @@ fn permissions_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let Some(session_id) = ctx.app.selected_session_id.cloned() else {
         return MenuBuildResult::Unavailable(MenuStatusSpec {
             id: MenuId::from(MENU_PERMISSIONS),
-            title: "Permissions unavailable".into(),
-            message: "Permissions require an open AppUI session.".into(),
-            footer_hint: Some("Esc close".into()),
+            title: t!("menu.permissions.unavailable_title").into_owned(),
+            message: t!("menu.permissions.unavailable_no_session").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
         });
     };
 
     if !supports_any_permission_method(ctx) {
         return MenuBuildResult::Unavailable(MenuStatusSpec {
             id: MenuId::from(MENU_PERMISSIONS),
-            title: "Permissions unavailable".into(),
+            title: t!("menu.permissions.unavailable_title").into_owned(),
             message: permission_menu_missing_reason(ctx),
-            footer_hint: Some("Esc close".into()),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
         });
     }
 
@@ -3297,15 +3602,15 @@ fn permissions_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
 
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(MENU_PERMISSIONS),
-        title: "Update Model Permissions".into(),
-        subtitle: Some("Session permission presets; mutation is capability gated.".into()),
+        title: t!("menu.permissions.title").into_owned(),
+        subtitle: Some(t!("menu.permissions.subtitle").into_owned()),
         items,
         tabs: Vec::new(),
         searchable: true,
-        search_placeholder: Some("Filter permissions".into()),
-        footer_hint: Some("Enter apply or refresh | Esc close".into()),
+        search_placeholder: Some(t!("menu.permissions.search").into_owned()),
+        footer_hint: Some(t!("menu.permissions.footer").into_owned()),
         preview: Some(MenuPreview::KeyValues {
-            title: Some("Capability Status".into()),
+            title: Some(t!("menu.permissions.preview_title").into_owned()),
             rows: permission_preview_rows(ctx),
         }),
         mode: MenuMode::SingleSelect,
@@ -3335,7 +3640,7 @@ fn action_missing_reason(ctx: &MenuContext<'_>, method: &'static str) -> Option<
 
 fn mutating_action_missing_reason(ctx: &MenuContext<'_>, method: &'static str) -> Option<String> {
     if ctx.availability.readonly {
-        Some("Read-only launch: mutating AppUI commands are disabled".into())
+        Some("Read-only launch: mutating Octos UI commands are disabled".into())
     } else {
         action_missing_reason(ctx, method)
     }
@@ -3343,7 +3648,7 @@ fn mutating_action_missing_reason(ctx: &MenuContext<'_>, method: &'static str) -
 
 fn permission_menu_missing_reason(ctx: &MenuContext<'_>) -> String {
     if ctx.availability.capabilities.is_none() {
-        "AppUI capabilities are not available".into()
+        "Octos UI capabilities are not available".into()
     } else if let Some((method, reason)) =
         APPUI_PERMISSION_MENU_METHODS_ANY.iter().find_map(|method| {
             ctx.availability
@@ -3351,10 +3656,10 @@ fn permission_menu_missing_reason(ctx: &MenuContext<'_>) -> String {
                 .map(|reason| (*method, reason))
         })
     {
-        format!("AppUI method `{method}` is unsupported: {reason}")
+        format!("Octos UI method `{method}` is unsupported: {reason}")
     } else {
         format!(
-            "AppUI permission methods are not advertised: {}",
+            "Octos UI permission methods are not advertised: {}",
             APPUI_PERMISSION_MENU_METHODS_ANY.join(", ")
         )
     }
@@ -3379,8 +3684,8 @@ fn permission_profile_items(
     let mut items = vec![
         permission_mode_item(
             "permissions.default",
-            "Default",
-            "Workspace edits; ask for network/outside.",
+            t!("menu.permissions.item.default.label"),
+            t!("menu.permissions.item.default.desc"),
             permission_set_action(
                 session_id.clone(),
                 PermissionProfileUpdate {
@@ -3394,8 +3699,8 @@ fn permission_profile_items(
         ),
         permission_mode_item(
             "permissions.read_only",
-            "Read Only",
-            "No writes without approval.",
+            t!("menu.permissions.item.read_only.label"),
+            t!("menu.permissions.item.read_only.desc"),
             permission_set_action(
                 session_id.clone(),
                 PermissionProfileUpdate {
@@ -3413,8 +3718,8 @@ fn permission_profile_items(
         ),
         permission_mode_item(
             "permissions.workspace_write",
-            "Workspace Write",
-            "Read/write inside workspace.",
+            t!("menu.permissions.item.workspace_write.label"),
+            t!("menu.permissions.item.workspace_write.desc"),
             permission_set_action(
                 session_id.clone(),
                 PermissionProfileUpdate {
@@ -3428,8 +3733,8 @@ fn permission_profile_items(
         ),
         permission_mode_item(
             "permissions.workspace_write_never",
-            "Workspace Write, Never Ask",
-            "Read/write inside workspace; deny approval-gated commands instead of prompting.",
+            t!("menu.permissions.item.workspace_write_never.label"),
+            t!("menu.permissions.item.workspace_write_never.desc"),
             permission_set_action(
                 session_id.clone(),
                 PermissionProfileUpdate {
@@ -3443,8 +3748,8 @@ fn permission_profile_items(
         ),
         permission_mode_item(
             "permissions.full_access",
-            "Full Access",
-            "No sandbox or network approvals.",
+            t!("menu.permissions.item.full_access.label"),
+            t!("menu.permissions.item.full_access.desc"),
             permission_set_action(
                 session_id.clone(),
                 PermissionProfileUpdate {
@@ -3463,7 +3768,7 @@ fn permission_profile_items(
         ),
         MenuItem::new(
             "permissions.profile.refresh",
-            "Refresh permission profiles",
+            t!("menu.permissions.item.profile_refresh.label"),
             MenuAction::SendAppUi(AppUiCommand::ListPermissionProfiles(
                 PermissionProfileListParams { session_id },
             )),
@@ -3482,8 +3787,8 @@ fn permission_profile_items(
 
 fn permission_mode_item(
     id: &'static str,
-    label: &'static str,
-    description: &'static str,
+    label: impl Into<String>,
+    description: impl Into<String>,
     action: MenuAction,
     state: MenuItemState,
     disabled_reason: Option<String>,
@@ -3572,7 +3877,7 @@ fn permission_network_items(
     vec![
         MenuItem::new(
             "permissions.network.allow",
-            "Allow Network",
+            t!("menu.permissions.item.network_allow.label"),
             permission_set_action(
                 session_id.clone(),
                 PermissionProfileUpdate {
@@ -3582,7 +3887,7 @@ fn permission_network_items(
                 },
             ),
         )
-        .with_description("Enable internet access.")
+        .with_description(t!("menu.permissions.item.network_allow.desc"))
         .with_state(MenuItemState::checked(
             ctx.app.permission_profile.is_some_and(|current| {
                 current.normalized().network == PermissionNetworkPolicy::Allow
@@ -3591,7 +3896,7 @@ fn permission_network_items(
         .maybe_disabled(mutation_reason.clone()),
         MenuItem::new(
             "permissions.network.block",
-            "Block Network",
+            t!("menu.permissions.item.network_block.label"),
             permission_set_action(
                 session_id,
                 PermissionProfileUpdate {
@@ -3601,7 +3906,7 @@ fn permission_network_items(
                 },
             ),
         )
-        .with_description("Deny internet access.")
+        .with_description(t!("menu.permissions.item.network_block.desc"))
         .with_state(MenuItemState::checked(
             ctx.app.permission_profile.is_some_and(|current| {
                 current.normalized().network == PermissionNetworkPolicy::Deny
@@ -3630,7 +3935,7 @@ fn approval_scopes_refresh_item(
 ) -> MenuItem {
     let item = MenuItem::new(
         "permissions.scopes.refresh",
-        "Refresh persisted approval scopes",
+        t!("menu.permissions.item.scopes_refresh.label"),
         MenuAction::SendAppUi(AppUiCommand::ListApprovalScopes(ApprovalScopesListParams {
             session_id,
         })),
@@ -3653,7 +3958,7 @@ fn approval_scopes_refresh_item(
 fn approval_scopes_clear_item(ctx: &MenuContext<'_>) -> MenuItem {
     MenuItem::new(
         "permissions.scopes.clear",
-        "Clear persisted approval scopes",
+        t!("menu.permissions.item.scopes_clear.label"),
         MenuAction::Noop,
     )
     .with_description("Requires scopes/clear.")
@@ -3758,11 +4063,11 @@ fn permission_method_row(ctx: &MenuContext<'_>, method: &'static str) -> MenuPre
 
 fn method_missing_reason(ctx: &MenuContext<'_>, method: &str) -> String {
     if let Some(reason) = ctx.availability.unsupported_method_reason(method) {
-        format!("AppUI method `{method}` is unsupported: {reason}")
+        format!("Octos UI method `{method}` is unsupported: {reason}")
     } else if ctx.availability.capabilities.is_none() {
-        "AppUI capabilities are not available".into()
+        "Octos UI capabilities are not available".into()
     } else {
-        format!("AppUI method `{method}` is not advertised by this backend.")
+        format!("Octos UI method `{method}` is not advertised by this backend.")
     }
 }
 
@@ -3899,7 +4204,7 @@ fn mcp_config_description(server: &McpConfigEntry) -> String {
         parts.push(format!("error: {last_error}"));
     }
     if parts.is_empty() {
-        "Configured by AppUI.".into()
+        "Configured by Octos UI.".into()
     } else {
         parts.join(" | ")
     }
@@ -3941,7 +4246,7 @@ fn tool_config_description(tool: &ToolConfigEntry) -> String {
         parts.push(format!("tags {}", tool.tags.join(", ")));
     }
     if parts.is_empty() {
-        "Configured by AppUI.".into()
+        "Configured by Octos UI.".into()
     } else {
         parts.join(" | ")
     }
@@ -4177,10 +4482,14 @@ fn capability_summary_item(ctx: &MenuContext<'_>) -> MenuItem {
             capabilities.features().len(),
             capabilities.unsupported_methods().len()
         ),
-        None => "No AppUI capabilities have been advertised yet".into(),
+        None => "No Octos UI capabilities have been advertised yet".into(),
     };
-    MenuItem::new("status.capabilities", "Capabilities", MenuAction::Noop)
-        .with_description(description)
+    MenuItem::new(
+        "status.capabilities",
+        t!("menu.status.item.capabilities.label"),
+        MenuAction::Noop,
+    )
+    .with_description(description)
 }
 
 fn status_runtime_items(ctx: &MenuContext<'_>) -> Vec<MenuItem> {
@@ -4190,8 +4499,12 @@ fn status_runtime_items(ctx: &MenuContext<'_>) -> Vec<MenuItem> {
             .supports_method(AppUiActionKind::SessionStatusRead.method())
         {
             return vec![
-                MenuItem::new("status.server", "Server runtime status", MenuAction::Noop)
-                    .disabled("session/status/read is advertised but no result is cached yet"),
+                MenuItem::new(
+                    "status.server",
+                    t!("menu.status.item.server.label"),
+                    MenuAction::Noop,
+                )
+                .disabled("session/status/read is advertised but no result is cached yet"),
             ];
         }
         return Vec::new();
@@ -4200,83 +4513,128 @@ fn status_runtime_items(ctx: &MenuContext<'_>) -> Vec<MenuItem> {
     let mut items = Vec::new();
     if let Some(health) = status_health_value(status) {
         items.push(
-            MenuItem::new("status.health", "Health", MenuAction::Noop).with_description(health),
+            MenuItem::new(
+                "status.health",
+                t!("menu.statusline.item.health"),
+                MenuAction::Noop,
+            )
+            .with_description(health),
         );
     }
     if let Some(usage) = status_usage_value(status) {
-        items
-            .push(MenuItem::new("status.usage", "Usage", MenuAction::Noop).with_description(usage));
+        items.push(
+            MenuItem::new(
+                "status.usage",
+                t!("menu.statusline.item.usage"),
+                MenuAction::Noop,
+            )
+            .with_description(usage),
+        );
     }
     items.extend(runtime_policy_items(status));
     items
 }
 
 fn runtime_policy_items(status: &crate::model::SessionRuntimeStatus) -> Vec<MenuItem> {
-    [
+    let rows: &[(&'static str, &str, Option<String>)] = &[
         (
             "status.runtime_mode",
-            "Runtime Mode",
+            "menu.statusline.item.runtime_mode",
             status_runtime_mode_value(status),
         ),
-        ("status.profile", "Profile", status_profile_value(status)),
-        ("status.model", "Model", status_model_value(status)),
-        ("status.provider", "Provider", status_provider_value(status)),
+        (
+            "status.profile",
+            "menu.statusline.item.profile",
+            status_profile_value(status),
+        ),
+        (
+            "status.model",
+            "menu.statusline.item.model",
+            status_model_value(status),
+        ),
+        (
+            "status.provider",
+            "menu.statusline.item.provider",
+            status_provider_value(status),
+        ),
         (
             "status.approval_policy",
-            "Approval Policy",
+            "menu.statusline.item.approval_policy",
             status_approval_policy_value(status),
         ),
         (
             "status.sandbox",
-            "Sandbox Mode",
+            "menu.statusline.item.sandbox_mode",
             status_sandbox_value(status),
         ),
         (
             "status.filesystem_scope",
-            "Filesystem Scope",
+            "menu.statusline.item.filesystem_scope",
             status_filesystem_scope_value(status),
         ),
-        ("status.network", "Network", status_network_value(status)),
+        (
+            "status.network",
+            "menu.statusline.item.network",
+            status_network_value(status),
+        ),
         (
             "status.permission_profile",
-            "Permissions",
+            "menu.statusline.item.permissions",
             status_permission_value(status),
         ),
         (
             "status.dangerous",
-            "Dangerous Access",
+            "menu.statusline.item.dangerous_access",
             status_dangerous_access_value(status),
         ),
         (
             "status.tool_policy",
-            "Tool Policy",
+            "menu.statusline.item.tool_policy",
             status_tool_policy_value(status),
         ),
         (
             "status.tool_contract",
-            "Tool Contract",
+            "menu.statusline.item.tool_contract",
             status_tool_contract_value(status),
         ),
         (
             "status.model_toolset",
-            "Model Toolset",
+            "menu.statusline.item.model_toolset",
             status_model_toolset_value(status),
         ),
         (
             "status.tool_discovery",
-            "Tool Discovery",
+            "menu.statusline.item.tool_discovery",
             status_tool_discovery_value(status),
         ),
-        ("status.mcp", "MCP", status_mcp_value(status)),
-        ("status.memory", "Memory", status_memory_value(status)),
-        ("status.qoe", "QoE", status_qoe_value(status)),
-        ("status.queue", "Queue", status_queue_value(status)),
-    ]
-    .into_iter()
-    .filter_map(|(id, label, value)| {
-        value.map(|value| MenuItem::new(id, label, MenuAction::Noop).with_description(value))
-    })
-    .collect()
+        (
+            "status.mcp",
+            "menu.statusline.item.mcp",
+            status_mcp_value(status),
+        ),
+        (
+            "status.memory",
+            "menu.statusline.item.memory",
+            status_memory_value(status),
+        ),
+        (
+            "status.qoe",
+            "menu.statusline.item.qoe",
+            status_qoe_value(status),
+        ),
+        (
+            "status.queue",
+            "menu.statusline.item.queue",
+            status_queue_value(status),
+        ),
+    ];
+    rows.iter()
+        .filter_map(|(id, key, value)| {
+            value
+                .as_ref()
+                .map(|v| MenuItem::new(*id, t!(*key), MenuAction::Noop).with_description(v))
+        })
+        .collect()
 }
 
 fn status_preview_rows(ctx: &MenuContext<'_>) -> Vec<MenuPreviewRow> {
@@ -4575,7 +4933,7 @@ fn status_usage_value(status: &crate::model::SessionRuntimeStatus) -> Option<Str
     (!parts.is_empty()).then(|| parts.join(" | "))
 }
 
-fn usage_item(id: &'static str, label: &'static str, value: Option<u64>) -> MenuItem {
+fn usage_item(id: &'static str, label: String, value: Option<u64>) -> MenuItem {
     MenuItem::new(id, label, MenuAction::Noop)
         .with_description(value.map_or_else(|| "not reported".into(), |value| value.to_string()))
         .maybe_disabled(value.is_none().then_some("not reported".into()))
@@ -4585,9 +4943,13 @@ fn cost_item(value: Option<u64>) -> MenuItem {
     let description = value
         .map(format_micros_usd)
         .unwrap_or_else(|| "not reported".into());
-    MenuItem::new("cost.estimated", "Estimated Cost", MenuAction::Noop)
-        .with_description(description)
-        .maybe_disabled(value.is_none().then_some("not reported".into()))
+    MenuItem::new(
+        "cost.estimated",
+        t!("menu.cost.item.estimated.label"),
+        MenuAction::Noop,
+    )
+    .with_description(description)
+    .maybe_disabled(value.is_none().then_some("not reported".into()))
 }
 
 fn format_micros_usd(value: u64) -> String {
@@ -4624,10 +4986,15 @@ fn action_for_command_entry(entry: &CommandEntry) -> MenuAction {
 }
 
 fn command_description(description: &str, aliases: &[&str]) -> String {
+    let desc = t!(description).into_owned();
     if aliases.is_empty() {
-        description.to_owned()
+        desc
     } else {
-        format!("{description} Aliases: {}", aliases.join(", "))
+        format!(
+            "{desc} {} {}",
+            t!("command.aliases_label"),
+            aliases.join(", ")
+        )
     }
 }
 
@@ -4635,45 +5002,81 @@ fn status_line_items(app: MenuAppSnapshot<'_>) -> [(&'static str, String, bool);
     [
         (
             "state",
-            format!("State: {}", app.status.unwrap_or("idle")),
+            t!(
+                "menu.statusline.item.state_label",
+                value = app.status.unwrap_or("idle")
+            )
+            .into_owned(),
             true,
         ),
         (
             "target",
-            format!("Target: {}", app.target.unwrap_or("local")),
+            t!(
+                "menu.statusline.item.target_label",
+                value = app.target.unwrap_or("local")
+            )
+            .into_owned(),
             true,
         ),
         (
             "cwd",
-            format!("Cwd: {}", app.cwd.unwrap_or("unknown")),
+            t!(
+                "menu.statusline.item.cwd_label",
+                value = app.cwd.unwrap_or("unknown")
+            )
+            .into_owned(),
             true,
         ),
         (
             "model",
-            format!("Model: {}", app.current_model.unwrap_or("not supplied")),
+            t!(
+                "menu.statusline.item.model_label",
+                value = app.current_model.unwrap_or("not supplied")
+            )
+            .into_owned(),
             true,
         ),
         (
             "profile",
-            format!("Profile: {}", app.current_profile.unwrap_or("default")),
+            t!(
+                "menu.statusline.item.profile_label",
+                value = app.current_profile.unwrap_or("default")
+            )
+            .into_owned(),
             true,
         ),
         (
             "session",
-            format!("Session: {}", app.selected_session_title.unwrap_or("none")),
+            t!(
+                "menu.statusline.item.session_label",
+                value = app.selected_session_title.unwrap_or("none")
+            )
+            .into_owned(),
             true,
         ),
         (
             "task",
-            format!("Task: {}", app.selected_task_title.unwrap_or("none")),
+            t!(
+                "menu.statusline.item.task_label",
+                value = app.selected_task_title.unwrap_or("none")
+            )
+            .into_owned(),
             false,
         ),
         (
             "background_tasks",
-            format!("Background: {}", app.background_task_count),
+            t!(
+                "menu.statusline.item.background_label",
+                value = app.background_task_count
+            )
+            .into_owned(),
             true,
         ),
-        ("approval", "Approval state".into(), true),
+        (
+            "approval",
+            t!("menu.statusline.item.approval_label").into_owned(),
+            true,
+        ),
     ]
 }
 
@@ -4726,16 +5129,22 @@ fn app_snapshot_rows(app: MenuAppSnapshot<'_>) -> Vec<MenuPreviewRow> {
 }
 
 fn keymap_tabs() -> Vec<MenuTab> {
-    ["Global", "Composer", "Menu", "Task", "Approval"]
-        .into_iter()
-        .enumerate()
-        .map(|(idx, label)| MenuTab {
-            id: label.to_ascii_lowercase(),
-            label: label.into(),
-            active: idx == 0,
-            count: None,
-        })
-        .collect()
+    [
+        ("global", t!("menu.keymap.tab.global")),
+        ("composer", t!("menu.keymap.tab.composer")),
+        ("menu", t!("menu.keymap.tab.menu")),
+        ("task", t!("menu.keymap.tab.task")),
+        ("approval", t!("menu.keymap.tab.approval")),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(idx, (id, label))| MenuTab {
+        id: id.to_owned(),
+        label: label.into_owned(),
+        active: idx == 0,
+        count: None,
+    })
+    .collect()
 }
 
 fn numeric_shortcut(index: usize) -> Option<KeyBinding> {
@@ -5185,11 +5594,11 @@ mod tests {
             "info pane should show the staged workspace path: {body:?}"
         );
         assert!(
-            body.contains("Status:"),
+            body.contains(&onboarding_workspace_status_label(&onboarding)),
             "info pane should show the validation status: {body:?}"
         );
         assert!(
-            body.contains("Permissions:"),
+            body.contains(&onboarding_permission_profile_label(&onboarding)),
             "info pane should show the staged permission profile: {body:?}"
         );
         assert!(
@@ -5241,7 +5650,10 @@ mod tests {
             .iter()
             .find(|item| item.id == "onboard.provider.test")
             .expect("test provider row");
-        assert_eq!(test_item.label, "Testing connection...");
+        assert_eq!(
+            test_item.label,
+            t!("onboarding.provider.test_testing").into_owned()
+        );
         assert!(test_item.state.loading);
         assert_eq!(test_item.disabled_reason, None);
         let save_item = spec
@@ -5249,7 +5661,10 @@ mod tests {
             .iter()
             .find(|item| item.id == "onboard.provider.save")
             .expect("save provider row");
-        assert_eq!(save_item.label, "Save unavailable while testing");
+        assert_eq!(
+            save_item.label,
+            t!("onboarding.provider.save_unavailable_testing").into_owned()
+        );
         assert_eq!(save_item.disabled_reason, None);
         let family_item = spec
             .items
@@ -5283,7 +5698,8 @@ mod tests {
             panic!("provider step must keep a Text teaching pane");
         };
         assert!(
-            body.contains("Selected provider:") && body.contains("Profile:"),
+            body.contains(t!("onboarding.preview.provider.selected").as_ref())
+                && body.contains(t!("onboarding.preview.provider.profile").as_ref()),
             "info pane should surface the read-only provider/profile status: {body:?}"
         );
     }
@@ -5332,7 +5748,10 @@ mod tests {
             .iter()
             .find(|item| item.id == "provider.test")
             .expect("provider test row");
-        assert_eq!(test_item.label, "Testing connection...");
+        assert_eq!(
+            test_item.label,
+            t!("onboarding.provider.test_testing").into_owned()
+        );
         assert!(test_item.state.loading);
         assert_eq!(test_item.disabled_reason, None);
         let fallback_item = spec
@@ -5340,7 +5759,10 @@ mod tests {
             .iter()
             .find(|item| item.id == "provider.fallback")
             .expect("provider fallback row");
-        assert_eq!(fallback_item.label, "Fallback unavailable while testing");
+        assert_eq!(
+            fallback_item.label,
+            t!("onboarding.provider.fallback_unavailable_testing").into_owned()
+        );
         assert_eq!(fallback_item.disabled_reason, None);
     }
 
@@ -5380,7 +5802,7 @@ mod tests {
 
         assert_eq!(
             saved_item.label,
-            "Saved provider: fallback minimax / MiniMax-M2.5-highspeed via wisemodel"
+            onboarding_provider_saved_status_label(&onboarding)
         );
         assert_eq!(saved_item.state.checked, Some(true));
         assert_eq!(saved_item.state.required_valid, Some(true));
@@ -6365,7 +6787,7 @@ mod tests {
             .expect("toggle item");
         let MenuAction::SendAppUi(AppUiCommand::SetMcpConfigEnabled(params)) = &toggle.action
         else {
-            panic!("toggle should call AppUI set_enabled");
+            panic!("toggle should call Octos UI set_enabled");
         };
         assert_eq!(params.server, "github");
         assert!(!params.enabled);
@@ -6430,7 +6852,7 @@ mod tests {
             .expect("tool toggle");
         let MenuAction::SendAppUi(AppUiCommand::SetToolConfigEnabled(params)) = &toggle.action
         else {
-            panic!("toggle should call AppUI set_enabled");
+            panic!("toggle should call Octos UI set_enabled");
         };
         assert_eq!(params.tool, "web_fetch");
         assert!(params.enabled);
@@ -6684,7 +7106,7 @@ mod tests {
         };
         assert!(
             spec.message
-                .contains("AppUI permission methods are not advertised")
+                .contains("Octos UI permission methods are not advertised")
         );
     }
 

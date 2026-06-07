@@ -14,6 +14,7 @@ use crate::menu::types::{
 
 pub const MENU_HELP: &str = "help";
 pub const MENU_ONBOARD: &str = "onboard";
+pub const MENU_ONBOARD_LANGUAGE: &str = "onboard-language";
 pub const MENU_ONBOARD_FAMILY: &str = "onboard-family";
 pub const MENU_ONBOARD_MODEL: &str = "onboard-model";
 pub const MENU_ONBOARD_ROUTE: &str = "onboard-route";
@@ -458,7 +459,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "ps",
             aliases: &["tasks"],
-            description: "Show background task and process status.",
+            description: "command.ps.desc",
             category: CommandCategory::Runtime,
             availability: CommandAvailability::always(),
             inline_args: InlineArgMode::None,
@@ -466,8 +467,12 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         },
         CommandSpec {
             name: "stop",
-            aliases: &["interrupt"],
-            description: "Interrupt the active turn or stop supported background work.",
+            // `esc` is an alias so a user who types `/esc` (a natural guess for
+            // "escape/cancel this turn") hits the same interrupt path as the
+            // Esc key, Ctrl-C, and `/stop`. Without it `/esc` was an unknown
+            // command and the turn kept running.
+            aliases: &["interrupt", "esc"],
+            description: "command.stop.desc",
             category: CommandCategory::Runtime,
             availability: stop_availability,
             inline_args: InlineArgMode::None,
@@ -476,7 +481,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "help",
             aliases: &["?", "commands"],
-            description: "Show available commands.",
+            description: "command.help.desc",
             category: CommandCategory::Help,
             availability: CommandAvailability::always(),
             inline_args: InlineArgMode::Optional,
@@ -496,7 +501,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "exit",
             aliases: &["quit"],
-            description: "Quit the TUI.",
+            description: "command.exit.desc",
             category: CommandCategory::Runtime,
             availability: CommandAvailability::always(),
             inline_args: InlineArgMode::None,
@@ -505,7 +510,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "onboard",
             aliases: &["setup", "wizard"],
-            description: "Open the setup wizard to configure or reconfigure your profile, provider, model, and workspace.",
+            description: "command.onboard.desc",
             category: CommandCategory::Settings,
             availability: CommandAvailability::app_ui_read(&[])
                 .with_session(SessionRequirement::Any)
@@ -518,7 +523,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "login",
             aliases: &["auth"],
-            description: "Sign in with email OTP or inspect current auth state.",
+            description: "command.login.desc",
             category: CommandCategory::Session,
             availability: CommandAvailability::app_ui_read(&[])
                 .with_session(SessionRequirement::Any)
@@ -531,7 +536,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "provider",
             aliases: &["providers"],
-            description: "Configure profile-owned LLM providers and routes.",
+            description: "command.provider.desc",
             category: CommandCategory::Settings,
             availability: CommandAvailability::app_ui_read(&[])
                 .with_session(SessionRequirement::Any)
@@ -544,7 +549,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "model",
             aliases: &[],
-            description: "Choose a server-returned profile LLM model.",
+            description: "command.model.desc",
             category: CommandCategory::Session,
             availability: CommandAvailability::app_ui_read(&[])
                 .with_session(SessionRequirement::Any)
@@ -555,7 +560,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "status",
             aliases: &[],
-            description: "Show snapshot-backed session, runtime, and connection status.",
+            description: "command.status.desc",
             category: CommandCategory::Runtime,
             availability: CommandAvailability::always(),
             inline_args: InlineArgMode::None,
@@ -564,7 +569,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "cost",
             aliases: &["usage"],
-            description: "Show server-reported token and cost usage.",
+            description: "command.cost.desc",
             category: CommandCategory::Runtime,
             availability: CommandAvailability::app_ui_read(&[APPUI_METHOD_SESSION_STATUS_READ]),
             inline_args: InlineArgMode::None,
@@ -573,7 +578,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "theme",
             aliases: &[],
-            description: "Choose the local TUI theme.",
+            description: "command.theme.desc",
             category: CommandCategory::Settings,
             availability: CommandAvailability::always(),
             inline_args: InlineArgMode::None,
@@ -582,7 +587,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "lang",
             aliases: &["language"],
-            description: "Switch the UI display language, e.g. /lang zh (en, zh).",
+            description: "command.lang.desc",
             category: CommandCategory::Settings,
             availability: CommandAvailability::always(),
             inline_args: InlineArgMode::Optional,
@@ -591,7 +596,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "thinking",
             aliases: &["think"],
-            description: "Set reasoning effort for thinking models: /thinking low|medium|high|max|default.",
+            description: "command.thinking.desc",
             category: CommandCategory::Settings,
             availability: CommandAvailability::always(),
             inline_args: InlineArgMode::Optional,
@@ -600,7 +605,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "statusline",
             aliases: &["status-line"],
-            description: "Configure bottom status line items.",
+            description: "command.statusline.desc",
             category: CommandCategory::Settings,
             availability: CommandAvailability::always(),
             inline_args: InlineArgMode::None,
@@ -609,7 +614,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "title",
             aliases: &[],
-            description: "Configure terminal title items.",
+            description: "command.title.desc",
             category: CommandCategory::Settings,
             availability: CommandAvailability::always(),
             inline_args: InlineArgMode::None,
@@ -618,7 +623,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "keymap",
             aliases: &["keys"],
-            description: "Inspect and edit TUI key bindings.",
+            description: "command.keymap.desc",
             category: CommandCategory::Settings,
             availability: CommandAvailability::always(),
             inline_args: InlineArgMode::None,
@@ -627,7 +632,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "permissions",
             aliases: &["permission"],
-            description: "Review or change approval, filesystem, and network permissions.",
+            description: "command.permissions.desc",
             category: CommandCategory::Session,
             availability: CommandAvailability::app_ui_read(&[])
                 .with_required_methods_any(APPUI_PERMISSION_MENU_METHODS_ANY),
@@ -637,7 +642,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "mcp",
             aliases: &[],
-            description: "List or configure server-owned MCP entries when supported.",
+            description: "command.mcp.desc",
             category: CommandCategory::Runtime,
             availability: CommandAvailability::app_ui_read(&[])
                 .with_required_methods_any(APPUI_MCP_MENU_METHODS_ANY),
@@ -647,7 +652,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "tools",
             aliases: &["tool-settings"],
-            description: "List or configure server-owned tool settings when supported.",
+            description: "command.tools.desc",
             category: CommandCategory::Settings,
             availability: CommandAvailability::app_ui_read(&[])
                 .with_session(SessionRequirement::Any)
@@ -658,7 +663,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "skills",
             aliases: &["skill"],
-            description: "List, search, install, or remove profile skills.",
+            description: "command.skills.desc",
             category: CommandCategory::Settings,
             availability: CommandAvailability::app_ui_read(&[])
                 .with_session(SessionRequirement::Any)
@@ -669,7 +674,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "task",
             aliases: &[],
-            description: "Read backend task artifacts.",
+            description: "command.task.desc",
             category: CommandCategory::Runtime,
             availability: CommandAvailability::app_ui_read(&[])
                 .with_session(SessionRequirement::Any)
@@ -681,7 +686,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "threads",
             aliases: &["thread"],
-            description: "Inspect the backend thread graph.",
+            description: "command.threads.desc",
             category: CommandCategory::Runtime,
             availability: CommandAvailability::app_ui_read(&[])
                 .with_session(SessionRequirement::Any)
@@ -693,7 +698,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "turn",
             aliases: &[],
-            description: "Inspect backend turn lifecycle state.",
+            description: "command.turn.desc",
             category: CommandCategory::Runtime,
             availability: CommandAvailability::app_ui_read(&[])
                 .with_session(SessionRequirement::Any)
@@ -705,7 +710,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "review",
             aliases: &["code-review"],
-            description: "Start the backend-owned code review workflow.",
+            description: "command.review.desc",
             category: CommandCategory::Runtime,
             availability: CommandAvailability::app_ui_mutating(&[])
                 .with_task(TaskRequirement::Idle)
@@ -721,7 +726,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "agents",
             aliases: &["agent"],
-            description: "Inspect or interrupt backend-owned subagents.",
+            description: "command.agents.desc",
             category: CommandCategory::Runtime,
             availability: CommandAvailability::app_ui_read(&[])
                 .with_required_methods_any(APPUI_AGENTS_MENU_METHODS_ANY)
@@ -732,7 +737,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "goal",
             aliases: &[],
-            description: "View, set, pause, resume, or clear the persisted session goal.",
+            description: "command.goal.desc",
             category: CommandCategory::Runtime,
             availability: CommandAvailability::app_ui_read(&[])
                 .with_required_methods_any(APPUI_GOAL_MENU_METHODS_ANY)
@@ -743,7 +748,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             name: "loop",
             aliases: &[],
-            description: "Create, list, pause, resume, fire-now, or delete backend loops.",
+            description: "command.loop.desc",
             category: CommandCategory::Runtime,
             availability: CommandAvailability::app_ui_read(&[])
                 .with_required_methods_any(APPUI_LOOP_MENU_METHODS_ANY)
@@ -802,6 +807,27 @@ mod tests {
         };
         assert_eq!(command.name, "help");
         assert_eq!(invocation.args, "theme");
+    }
+
+    #[test]
+    fn slash_esc_resolves_to_the_stop_interrupt_command() {
+        // The user complaint: typing `/esc` did nothing because `esc` was not
+        // a registered command/alias — only the Esc KEY, Ctrl-C, and `/stop`
+        // emitted the interrupt. `/esc` now aliases the `stop` command so it
+        // routes to the same `StopActiveTurn` → `InterruptTurn` path.
+        let registry = CommandRegistry::with_core_commands();
+        assert_eq!(
+            registry.find("/esc").map(|command| command.name),
+            Some("stop"),
+            "/esc must alias the stop/interrupt command"
+        );
+        assert_eq!(
+            registry.find("esc").map(|command| command.name),
+            Some("stop")
+        );
+        // The pre-existing names/aliases still resolve to the same command.
+        assert_eq!(registry.find("/stop").map(|c| c.name), Some("stop"));
+        assert_eq!(registry.find("/interrupt").map(|c| c.name), Some("stop"));
     }
 
     #[test]

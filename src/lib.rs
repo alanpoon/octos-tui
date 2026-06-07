@@ -55,7 +55,10 @@ mod i18n_tests {
     #[test]
     fn onboarding_ux2_keys_resolve_in_en_and_zh() {
         let keys = [
+            "onboarding.language.title",
+            "onboarding.language.description",
             "onboarding.wizard.explain_title",
+            "onboarding.wizard.explain.language",
             "onboarding.wizard.explain.profile",
             "onboarding.wizard.explain.provider",
             "onboarding.wizard.explain.connect",
@@ -66,6 +69,10 @@ mod i18n_tests {
             "onboarding.wizard.workspace_open_label",
             "onboarding.wizard.workspace_open_description",
             "onboarding.wizard.workspace_locked_reason",
+            "onboarding.preview.provider.configured_title",
+            "onboarding.preview.workspace.staged_title",
+            "menu.lang.item.en.label",
+            "menu.lang.item.zh.label",
         ];
         for key in keys {
             for locale in ["en", "zh"] {
