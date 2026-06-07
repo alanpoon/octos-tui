@@ -10,14 +10,18 @@ pub mod app;
 pub mod autonomy;
 pub mod cli;
 pub mod client_event;
+pub mod clipboard;
 pub mod cmd;
 pub mod event_loop;
+pub mod insert_history;
 pub mod keymap;
 pub mod menu;
 pub mod model;
 pub mod store;
 pub mod theme;
 pub mod transport;
+pub mod tui_terminal;
+pub mod viewport;
 
 #[cfg(test)]
 mod i18n_tests {
@@ -43,5 +47,45 @@ mod i18n_tests {
         let locales = rust_i18n::available_locales!();
         assert!(locales.contains(&"en"), "missing en: {locales:?}");
         assert!(locales.contains(&"zh"), "missing zh: {locales:?}");
+    }
+
+    /// UX2 A.3/B.2: the new onboarding teaching-panel + workspace-step keys
+    /// resolve in BOTH locales (rust-i18n echoes the key on a miss, so a typo or
+    /// a missing `zh` translation would leave the dotted key in the output).
+    #[test]
+    fn onboarding_ux2_keys_resolve_in_en_and_zh() {
+        let keys = [
+            "onboarding.language.title",
+            "onboarding.language.description",
+            "onboarding.wizard.explain_title",
+            "onboarding.wizard.explain.language",
+            "onboarding.wizard.explain.profile",
+            "onboarding.wizard.explain.provider",
+            "onboarding.wizard.explain.connect",
+            "onboarding.wizard.explain.save",
+            "onboarding.wizard.explain.workspace",
+            "onboarding.wizard.explain.activate",
+            "onboarding.wizard.workspace_title",
+            "onboarding.wizard.workspace_open_label",
+            "onboarding.wizard.workspace_open_description",
+            "onboarding.wizard.workspace_locked_reason",
+            "onboarding.preview.provider.configured_title",
+            "onboarding.preview.workspace.staged_title",
+            "menu.lang.item.en.label",
+            "menu.lang.item.zh.label",
+        ];
+        for key in keys {
+            for locale in ["en", "zh"] {
+                let value = t!(key, locale = locale);
+                assert_ne!(
+                    &*value, key,
+                    "missing {locale} translation for `{key}` (got the raw key back)"
+                );
+                assert!(
+                    !value.trim().is_empty(),
+                    "empty {locale} translation for `{key}`"
+                );
+            }
+        }
     }
 }

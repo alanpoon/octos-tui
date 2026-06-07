@@ -222,6 +222,81 @@ onboarding:
     continue: "继续"
     create_action: "创建档案"
     footer: "上/下 选择 | 回车 编辑或继续 | 输入后回车保存"
+  language:
+    title: "选择语言"
+    label: "语言"
+    description: "选择引导流程和当前会话使用的界面语言。"
+    footer: "回车 选择语言 | Esc 返回"
+  auth:
+    verified: "认证：已验证"
+    code_sent: "认证：验证码已发送至 %{email}"
+    email: "认证：邮箱 %{email}"
+    email_not_set: "认证：邮箱未设置"
+  profile:
+    created: "本地档案：%{profile}"
+    ready: "本地档案：%{username} 已就绪"
+    required: "本地档案：需要姓名、用户名和邮箱"
+  permissions:
+    default_hint: "权限：（默认 — 使用 /onboard permissions <mode>）"
+    mode_unchanged: "（模式未更改）"
+    unchanged: "（未更改）"
+    network_allowed: "网络已允许"
+    network_blocked: "网络已阻止"
+    network_unchanged: "（网络未更改）"
+    staged: "权限：已暂存 %{mode} · %{approval} · %{network}"
+    staged_clamped: "权限：已暂存 %{mode} · %{approval} · %{network} — 服务器已收紧：%{mismatch}"
+  workspace:
+    active: "%{path}（当前）"
+    unset: "（使用 /onboard workspace <路径>）"
+    writable: "可写"
+    read_only: "只读"
+    toml_present: " · .octos-workspace.toml"
+    status_unvalidated: "状态：未验证"
+    status_validating: "状态：验证中……"
+    status_ok: "状态：正常（%{writable}%{toml}）"
+    status_invalid: "状态：无效 — %{reason}"
+  provider:
+    test: "测试连接"
+    test_testing: "正在测试连接……"
+    test_unavailable_saving: "保存期间无法测试"
+    tested: "连接已测试"
+    test_failed: "测试失败 — %{reason}"
+    save: "保存供应商"
+    saving: "正在保存供应商……"
+    save_unavailable_testing: "测试期间无法保存"
+    saved: "供应商已保存"
+    add_fallback: "添加为备用"
+    fallback_unavailable_testing: "测试期间无法添加备用"
+    saved_status_target: "已保存供应商：%{target} %{label}"
+    saved_status_primary: "已保存供应商：主供应商 %{label}"
+    saved_status_none: "已保存供应商：无"
+    primary: "主供应商"
+    fallback: "备用"
+  disabled:
+    name_empty: "姓名为空"
+    username_empty: "用户名为空"
+    email_empty: "邮箱为空"
+    otp_empty: "OTP 验证码为空"
+    profile_unresolved: "档案未解析；请使用 /onboard profile <profile_id>"
+    provider_incomplete: "供应商选择不完整"
+    api_key_empty: "API 密钥为空"
+    choose_family_first: "请先选择模型系列"
+    choose_family_model_first: "请先选择模型系列和模型"
+    choose_provider_first: "请先选择供应商"
+    save_provider_first: "请先保存供应商"
+    validate_workspace_first: "请先验证工作区"
+    workspace_validating: "工作区验证进行中"
+    workspace_invalid: "工作区无效：%{reason}"
+  preview:
+    provider:
+      configured_title: "已配置（此处只读）："
+      profile: "档案"
+      selected: "已选择供应商"
+    workspace:
+      staged_title: "已暂存（通过命令设置，此处不可选择）："
+      workspace: "工作区"
+      workspace_hint: "/onboard workspace <路径>   （可用 `.` 表示当前文件夹）"
+      permissions_hint: "/onboard permissions <default|read-only|workspace-write|full-access>"
   wizard:
     setup_title: "Octos 设置向导"
     progress_title: "设置进度"
@@ -229,6 +304,7 @@ onboarding:
     subtitle: "%{header} · %{purpose}"
     footer: "下一步：%{next} | 上/下 移动 | 回车 选择 | Esc 关闭"
     step:
+      language: "语言"
       profile: "档案"
       provider: "供应商"
       connect: "连接"
@@ -236,12 +312,28 @@ onboarding:
       workspace: "工作区"
       activate: "激活"
     purpose:
+      language: "选择界面语言。默认使用 English。"
       profile: "为 Octos 创建本地身份。仅保存在本机，不会发送邮件。"
       provider: "选择 Octos 调用的 AI 模型（模型系列、模型和供应商线路）。"
       connect: "粘贴供应商 API 密钥并进行实时测试，确认模型能正常响应。"
       save: "将验证通过的供应商保存到档案中以便持久化。"
       workspace: "选择并验证 Octos 在编码时可读写的文件夹。"
       activate: "激活工作区：打开编码会话并开始工作。"
+    explain_title: "关于本步骤"
+    explain_progress: "设置进度 — 第 %{number}/%{total} 步"
+    explain_now: "当前：%{title}"
+    explain:
+      language: "选择完成设置时 Octos 使用的语言。\n默认已选择 English。如果想让后续引导流程和应用立即切换为中文，请选择 中文。\n之后也可以使用 `/lang` 更改。"
+      profile: "Octos 需要一个本地身份，用于关联你的设置、供应商和历史记录。\n填写姓名、简短的用户名和邮箱（仅作为本地元数据保存，不会发送任何代码），然后继续。\n该档案仅保存在本机。"
+      provider: "选择驱动 Octos 的 AI 模型。\n先选模型系列（如 GPT、Claude），再选具体模型，最后选择提供该模型的供应商线路（官方或替代线路）。\n这决定了 Octos 与谁通信以及编码辅助的质量——之后可随时更改。"
+      connect: "在依赖该模型之前，先确认它确实能够响应。\n粘贴你的供应商 API 密钥，然后运行实时测试。Octos 会发送一个小请求并报告成功或具体错误。\n这样能在此刻发现密钥错误或线路不对，而不是任务进行中才发现。"
+      save: "将验证通过的供应商持久化到档案 JSON 中，以便重启后仍然可用。\n可将其保存为主供应商（或添加为备用）。保存前，该线路仅存在于当前会话中。\n保存后，工作区步骤即可解锁。"
+      workspace: "选择 Octos 在编码时可读写的项目文件夹。\n默认使用你启动时所在的文件夹；可用 `/onboard workspace <路径>` 覆盖（用 `.` 表示当前文件夹）。然后进行验证——Octos 会检查路径是否存在、是否为目录以及是否可写。\n激活前必须有一个有效的工作区。"
+      activate: "打开编码会话并进入工作界面。\n上面的步骤都已完成：档案已创建、供应商已保存并测试通过、工作区已验证。在“激活”上按回车即可开始。\n这是最后一步——完成后你就可以开始用 Octos 编码了。"
+    workspace_title: "Octos 设置 — 工作区"
+    workspace_open_label: "继续到工作区 →"
+    workspace_open_description: "选择并验证 Octos 将要编码的项目文件夹，然后激活。"
+    workspace_locked_reason: "请先保存一个供应商"
     activate_ready_label: "▶ 激活工作区 — 打开编码会话（回车）"
     activate_blocked_label: "激活工作区 — 打开编码会话"
     activate_ready_description: "已就绪。在此按回车打开会话并开始编码。"
@@ -397,6 +489,13 @@ menu:
       task: 任务
     title: 按键映射
   lang:
+    item:
+      en:
+        desc: 使用 English 界面。
+        label: English（英语）
+      zh:
+        desc: 使用简体中文界面。
+        label: 中文
     subtitle: 界面显示语言。
     title: 语言
   login:
@@ -1061,6 +1160,8 @@ status:
   hint_registered_command: "已注册的命令"
   provider_test_in_progress: "供应商测试已在进行中"
   provider_save_in_progress: "供应商保存已在进行中"
+  copied_last_reply: "已复制上一条回复到剪贴板（%{chars} 个字符）"
+  nothing_to_copy: "暂无可复制内容（没有助手回复）"
   usage_onboard: "用法：/onboard [name|username|email|create-profile|profile|select|family|model|route|base-url|api-key-env|key|send-code|verify|catalog|save|test|finish|reset]"
   usage_login: "用法：/login [email <address>|send-code [email]|code <otp>|verify [otp]|status|me|logout]"
   usage_provider: "用法：/provider [catalog|list|select <family_id> <model_id> <route_id> [base_url] [api_key_env]|family|model|route|base-url|api-key-env|api-type|key|test|save|add-fallback]"

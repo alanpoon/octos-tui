@@ -234,6 +234,81 @@ onboarding:
     continue: "Continue"
     create_action: "Create profile"
     footer: "Up/Down choose | Enter edit or continue | type value, Enter save"
+  language:
+    title: "Choose Language"
+    label: "Language"
+    description: "Pick the UI language for onboarding and the current session."
+    footer: "Enter choose language | Esc back"
+  auth:
+    verified: "Auth: verified"
+    code_sent: "Auth: code sent to %{email}"
+    email: "Auth: email %{email}"
+    email_not_set: "Auth: email not set"
+  profile:
+    created: "Local profile: %{profile}"
+    ready: "Local profile: ready for %{username}"
+    required: "Local profile: name, username, and email required"
+  permissions:
+    default_hint: "Permissions: (default — use /onboard permissions <mode>)"
+    mode_unchanged: "(mode unchanged)"
+    unchanged: "(unchanged)"
+    network_allowed: "network allowed"
+    network_blocked: "network blocked"
+    network_unchanged: "(network unchanged)"
+    staged: "Permissions: staged %{mode} · %{approval} · %{network}"
+    staged_clamped: "Permissions: staged %{mode} · %{approval} · %{network} — server CLAMPED: %{mismatch}"
+  workspace:
+    active: "%{path} (active)"
+    unset: "(use /onboard workspace <path>)"
+    writable: "writable"
+    read_only: "read-only"
+    toml_present: " · .octos-workspace.toml"
+    status_unvalidated: "Status: not validated"
+    status_validating: "Status: validating..."
+    status_ok: "Status: OK (%{writable}%{toml})"
+    status_invalid: "Status: INVALID — %{reason}"
+  provider:
+    test: "Test connection"
+    test_testing: "Testing connection..."
+    test_unavailable_saving: "Test unavailable while saving"
+    tested: "Connection tested"
+    test_failed: "Test failed — %{reason}"
+    save: "Save provider"
+    saving: "Saving provider..."
+    save_unavailable_testing: "Save unavailable while testing"
+    saved: "Provider saved"
+    add_fallback: "Add as fallback"
+    fallback_unavailable_testing: "Fallback unavailable while testing"
+    saved_status_target: "Saved provider: %{target} %{label}"
+    saved_status_primary: "Saved provider: primary %{label}"
+    saved_status_none: "Saved provider: none"
+    primary: "primary"
+    fallback: "fallback"
+  disabled:
+    name_empty: "name is empty"
+    username_empty: "username is empty"
+    email_empty: "email is empty"
+    otp_empty: "OTP code is empty"
+    profile_unresolved: "profile is unresolved; use /onboard profile <profile_id>"
+    provider_incomplete: "provider selection is incomplete"
+    api_key_empty: "API key is empty"
+    choose_family_first: "choose family first"
+    choose_family_model_first: "choose family and model first"
+    choose_provider_first: "choose provider first"
+    save_provider_first: "save provider first"
+    validate_workspace_first: "validate workspace first"
+    workspace_validating: "workspace validation in progress"
+    workspace_invalid: "workspace invalid: %{reason}"
+  preview:
+    provider:
+      configured_title: "Configured (read-only here):"
+      profile: "Profile"
+      selected: "Selected provider"
+    workspace:
+      staged_title: "Staged (set via commands — not selectable here):"
+      workspace: "Workspace"
+      workspace_hint: "/onboard workspace <path>   (try `.` for the current folder)"
+      permissions_hint: "/onboard permissions <default|read-only|workspace-write|full-access>"
   wizard:
     # Wizard chrome shared by the local-profile and provider-setup screens.
     setup_title: "Octos Setup Wizard"
@@ -243,6 +318,7 @@ onboarding:
     footer: "Next: %{next} | Up/Down move | Enter select | Esc close"
     # Short checklist labels (right-side panel), one per step.
     step:
+      language: "Language"
       profile: "Profile"
       provider: "Provider"
       connect: "Connect"
@@ -251,12 +327,34 @@ onboarding:
       activate: "Activate"
     # One-line purpose ("why this step exists") per step.
     purpose:
+      language: "Choose the UI language. English is selected by default."
       profile: "Create a local identity for Octos. Stays on this machine; no email is sent."
       provider: "Pick which AI model Octos talks to (model family, model, and provider route)."
       connect: "Paste the provider API key and run a live test so we know the model answers."
       save: "Save the verified provider into your profile so it persists."
       workspace: "Choose and validate the folder Octos may read and edit while coding."
       activate: "Activate the workspace: open the coding session and start working."
+    # Right-pane TEACHING panel (A.3). `explain_title` heads the pane;
+    # `explain_progress` is the compact progress line; `explain_now` heads the
+    # current-step prose. Each `explain.<step>` is multi-line prose ("\n" breaks)
+    # describing what the step is for, what to do, and why it matters.
+    explain_title: "About this step"
+    explain_progress: "Setup progress — step %{number} of %{total}"
+    explain_now: "Now: %{title}"
+    explain:
+      language: "Choose the language Octos uses while you finish setup.\nEnglish is selected by default. Pick 中文 if you want the rest of onboarding and the app to switch immediately.\nYou can change this later with `/lang`."
+      profile: "Octos needs a local identity to attach your settings, providers, and history to.\nFill in your name, a short username, and an email (kept locally as metadata — no code is sent), then continue.\nThis profile stays on this machine."
+      provider: "Choose which AI model powers Octos.\nPick a model family (e.g. GPT, Claude), then a specific model, then the provider route that serves it (official or an alternative).\nThis decides who Octos talks to and how good the coding help is — you can change it later."
+      connect: "Prove the model actually answers before you rely on it.\nPaste your provider API key, then run the live test. Octos sends one small request and reports success or the exact error.\nThis catches a bad key or wrong route now, not mid-task."
+      save: "Persist the verified provider into your profile JSON so it survives restarts.\nSave it as your primary provider (or add it as a fallback). Until you save, the route lives only in this session.\nAfter saving, the workspace step unlocks."
+      workspace: "Pick the project folder Octos may read and edit while coding.\nIt defaults to the folder you launched from; override it with `/onboard workspace <path>` (try `.` for the current folder). Then validate — Octos checks the path exists, is a directory, and is writable.\nA valid workspace is required before you can activate."
+      activate: "Open the coding session and drop into the working surface.\nEverything above is done: profile created, provider saved and tested, workspace validated. Press Enter on Activate to start.\nThis is the finish line — after it you are coding with Octos."
+    # Workspace step screen (B.2): its own title + the row on the provider
+    # screen that opens it.
+    workspace_title: "Octos Setup — Workspace"
+    workspace_open_label: "Continue to Workspace →"
+    workspace_open_description: "Stage and validate the project folder Octos will code in, then activate."
+    workspace_locked_reason: "save a provider first"
     # Activate row (provider-setup screen) label + description.
     activate_ready_label: "▶ Activate workspace — open coding session (Enter)"
     activate_blocked_label: "Activate workspace — open coding session"
@@ -607,6 +705,8 @@ status:
   hint_registered_command: "a registered command"
   provider_test_in_progress: "Provider test already in progress"
   provider_save_in_progress: "Provider save already in progress"
+  copied_last_reply: "Copied last reply to clipboard (%{chars} chars)"
+  nothing_to_copy: "Nothing to copy yet (no assistant reply)"
   # Usage help for slash commands
   usage_onboard: "Usage: /onboard [name|username|email|create-profile|profile|select|family|model|route|base-url|api-key-env|key|send-code|verify|catalog|save|test|finish|reset]"
   usage_login: "Usage: /login [email <address>|send-code [email]|code <otp>|verify [otp]|status|me|logout]"
@@ -761,6 +861,13 @@ menu:
       task: Task
     title: Keymap
   lang:
+    item:
+      en:
+        desc: Use English for the UI.
+        label: English
+      zh:
+        desc: Use Simplified Chinese for the UI.
+        label: 中文 (Chinese)
     subtitle: UI display language.
     title: Language
   login:

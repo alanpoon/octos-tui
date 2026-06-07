@@ -14,9 +14,13 @@ use crate::menu::types::{
 
 pub const MENU_HELP: &str = "help";
 pub const MENU_ONBOARD: &str = "onboard";
+pub const MENU_ONBOARD_LANGUAGE: &str = "onboard-language";
 pub const MENU_ONBOARD_FAMILY: &str = "onboard-family";
 pub const MENU_ONBOARD_MODEL: &str = "onboard-model";
 pub const MENU_ONBOARD_ROUTE: &str = "onboard-route";
+/// UX2 B.2: workspace staging + validation lives on its OWN onboarding step
+/// screen (the "Set Up LLM Provider" menu now configures provider/model only).
+pub const MENU_ONBOARD_WORKSPACE: &str = "onboard-workspace";
 pub const MENU_LOGIN: &str = "login";
 pub const MENU_PROVIDER: &str = "provider";
 pub const MENU_MODEL: &str = "model";
@@ -482,6 +486,17 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             availability: CommandAvailability::always(),
             inline_args: InlineArgMode::Optional,
             entry: CommandEntry::OpenMenu(MenuId::from(MENU_HELP)),
+        },
+        // Ordered after the `ps`/`stop`/`help` trio so the unknown-command
+        // "Try ..." hint (first 3 visible commands) is unchanged.
+        CommandSpec {
+            name: "copy",
+            aliases: &["yank"],
+            description: "Copy the last assistant reply to your clipboard (works over SSH).",
+            category: CommandCategory::Runtime,
+            availability: CommandAvailability::always(),
+            inline_args: InlineArgMode::None,
+            entry: CommandEntry::LocalAction(LocalAction::CopyLastReply),
         },
         CommandSpec {
             name: "exit",

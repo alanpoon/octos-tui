@@ -202,6 +202,7 @@ pub struct ProtocolAppUiBackend {
     driver: Option<ProtocolTransportDriver>,
     connection_state: ProtocolConnectionState,
     disconnected_status_reported: bool,
+    refresh_capabilities_on_reconnect: bool,
     queue: VecDeque<ClientEvent>,
     protocol: ProtocolExchange,
 }
@@ -222,6 +223,17 @@ struct ProtocolExchange {
     pending_requests: HashMap<String, PendingRequest>,
     session_cursors: HashMap<SessionKey, UiCursor>,
     next_request_id: u64,
+}
+
+struct CancelledRequest {
+    method: String,
+    event: AppUiEvent,
+}
+
+impl CancelledRequest {
+    fn is_capabilities_probe(&self) -> bool {
+        self.method == crate::model::APPUI_METHOD_CONFIG_CAPABILITIES_LIST
+    }
 }
 
 enum ProtocolTransportDriver {
@@ -335,17 +347,19 @@ impl ProtocolExchange {
         }
     }
 
-    fn cancel_pending_requests(&mut self, reason: &str) -> Vec<AppUiEvent> {
+    fn cancel_pending_requests(&mut self, reason: &str) -> Vec<CancelledRequest> {
         let mut pending_requests = self.pending_requests.drain().collect::<Vec<_>>();
         pending_requests.sort_by(|(left_id, _), (right_id, _)| left_id.cmp(right_id));
 
         pending_requests
             .into_iter()
             .map(|(id, request)| {
-                app_error(
+                let method = request.method;
+                let event = app_error(
                     "request_cancelled",
-                    format!("{} request {id} cancelled: {reason}", request.method),
-                )
+                    format!("{method} request {id} cancelled: {reason}"),
+                );
+                CancelledRequest { method, event }
             })
             .collect()
     }
@@ -886,6 +900,7 @@ impl ProtocolAppUiBackend {
             driver: None,
             connection_state: ProtocolConnectionState::Disconnected,
             disconnected_status_reported: false,
+            refresh_capabilities_on_reconnect: false,
             queue: VecDeque::new(),
             protocol: ProtocolExchange::default(),
         }
@@ -934,6 +949,7 @@ impl ProtocolAppUiBackend {
         driver.connect(runtime)?;
         let endpoint = driver.label().to_string();
         self.mark_connected(&endpoint);
+        self.refresh_capabilities_after_reconnect()?;
         if should_reopen_session {
             self.send_launch_session_open()?;
         }
@@ -967,6 +983,7 @@ impl ProtocolAppUiBackend {
         if let Some(driver) = self.driver.as_mut() {
             driver.disconnect();
         }
+        self.refresh_capabilities_on_reconnect = true;
         let cancelled_requests = self.protocol.cancel_pending_requests(&message);
 
         let should_report = self.connection_state != ProtocolConnectionState::Disconnected
@@ -979,7 +996,9 @@ impl ProtocolAppUiBackend {
             self.disconnected_status_reported = true;
         }
         self.queue
-            .extend(cancelled_requests.into_iter().map(Into::into));
+            .extend(cancelled_requests.into_iter().filter_map(|cancelled| {
+                (!cancelled.is_capabilities_probe()).then_some(cancelled.event.into())
+            }));
     }
 
     fn launch_session_open_command(&self) -> Option<AppUiCommand> {
@@ -999,6 +1018,24 @@ impl ProtocolAppUiBackend {
             return Ok(());
         };
         self.send(command)
+    }
+
+    fn send_capabilities_request(&mut self) -> Result<()> {
+        self.send(AppUiCommand::ListConfigCapabilities(
+            ConfigCapabilitiesListParams {},
+        ))
+    }
+
+    fn refresh_capabilities_after_reconnect(&mut self) -> Result<()> {
+        if !self.refresh_capabilities_on_reconnect {
+            return Ok(());
+        }
+        self.refresh_capabilities_on_reconnect = false;
+        if let Err(err) = self.send_capabilities_request() {
+            self.refresh_capabilities_on_reconnect = true;
+            return Err(err);
+        }
+        Ok(())
     }
 
     fn build_tracked_request(
@@ -1257,9 +1294,7 @@ impl AppUiBackend for ProtocolAppUiBackend {
             return Err(err);
         }
 
-        self.send(AppUiCommand::ListConfigCapabilities(
-            ConfigCapabilitiesListParams {},
-        ))?;
+        self.send_capabilities_request()?;
         if let Some(profile_id) = self.launch.profile_id.clone() {
             self.send(AppUiCommand::ProfileLlmList(ProfileLlmListParams {
                 profile_id: Some(profile_id),
@@ -4274,6 +4309,89 @@ mod tests {
         }
     }
 
+    fn spawn_capabilities_reconnect_server() -> ProtocolCaptureServer {
+        let (addr_tx, addr_rx) = mpsc::channel();
+        let (frame_tx, frame_rx) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            let runtime = Runtime::new().expect("test protocol server runtime");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind protocol test server");
+                let addr = listener.local_addr().expect("protocol test server addr");
+                addr_tx.send(addr).expect("send protocol test server addr");
+
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("accept first protocol test connection");
+                let mut ws = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("accept first protocol test websocket");
+                let first = ws
+                    .next()
+                    .await
+                    .expect("first request arrives")
+                    .expect("read first request");
+                let first = match first {
+                    WsMessage::Text(text) => text.to_string(),
+                    WsMessage::Binary(bytes) => {
+                        String::from_utf8(bytes.to_vec()).expect("binary request is UTF-8")
+                    }
+                    other => panic!("unexpected first websocket message: {other:?}"),
+                };
+                frame_tx
+                    .send(serde_json::from_str(&first).expect("first request is JSON"))
+                    .expect("capture first request");
+                drop(ws);
+
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("accept reconnect protocol test connection");
+                let mut ws = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("accept reconnect protocol test websocket");
+                let second = ws
+                    .next()
+                    .await
+                    .expect("retry request arrives")
+                    .expect("read retry request");
+                let second = match second {
+                    WsMessage::Text(text) => text.to_string(),
+                    WsMessage::Binary(bytes) => {
+                        String::from_utf8(bytes.to_vec()).expect("binary request is UTF-8")
+                    }
+                    other => panic!("unexpected reconnect websocket message: {other:?}"),
+                };
+                let frame: Value = serde_json::from_str(&second).expect("retry request is JSON");
+                frame_tx.send(frame.clone()).expect("capture retry request");
+                ws.send(WsMessage::Text(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": frame.get("id").cloned().expect("request id"),
+                        "result": {
+                            "capabilities": tui_capabilities()
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .expect("send capabilities response");
+            });
+        });
+        let addr = addr_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("protocol test server starts");
+
+        ProtocolCaptureServer {
+            endpoint: format!("ws://{addr}/ui-protocol"),
+            received: frame_rx,
+            thread,
+        }
+    }
+
     fn next_event_until(backend: &mut ProtocolAppUiBackend) -> ClientEvent {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -5736,6 +5854,62 @@ mod tests {
         assert!(error.message.contains(methods::DIFF_PREVIEW_GET));
         assert!(error.message.contains(&request.id));
         assert!(error.message.contains("transport closed for test"));
+    }
+
+    #[test]
+    fn protocol_backend_retries_cancelled_capabilities_without_surfacing_error() {
+        let server = spawn_capabilities_reconnect_server();
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(server.endpoint.clone(), None)),
+            ..AppUiLaunch::default()
+        });
+
+        backend.bootstrap().expect("bootstrap sends capabilities");
+
+        let first = server.recv_json();
+        assert_eq!(
+            first["method"],
+            crate::model::APPUI_METHOD_CONFIG_CAPABILITIES_LIST
+        );
+
+        let mut saw_disconnect_status = false;
+        let mut saw_capabilities = false;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let Some(event) = backend.next_event().expect("poll protocol backend") else {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            match event {
+                ClientEvent::Capabilities(_) => {
+                    saw_capabilities = true;
+                    break;
+                }
+                ClientEvent::App(event) => match *event {
+                    AppUiEvent::Status(status) => {
+                        saw_disconnect_status |= status.message.contains("disconnected")
+                            || status.message.contains("closed");
+                    }
+                    AppUiEvent::Error(error) if error.code == "request_cancelled" => {
+                        panic!(
+                            "capabilities cancellation should be retried, not surfaced: {error:?}"
+                        );
+                    }
+                    AppUiEvent::Error(_) => {}
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+
+        assert!(saw_disconnect_status);
+        assert!(saw_capabilities);
+        let retry = server.recv_json();
+        assert_eq!(
+            retry["method"],
+            crate::model::APPUI_METHOD_CONFIG_CAPABILITIES_LIST
+        );
+        server.join();
     }
 
     #[test]

@@ -1,6 +1,5 @@
 use ratatui::{
-    Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, LineGauge, List, ListItem, Paragraph, Wrap},
@@ -8,7 +7,7 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use octos_core::ui_protocol::approval_kinds;
+use octos_core::{SessionKey, ui_protocol::approval_kinds};
 
 use crate::{
     menu::render as menu_render,
@@ -20,9 +19,10 @@ use crate::{
         UserQuestionPickerState, extract_plan_steps, task_state_label,
     },
     theme::Palette,
+    tui_terminal::FrameLike,
 };
 
-pub fn render(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
+pub fn render(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
     if inspector_visible(app) {
         render_inspector_layout(frame, app, palette);
     } else {
@@ -43,6 +43,13 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
     }
 }
 
+/// Full-screen overlay render for the alt-screen path (inspector, onboarding,
+/// detail modals). Identical layout to [`render`]; named separately so the event
+/// loop's alt-screen branch reads clearly against the inline-viewport branch.
+pub fn render_inline_overlay(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
+    render(frame, app, palette);
+}
+
 fn inspector_visible(app: &AppState) -> bool {
     matches!(
         app.focus,
@@ -54,7 +61,679 @@ fn inspector_visible(app: &AppState) -> bool {
     )
 }
 
-fn render_chat_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
+// ===========================================================================
+// Inline-viewport rendering (codex-style scrollback model).
+//
+// The event loop keeps the live UI (live transcript tail + menus + indicators +
+// composer + status) in a small ratatui inline viewport pinned to the bottom of
+// the screen, and writes *finalized* transcript history into the terminal's
+// normal scrollback (via `insert_history`). The terminal then owns that
+// scrollback, so the user can natively mouse-select, wheel-scroll, and copy
+// prior output (incl. through tmux) with no app mode key.
+//
+// `render_viewport` is the live-UI draw; `finalized_history_lines` produces the
+// committed-only lines flushed to scrollback. Full-screen overlays (inspector,
+// onboarding, modals) fall back to the legacy `render` path under alt-screen —
+// see `wants_fullscreen_overlay`.
+// ===========================================================================
+
+/// True when the current state needs the legacy full-screen render (alt-screen),
+/// rather than the inline-viewport + scrollback chat flow. Mirrors codex using
+/// alt-screen only for transient overlays (transcript pager, resume picker).
+pub fn wants_fullscreen_overlay(app: &AppState) -> bool {
+    inspector_visible(app)
+        || onboarding_first_launch_active(app)
+        || app.task_output.active
+        || app.artifact_detail.active
+        || app.thread_graph_detail.active
+        || app.turn_state_detail.active
+}
+
+/// Watermarks for active-turn content that has already been written into native
+/// scrollback while the turn is still running. The inline viewport uses this to
+/// hide the same stable prefix so spinner ticks only repaint the live tail.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LiveTurnFinalization {
+    pub(crate) session_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) reply_flushed_text: String,
+    pub(crate) activity_flushed_items: usize,
+    pub(crate) activity_flushed_keys: Vec<String>,
+}
+
+impl LiveTurnFinalization {
+    fn new(session_id: &SessionKey, turn_id: &octos_core::ui_protocol::TurnId) -> Self {
+        Self {
+            session_id: session_id.0.clone(),
+            turn_id: turn_id.0.to_string(),
+            reply_flushed_text: String::new(),
+            activity_flushed_items: 0,
+            activity_flushed_keys: Vec::new(),
+        }
+    }
+
+    pub(crate) fn matches_turn(
+        &self,
+        session_id: &SessionKey,
+        turn_id: &octos_core::ui_protocol::TurnId,
+    ) -> bool {
+        self.session_id == session_id.0 && self.turn_id == turn_id.0.to_string()
+    }
+
+    pub(crate) fn has_flushed_content(&self) -> bool {
+        !self.reply_flushed_text.is_empty()
+            || self.activity_flushed_items > 0
+            || !self.activity_flushed_keys.is_empty()
+    }
+}
+
+/// Height (rows) the live inline viewport needs for the current chat state:
+/// the live transcript tail + menu + indicators + composer + status. Bounded so
+/// it never consumes the whole screen (history must stay visible in scrollback).
+pub fn live_ui_height(app: &AppState, width: u16, height: u16) -> u16 {
+    live_ui_height_with_finalization(app, width, height, None)
+}
+
+pub fn live_ui_height_with_finalization(
+    app: &AppState,
+    width: u16,
+    height: u16,
+    live_finalization: Option<&LiveTurnFinalization>,
+) -> u16 {
+    let composer_height = composer_height_for_size(app, width, height);
+    let active_menu = active_menu_surface(app);
+    let menu_height = menu_height_hint(active_menu.as_ref(), width, height);
+    let autonomy_height = autonomy_indicator_height(app);
+    let harness_height = harness_status_height(app);
+    let chrome = menu_height + autonomy_height + harness_height + composer_height + 1; // +1 status
+
+    let tail_height = live_tail_height_with_finalization(app, width, height, live_finalization);
+    let total = chrome.saturating_add(tail_height);
+
+    // Never let the live UI eat the whole screen: leave at least a few rows of
+    // scrollback visible above it (so the user always sees prior output and can
+    // start a selection there). Always at least the chrome.
+    let cap = height
+        .saturating_sub(LIVE_VIEWPORT_MIN_SCROLLBACK)
+        .max(chrome.min(height));
+    total.clamp(chrome.min(height).max(1), cap.max(1))
+}
+
+/// Minimum rows of scrollback to keep visible above the inline viewport.
+const LIVE_VIEWPORT_MIN_SCROLLBACK: u16 = 4;
+
+/// Desired height of the live transcript tail (in-flight / uncommitted content
+/// shown inside the viewport). Bounded; the bulk of history lives in scrollback.
+fn live_tail_height_with_finalization(
+    app: &AppState,
+    width: u16,
+    height: u16,
+    live_finalization: Option<&LiveTurnFinalization>,
+) -> u16 {
+    if launch_banner_active(app) {
+        // The empty-session launch banner wants a generous block.
+        return height.saturating_sub(8).clamp(6, 16);
+    }
+    let wrap_width = usize::from(width.saturating_sub(2)).max(1);
+    let lines = live_tail_lines_with_finalization(
+        app,
+        Palette::for_theme(app.theme),
+        wrap_width,
+        live_finalization,
+    );
+    let rows = transcript_visual_rows(&lines, wrap_width) as u16;
+    // Cap the tail so it can't dominate the viewport; the rest is in scrollback.
+    let max_tail = height.saturating_sub(10).clamp(3, 18);
+    rows.clamp(0, max_tail)
+}
+
+/// Render the live UI into the inline viewport (`frame.area()` is the viewport).
+/// Mirrors `render_chat_layout` but the top pane shows only the live transcript
+/// tail (finalized history is in scrollback, not here).
+pub fn render_viewport(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
+    render_viewport_with_finalization(frame, app, palette, None);
+}
+
+pub fn render_viewport_with_finalization(
+    frame: &mut impl FrameLike,
+    app: &AppState,
+    palette: Palette,
+    live_finalization: Option<&LiveTurnFinalization>,
+) {
+    let area = frame.area();
+    let composer_height = composer_height_for_size(app, area.width, area.height);
+    let active_menu = active_menu_surface(app);
+    let menu_height = menu_height_hint(active_menu.as_ref(), area.width, area.height)
+        .min(area.height.saturating_sub(composer_height + 1));
+    let autonomy_height = autonomy_indicator_height(app);
+    let harness_height = harness_status_height(app);
+
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(menu_height),
+            Constraint::Length(autonomy_height),
+            Constraint::Length(harness_height),
+            Constraint::Length(composer_height),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    if launch_banner_active(app) {
+        render_launch_banner(frame, app, palette, root[0]);
+    } else {
+        frame.render_widget(
+            render_live_tail_with_finalization(app, palette, root[0], live_finalization),
+            root[0],
+        );
+    }
+    if let Some(menu) = active_menu.as_ref() {
+        menu_render::render_menu_surface(frame, root[1], menu, palette);
+    }
+    if autonomy_height > 0 {
+        frame.render_widget(render_autonomy_indicator(app, palette), root[2]);
+    }
+    if harness_height > 0 {
+        render_harness_status_row(frame, app, palette, root[3]);
+    }
+    frame.render_widget(render_composer(app, palette, root[4]), root[4]);
+    set_composer_cursor(frame, app, root[4]);
+    frame.render_widget(render_status(app, palette), root[5]);
+}
+
+/// The live (uncommitted / in-flight) transcript tail rendered inside the
+/// viewport: recent-user context, turn-flow, the streaming reply, activity, and
+/// pending messages. Committed messages are NOT here — they are in scrollback.
+fn render_live_tail_with_finalization(
+    app: &AppState,
+    palette: Palette,
+    area: Rect,
+    live_finalization: Option<&LiveTurnFinalization>,
+) -> Paragraph<'static> {
+    let wrap_width = transcript_wrap_width(area);
+    let lines = live_tail_lines_with_finalization(app, palette, wrap_width, live_finalization);
+
+    let visible_height = transcript_visible_height(area);
+    let total_rows = transcript_visual_rows(&lines, wrap_width);
+    let max_scroll = total_rows.saturating_sub(visible_height);
+    let scroll_from_bottom = app.transcript_scroll.min(max_scroll);
+    let scroll_top = max_scroll.saturating_sub(scroll_from_bottom) as u16;
+
+    Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                // The inline live tail sits directly above the terminal's native
+                // scrollback (where finalized history is written on the DEFAULT
+                // background). Painting the whole tail with `surface_alt` made it
+                // a solid theme-colored rectangle that reads as "brown blocks all
+                // over the screen" against that native scrollback — the
+                // user-reported bug. Render the tail on the default background so
+                // it blends with scrollback and the terminal, matching codex's
+                // inline rendering. (The fullscreen-overlay `render_transcript`
+                // path keeps `surface_alt` — it has no terminal scrollback behind
+                // it.) Interactive cards and the composer/status set their own
+                // backgrounds on their own spans.
+                .style(Style::default().fg(palette.text))
+                .border_style(palette.border()),
+        )
+        .scroll((scroll_top, 0))
+        .wrap(Wrap { trim: false })
+}
+
+/// Build the live-tail lines (everything that is NOT finalized committed
+/// history): recent-user context pinned for the active turn, turn-flow
+/// (approvals / questions / streaming reply / activity / diff preview), and
+/// pending queued messages.
+fn active_live_finalization<'a>(
+    app: &AppState,
+    live_finalization: Option<&'a LiveTurnFinalization>,
+) -> Option<&'a LiveTurnFinalization> {
+    let (session_id, turn_id) = app.active_turn()?;
+    live_finalization.filter(|finalization| finalization.matches_turn(session_id, turn_id))
+}
+
+fn live_tail_lines_with_finalization(
+    app: &AppState,
+    palette: Palette,
+    wrap_width: usize,
+    live_finalization: Option<&LiveTurnFinalization>,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let Some(session) = app.active_session() else {
+        return lines;
+    };
+    let active_finalization = active_live_finalization(app, live_finalization);
+
+    // `should_show_turn_flow` already covers the visible-approval and
+    // visible-question cases (it ORs them in), so a single branch suffices.
+    if should_show_turn_flow(app, session) {
+        let interactive_context_visible = app
+            .approval
+            .as_ref()
+            .is_some_and(|approval| approval.visible)
+            || app
+                .user_question
+                .as_ref()
+                .is_some_and(|picker| picker.visible);
+        let show_recent_context = interactive_context_visible
+            || !active_finalization.is_some_and(LiveTurnFinalization::has_flushed_content);
+        if show_recent_context && let Some(prompt) = latest_user_message(session) {
+            push_recent_user_context(&mut lines, palette, prompt, wrap_width);
+        }
+        push_turn_flow(
+            &mut lines,
+            palette,
+            app,
+            session,
+            wrap_width,
+            active_finalization,
+        );
+    }
+
+    if !app.pending_messages.is_empty() {
+        push_pending_messages_block(&mut lines, palette, &app.pending_messages, wrap_width);
+    }
+
+    lines
+}
+
+/// The finalized transcript lines to push into scrollback: committed
+/// `session.messages` plus anchored completed turn activity logs. Append-only as
+/// long as messages are append-only; the scrollback tracker detects
+/// discontinuities (session switch / hydrate replace / late activity-log
+/// archive) and re-flushes from scratch.
+pub fn finalized_history_lines(
+    app: &AppState,
+    palette: Palette,
+    wrap_width: usize,
+) -> Vec<Line<'static>> {
+    finalized_history_lines_range(app, palette, wrap_width, 0)
+}
+
+/// Like [`finalized_history_lines`] but only renders committed messages from
+/// index `start` onward — used to flush *just the newly committed* messages to
+/// scrollback without re-emitting the whole history every turn.
+pub fn finalized_history_lines_range(
+    app: &AppState,
+    palette: Palette,
+    wrap_width: usize,
+    start: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let Some(session) = app.active_session() else {
+        return lines;
+    };
+    let anchored_activity_logs = anchored_turn_activity_logs(app, session);
+    for (idx, message) in session.messages.iter().enumerate().skip(start) {
+        push_message_block(
+            &mut lines,
+            palette,
+            message.role.as_str(),
+            &message.content,
+            wrap_width,
+        );
+        if let Some(reasoning) = message.reasoning_content.as_deref() {
+            push_message_block(&mut lines, palette, "reasoning", reasoning, wrap_width);
+        }
+        if let Some(tool_call_id) = message.tool_call_id.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled("         tool_call ", palette.muted()),
+                Span::styled(tool_call_id.to_string(), palette.text()),
+            ]));
+        }
+
+        for (_, log) in anchored_activity_logs
+            .iter()
+            .filter(|(anchor_idx, _)| *anchor_idx == idx)
+        {
+            push_turn_activity_log_section(&mut lines, palette, log, app);
+        }
+    }
+    // Scrollback content must render on the terminal's NATIVE background, not the
+    // theme surface. Message blocks bake a `surface` / `diff_context_bg`
+    // background into their spans, and completed activity logs can inherit the
+    // live tail's `surface_alt` background if they are promoted into scrollback.
+    // codex writes finalized history on the default background; mirror that by
+    // dropping every finalized line/span background here (the live viewport
+    // render path is untouched, so it still shows the theme surface).
+    strip_lines_background(&mut lines);
+    lines
+}
+
+/// Render newly committed messages while skipping active-turn content that was
+/// already streamed into scrollback before the turn settled.
+pub fn finalized_history_lines_range_dedup_live(
+    app: &AppState,
+    palette: Palette,
+    wrap_width: usize,
+    start: usize,
+    live_coverages: &[LiveTurnFinalization],
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let Some(session) = app.active_session() else {
+        return lines;
+    };
+    let anchored_activity_logs = anchored_turn_activity_logs(app, session);
+    for (idx, message) in session.messages.iter().enumerate().skip(start) {
+        let reply_coverage = live_coverages.iter().find(|coverage| {
+            !coverage.reply_flushed_text.is_empty()
+                && message.role.as_str() == "assistant"
+                && message
+                    .content
+                    .starts_with(coverage.reply_flushed_text.as_str())
+        });
+        if let Some(coverage) = reply_coverage {
+            let suffix = &message.content[coverage.reply_flushed_text.len()..];
+            if !suffix.trim().is_empty() {
+                push_live_reply_block(&mut lines, palette, suffix, wrap_width);
+            }
+        } else {
+            push_message_block(
+                &mut lines,
+                palette,
+                message.role.as_str(),
+                &message.content,
+                wrap_width,
+            );
+        }
+        if let Some(reasoning) = message.reasoning_content.as_deref() {
+            push_message_block(&mut lines, palette, "reasoning", reasoning, wrap_width);
+        }
+        if let Some(tool_call_id) = message.tool_call_id.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled("         tool_call ", palette.muted()),
+                Span::styled(tool_call_id.to_string(), palette.text()),
+            ]));
+        }
+
+        for (_, log) in anchored_activity_logs
+            .iter()
+            .filter(|(anchor_idx, _)| *anchor_idx == idx)
+        {
+            if let Some(coverage) = live_coverages
+                .iter()
+                .find(|coverage| coverage.matches_turn(&log.session_id, &log.turn_id))
+            {
+                push_turn_activity_log_section_unflushed(&mut lines, palette, log, app, coverage);
+            } else {
+                push_turn_activity_log_section(&mut lines, palette, log, app);
+            }
+        }
+    }
+    strip_lines_background(&mut lines);
+    lines
+}
+
+/// Return the next active-turn watermark by extending the previous one with any
+/// newly settled live reply lines and any non-running activity rows.
+pub fn next_live_turn_finalization(
+    app: &AppState,
+    previous: Option<&LiveTurnFinalization>,
+) -> Option<LiveTurnFinalization> {
+    let (session_id, turn_id) = app.active_turn()?;
+    let session = app.active_session()?;
+    let mut next = previous
+        .filter(|finalization| finalization.matches_turn(session_id, turn_id))
+        .cloned()
+        .unwrap_or_else(|| LiveTurnFinalization::new(session_id, turn_id));
+
+    if let Some(live_reply) = session
+        .live_reply
+        .as_ref()
+        .filter(|live_reply| &live_reply.turn_id == turn_id)
+        && live_reply
+            .text
+            .starts_with(next.reply_flushed_text.as_str())
+    {
+        let stable_end = stable_live_reply_prefix_len(&live_reply.text);
+        if stable_end > next.reply_flushed_text.len() {
+            next.reply_flushed_text = live_reply.text[..stable_end].to_string();
+        }
+    }
+
+    let mut existing_activity = next
+        .activity_flushed_keys
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    for (idx, item) in flow_activity_items(app).iter().enumerate() {
+        let key = activity_finalization_key(item, idx);
+        if !existing_activity.contains(&key) && !is_running_activity(item) {
+            existing_activity.insert(key.clone());
+            next.activity_flushed_keys.push(key);
+        }
+    }
+    next.activity_flushed_items = next.activity_flushed_keys.len();
+
+    Some(next)
+}
+
+/// Render the delta between two active-turn watermarks for insertion into
+/// native scrollback.
+pub fn finalized_live_turn_lines_between(
+    app: &AppState,
+    palette: Palette,
+    wrap_width: usize,
+    previous: &LiveTurnFinalization,
+    next: &LiveTurnFinalization,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let Some((session_id, turn_id)) = app.active_turn() else {
+        return lines;
+    };
+    if !next.matches_turn(session_id, turn_id) {
+        return lines;
+    }
+
+    if next
+        .reply_flushed_text
+        .starts_with(previous.reply_flushed_text.as_str())
+    {
+        let new_reply = &next.reply_flushed_text[previous.reply_flushed_text.len()..];
+        if !new_reply.trim().is_empty() {
+            push_live_reply_block(&mut lines, palette, new_reply, wrap_width);
+        }
+    }
+
+    let previous_activity = previous
+        .activity_flushed_keys
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let new_activity = flow_activity_items(app)
+        .into_iter()
+        .enumerate()
+        .filter(|(idx, item)| {
+            let key = activity_finalization_key(item, *idx);
+            next.activity_flushed_keys.contains(&key) && !previous_activity.contains(&key)
+        })
+        .map(|(_, item)| item)
+        .collect::<Vec<_>>();
+    if !new_activity.is_empty() {
+        push_finalized_activity_items_section(
+            &mut lines,
+            palette,
+            app,
+            Some(turn_id),
+            &new_activity,
+        );
+    }
+
+    strip_lines_background(&mut lines);
+    lines
+}
+
+/// Render late archived activity for turns whose live activity rows were
+/// already streamed to scrollback. This handles the common race where the final
+/// assistant message commits first and `turn_activity_logs` catches up on a
+/// later frame.
+pub fn finalized_late_activity_lines_for_coverages(
+    app: &AppState,
+    palette: Palette,
+    _wrap_width: usize,
+    live_coverages: &[LiveTurnFinalization],
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let Some(session) = app.active_session() else {
+        return lines;
+    };
+    for log in app
+        .turn_activity_logs
+        .iter()
+        .filter(|log| log.session_id == session.id)
+    {
+        if let Some(coverage) = live_coverages
+            .iter()
+            .find(|coverage| coverage.matches_turn(&log.session_id, &log.turn_id))
+        {
+            push_turn_activity_log_section_unflushed(&mut lines, palette, log, app, coverage);
+        }
+    }
+    strip_lines_background(&mut lines);
+    lines
+}
+
+pub fn committed_activity_keys_for_live_finalization(
+    app: &AppState,
+    coverage: &LiveTurnFinalization,
+) -> Option<Vec<String>> {
+    app.turn_activity_logs
+        .iter()
+        .find(|log| {
+            log.session_id.0 == coverage.session_id && log.turn_id.0.to_string() == coverage.turn_id
+        })
+        .map(|log| {
+            log.items
+                .iter()
+                .enumerate()
+                .map(|(idx, item)| activity_finalization_key(item, idx))
+                .collect()
+        })
+}
+
+fn activity_finalization_key(item: &ActivityItem, ordinal: usize) -> String {
+    if let Some(tool_call_id) = item.tool_call_id.as_deref() {
+        return format!("tool:{tool_call_id}");
+    }
+    if let Some(turn_id) = item.turn_id.as_ref() {
+        return format!(
+            "turn:{}:{ordinal}:{}:{}",
+            turn_id.0,
+            item.kind.label(),
+            item.title
+        );
+    }
+    format!("activity:{ordinal}:{}:{}", item.kind.label(), item.title)
+}
+
+pub fn committed_reply_matches_live_finalization(
+    app: &AppState,
+    start: usize,
+    coverage: &LiveTurnFinalization,
+) -> bool {
+    !coverage.reply_flushed_text.is_empty()
+        && app.active_session().is_some_and(|session| {
+            session.messages.iter().skip(start).any(|message| {
+                message.role.as_str() == "assistant"
+                    && message
+                        .content
+                        .starts_with(coverage.reply_flushed_text.as_str())
+            })
+        })
+}
+
+fn stable_live_reply_prefix_len(text: &str) -> usize {
+    text.rfind('\n')
+        .map(|idx| idx + '\n'.len_utf8())
+        .unwrap_or(0)
+}
+
+fn strip_lines_background(lines: &mut [Line<'static>]) {
+    for line in lines {
+        strip_line_background(line);
+    }
+}
+
+/// Reset the background of a finalized scrollback line (and every span) to the
+/// terminal default, so history written into real scrollback blends with the
+/// terminal's native background instead of painting the theme surface. Only the
+/// background is cleared; foreground colors and text attributes are preserved.
+fn strip_line_background(line: &mut Line<'static>) {
+    line.style.bg = None;
+    for span in &mut line.spans {
+        span.style.bg = None;
+    }
+}
+
+/// A stable fingerprint of the committed messages already flushed to scrollback,
+/// used by the event loop's scrollback tracker to decide whether new committed
+/// messages are an append-only extension (flush the tail) or a discontinuity
+/// (session switch / hydrate replace → reset + re-flush).
+pub fn committed_messages_fingerprint(app: &AppState) -> CommittedFingerprint {
+    let Some(session) = app.active_session() else {
+        return CommittedFingerprint::default();
+    };
+    let anchored_activity_logs = anchored_turn_activity_logs(app, session);
+    CommittedFingerprint {
+        session_id: session.id.0.clone(),
+        message_count: session.messages.len(),
+        activity_log_count: anchored_activity_logs
+            .iter()
+            .filter(|(_, log)| !log.items.is_empty())
+            .count(),
+        // A cheap content hash of the committed messages so a hydrate that
+        // *replaces* history (same count, different content) is detected. It
+        // also covers archived activity logs, which can arrive after the
+        // corresponding assistant message was already flushed.
+        content_hash: committed_content_hash(session, &anchored_activity_logs),
+    }
+}
+
+/// Identity of the committed history flushed to scrollback.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommittedFingerprint {
+    pub session_id: String,
+    pub message_count: usize,
+    pub activity_log_count: usize,
+    pub content_hash: u64,
+}
+
+fn committed_content_hash(
+    session: &SessionView,
+    anchored_activity_logs: &[(usize, &TurnActivityLog)],
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for message in &session.messages {
+        message.role.as_str().hash(&mut hasher);
+        message.content.hash(&mut hasher);
+        message.reasoning_content.hash(&mut hasher);
+        message.tool_call_id.hash(&mut hasher);
+    }
+    for (render_index, log) in anchored_activity_logs {
+        if log.items.is_empty() {
+            continue;
+        }
+        render_index.hash(&mut hasher);
+        log.session_id.0.hash(&mut hasher);
+        log.turn_id.0.to_string().hash(&mut hasher);
+        log.request.hash(&mut hasher);
+        for item in &log.items {
+            item.kind.label().hash(&mut hasher);
+            item.title.hash(&mut hasher);
+            item.status.hash(&mut hasher);
+            item.detail.hash(&mut hasher);
+            item.output_preview.hash(&mut hasher);
+            item.success.hash(&mut hasher);
+            item.duration_ms.hash(&mut hasher);
+            item.tool_call_id.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+fn render_chat_layout(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
     if onboarding_first_launch_active(app) {
         render_onboarding_first_launch_layout(frame, app, palette);
         return;
@@ -117,59 +796,107 @@ const ONBOARDING_LOGO_ART: &str = "\
 ██║   ██║██║        ██║   ██║   ██║╚════██║
 ╚██████╔╝╚██████╗   ██║   ╚██████╔╝███████║
  ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚══════╝";
-/// True only on the onboarding WELCOME / local-profile entry screen, where the
-/// splash logo takes over the main window. Discriminated by the welcome menu's
-/// stable first-item id (`onboard.local.status`) rather than the display title:
-/// the post-profile-creation provider-setup screen shares the `MENU_ONBOARD`
-/// id but leads with `onboard.provider.*` items. Keying on the id (not the
-/// title) keeps this correct once titles are translated (i18n) — a title-text
-/// comparison would silently break under a non-English locale.
-fn onboarding_welcome_active(app: &AppState) -> bool {
-    matches!(
-        app.active_menu.as_ref(),
-        Some(crate::menu::MenuBuildResult::Ready(spec))
-            if spec.items.first().map(|item| item.id.as_str()) == Some("onboard.local.status")
-    )
+
+/// Display width of the figlet wordmark (max over its lines), measured with
+/// `unicode-width` so the box-drawing glyphs are counted by display columns.
+fn onboarding_logo_art_width() -> usize {
+    ONBOARDING_LOGO_ART
+        .lines()
+        .map(UnicodeWidthStr::width)
+        .max()
+        .unwrap_or(0)
 }
 
-/// Rows to spend on the onboarding logo, taken ONLY from the surplus above what
-/// the menu itself needs (`menu_needed`) — so the entry menu and its Continue
-/// action are never clipped on short terminals. Full figlet when there is room,
-/// else a one-line tagline, else nothing.
-fn onboarding_logo_height(area_height: u16, area_width: u16, menu_needed: u16) -> u16 {
-    const ART_WIDTH: u16 = 43;
+/// UX2 A.1: rows to spend on the OCTOS banner HEADER across the top of every
+/// onboarding step. Taken ONLY from the surplus above what the menu itself
+/// needs (`menu_needed`) so the step list, its inputs, and the explanation pane
+/// are never clipped on short terminals. Full bordered figlet box when there is
+/// room, else a compact one-line bordered tagline box, else nothing.
+///
+/// Layout (full): top border + blank + 6 art rows + blank + tagline + bottom
+/// border = 11 rows. Compact: top border + tagline + bottom border = 3 rows.
+fn onboarding_header_height(area_height: u16, area_width: u16, menu_needed: u16) -> u16 {
+    let art_width = onboarding_logo_art_width() as u16;
     let surplus = area_height.saturating_sub(menu_needed);
-    if area_width >= ART_WIDTH + 2 && surplus >= 9 {
-        9 // 1 pad + 6 art rows + 1 blank + 1 tagline
-    } else if surplus >= 2 {
-        2 // tagline only (figlet would crowd the menu)
+    if area_width >= art_width + 4 && surplus >= 11 {
+        11
+    } else if surplus >= 3 {
+        3
     } else {
         0
     }
 }
 
-fn render_onboarding_logo(height: u16, palette: Palette) -> Paragraph<'static> {
-    let mut lines: Vec<Line> = Vec::new();
-    if height >= 9 {
-        lines.push(Line::from(""));
-        for art in ONBOARDING_LOGO_ART.lines() {
-            lines.push(Line::from(Span::styled(
-                art,
-                Style::default()
-                    .fg(palette.accent)
-                    .add_modifier(Modifier::BOLD),
-            )));
-        }
-        lines.push(Line::from(""));
+/// UX2 A.1: render the OCTOS wordmark as a bordered window/header spanning the
+/// top of the onboarding screen. `height >= 11` draws the full figlet; a
+/// shorter box draws just the tagline. The box content is centered using
+/// `unicode-width` column math so the CJK tagline and the box-drawing art stay
+/// aligned. Mirrors `render_launch_banner`'s centering primitive.
+fn render_onboarding_header(area: Rect, palette: Palette) -> Paragraph<'static> {
+    let width = area.width as usize;
+    if width < 4 {
+        return Paragraph::new(Text::default());
     }
+    let inner_w = width - 2;
+    let border = Style::default().fg(palette.frame);
+    let accent = Style::default()
+        .fg(palette.accent)
+        .add_modifier(Modifier::BOLD);
+    let highlight = Style::default().fg(palette.highlight);
+
+    // `│` + centered content (display width `content_w`) + `│`.
+    let centered = |content: Vec<Span<'static>>, content_w: usize| -> Line<'static> {
+        let pad = inner_w.saturating_sub(content_w);
+        let left = pad / 2;
+        let right = pad - left;
+        let mut spans = vec![Span::styled("│", border), Span::raw(" ".repeat(left))];
+        spans.extend(content);
+        spans.push(Span::raw(" ".repeat(right)));
+        spans.push(Span::styled("│", border));
+        Line::from(spans)
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("╭", border),
+        Span::styled(format!("{}╮", "─".repeat(inner_w)), border),
+    ]));
+    let show_figlet = area.height >= 11 && inner_w >= onboarding_logo_art_width();
+    if show_figlet {
+        let fig_w = onboarding_logo_art_width();
+        lines.push(centered(vec![], 0));
+        for art in ONBOARDING_LOGO_ART.lines() {
+            // Pad each art line to the wordmark width so all rows align inside
+            // the box regardless of trailing-space trimming.
+            let pad_cols = fig_w.saturating_sub(art.width());
+            lines.push(centered(
+                vec![Span::styled(
+                    format!("{art}{}", " ".repeat(pad_cols)),
+                    accent,
+                )],
+                fig_w,
+            ));
+        }
+        lines.push(centered(vec![], 0));
+    }
+    let tagline = t!("app.banner.title").into_owned();
+    let tagline_width = tagline.width();
+    lines.push(centered(
+        vec![Span::styled(tagline, highlight)],
+        tagline_width,
+    ));
     lines.push(Line::from(Span::styled(
-        t!("app.banner.title").to_string(),
-        Style::default().fg(palette.highlight),
+        format!("╰{}╯", "─".repeat(inner_w)),
+        border,
     )));
-    Paragraph::new(Text::from(lines)).alignment(Alignment::Center)
+    Paragraph::new(Text::from(lines))
 }
 
-fn render_onboarding_first_launch_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
+fn render_onboarding_first_launch_layout(
+    frame: &mut impl FrameLike,
+    app: &AppState,
+    palette: Palette,
+) {
     let composer_height = composer_height_for_size(app, frame.area().width, frame.area().height);
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -181,28 +908,24 @@ fn render_onboarding_first_launch_layout(frame: &mut Frame<'_>, app: &AppState, 
         .split(frame.area());
 
     let menu = active_menu_surface(app);
-    // On the onboarding WELCOME screen, show the OCTOS logo in the main window
-    // above the menu. The wizard menu now carries a right-side progress
-    // checklist (`Setup progress`) as its preview; the selection view renders it
-    // beside the items on wide terminals, so the splash sits above and the
-    // checklist sits to the right. Logo rows come only from the surplus above
-    // the menu's own needs (which includes the preview rows), so the menu is
-    // never clipped — and only on the welcome step, not provider setup.
-    let menu_area = if onboarding_welcome_active(app) {
-        let menu_needed = menu
-            .as_ref()
-            .map_or(0, |m| menu_render::height_hint(m, root[0].width));
-        let logo_height = onboarding_logo_height(root[0].height, root[0].width, menu_needed);
-        if logo_height > 0 {
-            let split = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(logo_height), Constraint::Min(0)])
-                .split(root[0]);
-            frame.render_widget(render_onboarding_logo(logo_height, palette), split[0]);
-            split[1]
-        } else {
-            root[0]
-        }
+    // UX2 A.1: three-region onboarding layout. TOP = the OCTOS banner header
+    // (shown on EVERY step, not just the welcome screen); MAIN = the wizard menu
+    // (the numbered step list + the active step's inputs/rows on the left); RIGHT
+    // = the per-step explanation/teaching panel, carried as the menu's preview so
+    // the selection view renders it beside the items on wide terminals. Header
+    // rows come only from the surplus above the menu's own needs, so the steps
+    // and the explanation pane are never clipped on short terminals.
+    let menu_needed = menu
+        .as_ref()
+        .map_or(0, |m| menu_render::height_hint(m, root[0].width));
+    let header_height = onboarding_header_height(root[0].height, root[0].width, menu_needed);
+    let menu_area = if header_height > 0 {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(header_height), Constraint::Min(0)])
+            .split(root[0]);
+        frame.render_widget(render_onboarding_header(split[0], palette), split[0]);
+        split[1]
     } else {
         root[0]
     };
@@ -221,9 +944,11 @@ fn onboarding_first_launch_active(app: &AppState) -> bool {
             matches!(
                 frame.id.as_str(),
                 crate::menu::registry::MENU_ONBOARD
+                    | crate::menu::registry::MENU_ONBOARD_LANGUAGE
                     | crate::menu::registry::MENU_ONBOARD_FAMILY
                     | crate::menu::registry::MENU_ONBOARD_MODEL
                     | crate::menu::registry::MENU_ONBOARD_ROUTE
+                    | crate::menu::registry::MENU_ONBOARD_WORKSPACE
             )
         })
 }
@@ -232,7 +957,7 @@ fn min_transcript_height(terminal_height: u16) -> u16 {
     if terminal_height < 30 { 8 } else { 12 }
 }
 
-fn render_inspector_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
+fn render_inspector_layout(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
     let composer_height = composer_height_for_size(app, frame.area().width, frame.area().height);
     let active_menu = active_menu_surface(app);
     let menu_height = menu_height_hint(
@@ -595,7 +1320,7 @@ fn launch_banner_active(app: &AppState) -> bool {
 /// Claude-Code-style launch banner: a rounded box with the OCTOS logo, a
 /// greeting, and the workspace path. No right-hand panel (per product call).
 /// Rendered at the TOP of the transcript area for an empty session.
-fn render_launch_banner(frame: &mut Frame<'_>, app: &AppState, palette: Palette, area: Rect) {
+fn render_launch_banner(frame: &mut impl FrameLike, app: &AppState, palette: Palette, area: Rect) {
     let width = area.width as usize;
     if width < 12 || area.height < 6 {
         return;
@@ -726,7 +1451,7 @@ fn render_transcript(app: &AppState, palette: Palette, area: Rect) -> Paragraph<
 
             if turn_flow_visible && Some(idx) == latest_user_index {
                 approval_context_start = Some(message_start);
-                push_turn_flow(&mut lines, palette, app, session, wrap_width);
+                push_turn_flow(&mut lines, palette, app, session, wrap_width, None);
                 turn_flow_rendered = true;
             }
         }
@@ -737,9 +1462,9 @@ fn render_transcript(app: &AppState, palette: Palette, area: Rect) -> Paragraph<
         {
             approval_context_start = Some(lines.len());
             push_recent_user_context(&mut lines, palette, prompt, wrap_width);
-            push_turn_flow(&mut lines, palette, app, session, wrap_width);
+            push_turn_flow(&mut lines, palette, app, session, wrap_width, None);
         } else if !turn_flow_rendered {
-            push_turn_flow(&mut lines, palette, app, session, wrap_width);
+            push_turn_flow(&mut lines, palette, app, session, wrap_width, None);
         }
 
         if !app.pending_messages.is_empty() {
@@ -885,6 +1610,7 @@ fn push_turn_flow(
     app: &AppState,
     session: &SessionView,
     width: usize,
+    live_finalization: Option<&LiveTurnFinalization>,
 ) {
     if let Some(approval) = app.approval.as_ref().filter(|approval| approval.visible) {
         push_inline_approval_card(lines, palette, approval);
@@ -895,10 +1621,20 @@ fn push_turn_flow(
     }
 
     if let Some(live_reply) = &session.live_reply {
-        push_live_reply_block(lines, palette, &live_reply.text, width);
+        let reply_text = if let Some(finalization) = live_finalization {
+            live_reply
+                .text
+                .strip_prefix(finalization.reply_flushed_text.as_str())
+                .unwrap_or(live_reply.text.as_str())
+        } else {
+            live_reply.text.as_str()
+        };
+        if !reply_text.trim().is_empty() {
+            push_live_reply_block(lines, palette, reply_text, width);
+        }
     }
 
-    push_activity_section(lines, palette, app);
+    push_activity_section_with_finalization(lines, palette, app, live_finalization);
 
     if live_turn_diff_preview_visible(app) {
         push_inline_diff_preview(lines, palette, &app.diff_preview);
@@ -2130,8 +2866,25 @@ fn push_prefixed_line(
     lines.push(Line::from(spans));
 }
 
-fn push_activity_section(lines: &mut Vec<Line<'static>>, palette: Palette, app: &AppState) {
-    let flow_activity = flow_activity_items(app);
+fn push_activity_section_with_finalization(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    app: &AppState,
+    live_finalization: Option<&LiveTurnFinalization>,
+) {
+    let mut flow_activity = flow_activity_items(app);
+    if let Some(finalization) = active_live_finalization(app, live_finalization) {
+        flow_activity = flow_activity
+            .into_iter()
+            .enumerate()
+            .filter(|(idx, item)| {
+                !finalization
+                    .activity_flushed_keys
+                    .contains(&activity_finalization_key(item, *idx))
+            })
+            .map(|(_, item)| item)
+            .collect();
+    }
     if flow_activity.is_empty() {
         return;
     }
@@ -2341,6 +3094,53 @@ fn push_turn_activity_log_section(
     if app.diff_preview.active && app.diff_preview.turn_id.as_ref() == Some(&log.turn_id) {
         push_inline_diff_preview(lines, palette, &app.diff_preview);
     }
+}
+
+fn push_turn_activity_log_section_unflushed(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    log: &TurnActivityLog,
+    app: &AppState,
+    coverage: &LiveTurnFinalization,
+) {
+    let items = log
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(idx, item)| {
+            !coverage
+                .activity_flushed_keys
+                .contains(&activity_finalization_key(item, *idx))
+        })
+        .map(|(_, item)| item)
+        .collect::<Vec<_>>();
+    push_finalized_activity_items_section(lines, palette, app, Some(&log.turn_id), &items);
+}
+
+fn push_finalized_activity_items_section(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    app: &AppState,
+    turn_id: Option<&octos_core::ui_protocol::TurnId>,
+    items: &[&ActivityItem],
+) {
+    if items.is_empty() {
+        return;
+    }
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    push_agent_task_group(
+        lines,
+        palette,
+        turn_id,
+        items,
+        items,
+        &[],
+        0,
+        false,
+        app.expanded_tool_outputs,
+    );
 }
 
 /// "Tentacle pulse" octopus spinner frames (braille blob, all single-width).
@@ -3522,7 +4322,11 @@ fn harness_context_percent(app: &AppState) -> Option<u16> {
 
 /// Build the harness status line(s): spinner + phase + agent count +
 /// re-entering + token in/out + cost + retry + ctx %. Empty when idle.
-fn harness_status_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> {
+fn harness_status_lines(
+    app: &AppState,
+    palette: Palette,
+    include_ctx_text: bool,
+) -> Vec<Line<'static>> {
     if !harness_status_active(app) {
         return Vec::new();
     }
@@ -3612,17 +4416,23 @@ fn harness_status_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> 
         ));
     }
 
-    // Context window %, mirrored as the textual label alongside the gauge so
-    // it survives a narrow terminal (and is unit-testable).
-    if let Some(percent) = harness_context_percent(app) {
-        // `~` marks this as an estimate: the wire carries no per-model context
-        // window, so the percent is against a fixed default denominator
-        // (`DEFAULT_CONTEXT_WINDOW_TOKENS`) and is approximate when the real
-        // model window differs.
-        spans.push(Span::styled(
-            format!(" · ctx ~{percent}%"),
-            palette.muted().bg(palette.surface),
-        ));
+    // Context window %. This textual label is the NARROW-terminal fallback:
+    // when `render_harness_status_row` draws the LineGauge (wide terminal) it
+    // passes `include_ctx_text = false` so the percent does not render twice —
+    // once as this text on the left and once as the gauge's own label on the
+    // right (the duplicate-`ctx ~N%` bug). Kept (and unit-tested) for narrow
+    // terminals where the gauge column is dropped.
+    if include_ctx_text {
+        if let Some(percent) = harness_context_percent(app) {
+            // `~` marks this as an estimate: the wire carries no per-model
+            // context window, so the percent is against a fixed default
+            // denominator (`DEFAULT_CONTEXT_WINDOW_TOKENS`) and is approximate
+            // when the real model window differs.
+            spans.push(Span::styled(
+                format!(" · ctx ~{percent}%"),
+                palette.muted().bg(palette.surface),
+            ));
+        }
     }
 
     vec![Line::from(spans)]
@@ -3632,16 +4442,26 @@ fn harness_status_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> 
 /// status sits on the left and a `LineGauge` context-window bar sits on the
 /// right when a `token_estimate` is known. Drawn into its own layout row
 /// (never the composer border).
-fn render_harness_status_row(frame: &mut Frame<'_>, app: &AppState, palette: Palette, area: Rect) {
-    let lines = harness_status_lines(app, palette);
+fn render_harness_status_row(
+    frame: &mut impl FrameLike,
+    app: &AppState,
+    palette: Palette,
+    area: Rect,
+) {
+    let ratio = harness_context_ratio(app);
+    // Reserve a fixed-width column for the context gauge only when we have a
+    // ratio to show AND the row is wide enough for both the text and the gauge.
+    const GAUGE_WIDTH: u16 = 18;
+    let show_gauge = ratio.is_some() && area.width > GAUGE_WIDTH + 12;
+    // Suppress the textual `· ctx ~N%` label when the gauge will be drawn —
+    // otherwise the percent renders twice on the same row (text on the left and
+    // gauge on the right). The gauge is canonical on a wide terminal; the text
+    // is the narrow-terminal fallback.
+    let lines = harness_status_lines(app, palette, !show_gauge);
     if lines.is_empty() {
         return;
     }
-    let ratio = harness_context_ratio(app);
-    // Reserve a fixed-width column for the context gauge only when we have a
-    // ratio to show; otherwise the text spans the full width.
-    const GAUGE_WIDTH: u16 = 18;
-    if let Some(ratio) = ratio.filter(|_| area.width > GAUGE_WIDTH + 12) {
+    if let Some(ratio) = ratio.filter(|_| show_gauge) {
         let split = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(12), Constraint::Length(GAUGE_WIDTH)])
@@ -3654,6 +4474,12 @@ fn render_harness_status_row(frame: &mut Frame<'_>, app: &AppState, palette: Pal
         let percent = (ratio * 100.0).round() as u16;
         let gauge = LineGauge::default()
             .ratio(ratio)
+            // Base style backs the label cells: `LineGauge` paints the whole
+            // area with `self.style` before writing the (unstyled) label, so
+            // without a surface bg here the `ctx ~N%` label renders on the raw
+            // terminal background — a mismatched block to the right of the
+            // harness row, just above the composer. Keep it on `surface`.
+            .style(Style::default().fg(palette.muted).bg(palette.surface))
             .label(format!("ctx ~{percent}%"))
             .filled_style(Style::default().fg(palette.accent).bg(palette.surface))
             .unfilled_style(Style::default().fg(palette.frame).bg(palette.surface));
@@ -3790,7 +4616,7 @@ fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'s
         .block(block)
 }
 
-fn set_composer_cursor(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
+fn set_composer_cursor(frame: &mut impl FrameLike, app: &AppState, area: Rect) {
     if app.focus != FocusPane::Composer {
         return;
     }
@@ -4449,7 +5275,7 @@ fn push_field(
 }
 
 fn render_task_output_modal(
-    frame: &mut Frame<'_>,
+    frame: &mut impl FrameLike,
     output: &TaskOutputDetailState,
     palette: Palette,
 ) {
@@ -4501,7 +5327,7 @@ fn render_task_output_modal(
 }
 
 fn render_artifact_detail_modal(
-    frame: &mut Frame<'_>,
+    frame: &mut impl FrameLike,
     artifact: &ArtifactDetailState,
     palette: Palette,
 ) {
@@ -4542,7 +5368,7 @@ fn render_artifact_detail_modal(
 }
 
 fn render_thread_graph_detail_modal(
-    frame: &mut Frame<'_>,
+    frame: &mut impl FrameLike,
     graph: &ThreadGraphDetailState,
     palette: Palette,
 ) {
@@ -4583,7 +5409,7 @@ fn render_thread_graph_detail_modal(
 }
 
 fn render_turn_state_detail_modal(
-    frame: &mut Frame<'_>,
+    frame: &mut impl FrameLike,
     turn: &TurnStateDetailState,
     palette: Palette,
 ) {
@@ -4732,6 +5558,7 @@ mod tests {
             DiffPreviewHunk, DiffPreviewLine, SessionView,
         },
         store::Store,
+        viewport::ScrollbackTracker,
     };
     use octos_core::{
         Message, SessionKey,
@@ -6281,22 +7108,79 @@ mod tests {
         );
     }
 
-    /// The onboarding logo only consumes rows ABOVE what the menu needs, so the
-    /// entry menu (incl. its Continue action) is never clipped — the regression
-    /// codex flagged for short terminals. Figlet only when there is real
-    /// surplus AND it fits the width; otherwise tagline-only, then nothing.
+    /// UX2 A.1: the OCTOS banner header only consumes rows ABOVE what the menu
+    /// needs, so the step list, its inputs, and the explanation pane are never
+    /// clipped on short terminals. Full figlet box (11 rows) only with real
+    /// surplus AND width; otherwise the compact tagline box (3 rows), then
+    /// nothing.
     #[test]
-    fn onboarding_logo_height_takes_only_menu_surplus() {
-        // Tall terminal, menu needs 14 rows → ample surplus → full figlet.
-        assert_eq!(onboarding_logo_height(37, 120, 14), 9);
+    fn onboarding_header_height_takes_only_menu_surplus() {
+        // Tall terminal, menu needs 14 rows → ample surplus → full figlet box.
+        assert_eq!(onboarding_header_height(37, 120, 14), 11);
         // Short terminal (root[0] ~16-17 rows, menu needs 14): surplus 2-3 →
-        // tagline only, so the menu keeps all 14 of its rows.
-        assert_eq!(onboarding_logo_height(16, 120, 14), 2);
-        assert_eq!(onboarding_logo_height(17, 120, 14), 2);
-        // No surplus → no logo at all (the menu takes everything).
-        assert_eq!(onboarding_logo_height(14, 120, 14), 0);
-        // Narrow terminal → never the wide figlet; tagline at most.
-        assert_eq!(onboarding_logo_height(40, 40, 5), 2);
+        // compact box only once there are 3 surplus rows; below that, nothing.
+        assert_eq!(onboarding_header_height(17, 120, 14), 3);
+        assert_eq!(onboarding_header_height(16, 120, 14), 0);
+        // No surplus → no header at all (the menu takes everything).
+        assert_eq!(onboarding_header_height(14, 120, 14), 0);
+        // Narrow terminal → never the wide figlet; compact box at most.
+        assert_eq!(onboarding_header_height(40, 40, 5), 3);
+    }
+
+    /// UX2 A: the three-region onboarding layout renders end-to-end on a wide
+    /// terminal — TOP figlet banner header, MAIN step list, and the RIGHT
+    /// teaching panel with the current step's explanatory prose (not a bare
+    /// checklist). Asserts against the i18n source so it tracks wording/locale.
+    #[test]
+    fn render_first_launch_onboarding_shows_header_steps_and_explanation_pane() {
+        let mut store = Store {
+            state: AppState::new(
+                vec![],
+                0,
+                "AppUI connected".into(),
+                Some("stdio:octos serve --stdio".into()),
+                false,
+            ),
+        };
+        store.state.set_capabilities(UiProtocolCapabilities::new(
+            &[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+            &[],
+        ));
+        store.open_menu(crate::menu::MenuId::from(
+            crate::menu::registry::MENU_ONBOARD,
+        ));
+
+        let text =
+            rendered_buffer_with_size(&store.state, Palette::for_theme(ThemeName::Slate), 140, 44)
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+
+        // TOP: figlet banner header (a characteristic block-letter row) + the
+        // bordered box corner.
+        assert!(text.contains("██████╗"), "figlet header at top:\n{text}");
+        assert!(text.contains('╭'), "header is a bordered window:\n{text}");
+        // RIGHT: the teaching panel title + the current step's explanatory
+        // prose. Assert against the i18n source (NOT a hardcoded literal) so the
+        // test tracks wording/locale changes.
+        let panel_title = t!("onboarding.wizard.explain_title", locale = "en");
+        assert!(
+            text.contains(&*panel_title),
+            "teaching panel title in the right pane:\n{text}"
+        );
+        // The Profile-step explanation is a multi-line source string; assert on
+        // its first word so soft-wrapping in the pane can't flake it.
+        let explain_first_word = crate::menu::wizard::WizardStep::Profile
+            .explanation()
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !explain_first_word.is_empty() && text.contains(&explain_first_word),
+            "current-step explanation prose in the right pane (`{explain_first_word}`):\n{text}"
+        );
     }
 
     #[test]
@@ -6435,6 +7319,67 @@ mod tests {
             cursor,
             composer_cursor_position(&app, Rect::new(0, 36, 120, 5)).expect("cursor")
         );
+    }
+
+    /// Regression: the harness-row context `LineGauge` label (`ctx ~N%`) must
+    /// inherit the theme `surface` background. `LineGauge` paints its whole
+    /// area with the widget base style *before* writing the (unstyled) label,
+    /// so without `.style(bg: surface)` the label cells fall back to the raw
+    /// terminal background — a mismatched solid block on the right of the
+    /// harness row, directly above the composer.
+    #[test]
+    fn harness_gauge_label_inherits_surface_background() {
+        use octos_core::ui_protocol::SessionOrchestrationEvent;
+        let mut app = autonomy_app_state();
+        let session_id = SessionKey("local:test".into());
+        app.orchestration.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 1,
+                pending_continuations: 0,
+                phase: Some("orchestrating".into()),
+            },
+        );
+        app.context_lifecycle_mut(&session_id).state = Some(crate::model::ContextLifecycleState {
+            session_id: session_id.clone(),
+            thread_id: None,
+            generation: 1,
+            transcript_hash: String::new(),
+            item_count: 10,
+            token_estimate: 15_360,
+            recovery_state: "healthy".into(),
+            last_checkpoint_id: None,
+            last_compaction_id: None,
+        });
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let buffer = rendered_buffer_with_size(&app, palette, 120, 42);
+
+        // The gauge label is rendered on the harness row (the `ctx ~N%` text).
+        let label_style = style_for_text(&buffer, "ctx ~").expect("gauge label rendered");
+        assert_eq!(
+            label_style.bg,
+            Some(palette.surface),
+            "gauge label must use the surface bg, not the raw terminal background"
+        );
+
+        // The whole gauge column (label + filled/unfilled line) must be a single
+        // contiguous surface-backed band — no stray bg=Reset cells.
+        let rows = rendered_rows(&buffer);
+        let gauge_row = row_index_containing(&rows, "ctx ~");
+        let width = usize::from(buffer.area.width);
+        let row_start = gauge_row * width;
+        let first_label_col = rows[gauge_row].find("ctx ~").expect("label col");
+        for x in first_label_col..width {
+            let cell = &buffer.content[row_start + x];
+            assert_eq!(
+                cell.bg,
+                palette.surface,
+                "gauge cell at x={x} (sym {:?}) leaked a non-surface background",
+                cell.symbol()
+            );
+        }
     }
 
     #[test]
@@ -8918,7 +9863,7 @@ mod tests {
         // Idle: no orchestration, no active turn → row reserves no rows and is
         // absent from the render (so it cannot collide with the composer).
         assert_eq!(harness_status_height(&app), 0);
-        assert!(harness_status_lines(&app, Palette::for_theme(ThemeName::Codex)).is_empty());
+        assert!(harness_status_lines(&app, Palette::for_theme(ThemeName::Codex), true).is_empty());
 
         // Orchestrating: active, 2 running agents, 1 pending continuation.
         app.orchestration.insert(
@@ -8952,7 +9897,7 @@ mod tests {
             1,
             "active row reserves one row"
         );
-        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex))
+        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex), true)
             .iter()
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.to_string())
@@ -8985,6 +9930,16 @@ mod tests {
         assert!(
             rendered.contains("Tab inspector"),
             "composer hint not clobbered: {rendered:?}"
+        );
+        // Regression (duplicate ctx%): on a wide terminal (rendered_text uses
+        // 120 cols, so the gauge column is drawn) the percent must render ONCE —
+        // as the LineGauge on the right, NOT also as the textual `· ctx ~N%`
+        // label on the left. Pre-fix this row showed both "· ctx ~50%" and
+        // "ctx ~50% ───" on the same line.
+        assert_eq!(
+            rendered.matches("ctx ~").count(),
+            1,
+            "ctx% must render exactly once (gauge only) on a wide terminal: {rendered:?}"
         );
     }
 
@@ -9019,7 +9974,7 @@ mod tests {
             last_compaction_id: None,
         });
 
-        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex))
+        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex), true)
             .iter()
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.to_string())
@@ -9049,7 +10004,7 @@ mod tests {
         retry.attempt = Some(3);
         app.session_retry.insert(session_id, retry);
 
-        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex))
+        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex), true)
             .iter()
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.to_string())
@@ -9103,5 +10058,466 @@ mod tests {
             "label {label:?} should respect AUTONOMY_LOOP_LABEL_MAX",
         );
         assert!(label.ends_with('…'));
+    }
+
+    // ---- inline-viewport (scrollback) rendering ----
+
+    fn chat_app(messages: Vec<Message>) -> AppState {
+        AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages,
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        )
+    }
+
+    /// Render `render_viewport` into a buffer via the custom inline `Frame`, at
+    /// the live-UI height the event loop would size it to. We render straight
+    /// into a `Buffer` (no escape-emitting backend needed) so the test does not
+    /// require a `Write` backend.
+    fn viewport_rows(app: &AppState, width: u16, height: u16) -> Vec<String> {
+        viewport_rows_with_finalization(app, width, height, None)
+    }
+
+    fn viewport_rows_with_finalization(
+        app: &AppState,
+        width: u16,
+        height: u16,
+        live_finalization: Option<&LiveTurnFinalization>,
+    ) -> Vec<String> {
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let live_height =
+            super::live_ui_height_with_finalization(app, width, height, live_finalization);
+        let area = Rect::new(0, 0, width, live_height);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = crate::tui_terminal::Frame::for_test(area, &mut buffer);
+        render_viewport_with_finalization(&mut frame, app, palette, live_finalization);
+        rendered_rows(&buffer)
+    }
+
+    fn lines_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn viewport_renders_live_ui_not_committed_history() {
+        // Committed messages live in scrollback (finalized_history_lines), NOT
+        // in the inline viewport. The viewport shows the composer + status.
+        let app = chat_app(vec![
+            Message::user("an old committed question"),
+            Message::assistant("an old committed answer"),
+        ]);
+        let rows = viewport_rows(&app, 100, 40);
+        let text = rows.join("\n");
+        assert!(
+            text.contains("Composer"),
+            "viewport should show the composer chrome, got:\n{text}"
+        );
+        assert!(
+            !text.contains("an old committed answer"),
+            "committed history must go to scrollback, not the viewport:\n{text}"
+        );
+    }
+
+    #[test]
+    fn finalized_history_lines_contain_committed_messages() {
+        let app = chat_app(vec![
+            Message::user("question one"),
+            Message::assistant("answer one"),
+        ]);
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let lines = finalized_history_lines(&app, palette, 80);
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(text.contains("question one"), "missing user msg: {text:?}");
+        assert!(
+            text.contains("answer one"),
+            "missing assistant msg: {text:?}"
+        );
+    }
+
+    #[test]
+    fn active_turn_completed_activity_flushes_to_scrollback_and_leaves_live_tail() {
+        let turn_id = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("run the checks")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: "Still checking the last item".into(),
+                }),
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "shell", "running")
+                .with_turn(turn_id.clone())
+                .with_tool_call("call-running")
+                .with_detail("cargo clippy --all-targets"),
+        );
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                .with_turn(turn_id)
+                .with_tool_call("call-complete")
+                .with_detail("cargo test")
+                .with_success(true),
+        );
+
+        let mut tracker = ScrollbackTracker::new();
+        let update = tracker.sync(&app, Palette::for_theme(ThemeName::Slate), 100);
+        let inserted = lines_text(&update.lines_to_insert);
+        assert!(
+            inserted.contains("Agent task completed") && inserted.contains("$ cargo test"),
+            "completed activity should be inserted into scrollback mid-turn: {inserted:?}"
+        );
+        assert!(
+            !inserted.contains("cargo clippy --all-targets"),
+            "running activity must stay in the live tail: {inserted:?}"
+        );
+
+        let rows =
+            viewport_rows_with_finalization(&app, 100, 40, update.live_tail_finalization.as_ref());
+        let live = rows.join("\n");
+        assert!(
+            !live.contains("cargo test"),
+            "flushed activity must not remain in the repainting viewport:\n{live}"
+        );
+        assert!(
+            live.contains("cargo clippy --all-targets") && live.contains("Orchestrating"),
+            "running activity should remain as the small live tail:\n{live}"
+        );
+    }
+
+    #[test]
+    fn active_turn_completed_reply_lines_flush_to_scrollback_and_leave_only_suffix_live() {
+        let turn_id = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("summarize")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id,
+                    text: "finalized assistant line\nstreaming suffix still live".into(),
+                }),
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+
+        let mut tracker = ScrollbackTracker::new();
+        let update = tracker.sync(&app, Palette::for_theme(ThemeName::Slate), 100);
+        let inserted = lines_text(&update.lines_to_insert);
+        assert!(
+            inserted.contains("finalized assistant line"),
+            "completed reply line should be inserted into scrollback mid-turn: {inserted:?}"
+        );
+        assert!(
+            !inserted.contains("streaming suffix still live"),
+            "unterminated reply suffix must stay live: {inserted:?}"
+        );
+
+        let rows =
+            viewport_rows_with_finalization(&app, 100, 40, update.live_tail_finalization.as_ref());
+        let live = rows.join("\n");
+        assert!(
+            !live.contains("finalized assistant line"),
+            "flushed reply line must not remain in the repainting viewport:\n{live}"
+        );
+        assert!(
+            live.contains("streaming suffix still live"),
+            "only the active reply suffix should remain live:\n{live}"
+        );
+    }
+
+    #[test]
+    fn committed_turn_does_not_duplicate_live_flushed_reply_or_activity() {
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let first_activity = ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+            .with_turn(turn_id.clone())
+            .with_detail("cargo test")
+            .with_success(true);
+        let second_activity_running = ActivityItem::new(ActivityKind::Tool, "shell", "running")
+            .with_turn(turn_id.clone())
+            .with_detail("cargo clippy --all-targets");
+        let second_activity_done = ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+            .with_turn(turn_id.clone())
+            .with_detail("cargo clippy --all-targets")
+            .with_success(true);
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("finish the turn")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: "already flushed line\nfinal answer tail".into(),
+                }),
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+        app.push_activity(first_activity.clone());
+        app.push_activity(second_activity_running);
+
+        let mut tracker = ScrollbackTracker::new();
+        let first = tracker.sync(&app, Palette::for_theme(ThemeName::Slate), 100);
+        let first_text = lines_text(&first.lines_to_insert);
+        assert!(first_text.contains("already flushed line"));
+        assert!(first_text.contains("$ cargo test"));
+
+        app.sessions[0].live_reply = None;
+        app.sessions[0].messages.push(Message::assistant(
+            "already flushed line\nfinal answer tail",
+        ));
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id,
+            request: Some("finish the turn".into()),
+            anchor_index: Some(0),
+            items: vec![first_activity, second_activity_done],
+        });
+        app.activity.clear();
+        app.set_run_state_success();
+
+        let second = tracker.sync(&app, Palette::for_theme(ThemeName::Slate), 100);
+        let second_text = lines_text(&second.lines_to_insert);
+        assert!(
+            !second_text.contains("already flushed line"),
+            "committed assistant must not duplicate the live-flushed prefix: {second_text:?}"
+        );
+        assert!(
+            second_text.contains("final answer tail"),
+            "committed assistant should flush the unflushed suffix: {second_text:?}"
+        );
+        assert!(
+            !second_text.contains("$ cargo test"),
+            "committed activity log must not duplicate the live-flushed action: {second_text:?}"
+        );
+        assert!(
+            second_text.contains("cargo clippy --all-targets"),
+            "committed activity log should flush the previously-running action: {second_text:?}"
+        );
+
+        app.sessions[0].messages.push(Message::user("new turn"));
+        app.sessions[0].messages.push(Message::assistant(
+            "already flushed line\nunrelated later answer",
+        ));
+        let third = tracker.sync(&app, Palette::for_theme(ThemeName::Slate), 100);
+        let third_text = lines_text(&third.lines_to_insert);
+        assert!(
+            third_text.contains("already flushed line")
+                && third_text.contains("unrelated later answer"),
+            "stale live-prefix coverage must not suppress a later assistant message: {third_text:?}"
+        );
+    }
+
+    #[test]
+    fn finalized_history_lines_range_skips_already_flushed() {
+        let app = chat_app(vec![
+            Message::user("q1"),
+            Message::assistant("a1"),
+            Message::user("q2"),
+            Message::assistant("a2"),
+        ]);
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let tail = finalized_history_lines_range(&app, palette, 80, 2);
+        let text: String = tail
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(text.contains("q2") && text.contains("a2"));
+        assert!(
+            !text.contains("a1"),
+            "range(2) must not re-emit already-flushed messages: {text:?}"
+        );
+    }
+
+    #[test]
+    fn finalized_history_lines_include_anchored_activity_logs() {
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = chat_app(vec![
+            Message::user("build the site"),
+            Message::assistant("The site is built."),
+        ]);
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: turn_id.clone(),
+            request: Some("build the site".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                    .with_turn(turn_id)
+                    .with_detail("cargo build")
+                    .with_output_preview("Finished dev build")
+                    .with_success(true),
+            ],
+        });
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let lines = finalized_history_lines_range(&app, palette, 80, 1);
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(
+            text.contains("The site is built."),
+            "missing answer: {text:?}"
+        );
+        assert!(
+            text.contains("Agent task completed"),
+            "missing activity log: {text:?}"
+        );
+        assert!(
+            text.contains("$ cargo build"),
+            "missing tool detail: {text:?}"
+        );
+    }
+
+    #[test]
+    fn finalized_history_lines_carry_no_theme_background() {
+        // Bug 3a: scrollback content must render on the terminal's native
+        // background. The Codex theme's `surface` / `surface_alt` and the user
+        // message's `diff_context_bg` would otherwise paint solid "brown blocks"
+        // into the terminal's real scrollback. Every finalized line/span must
+        // have `bg == None` so `insert_history` emits the default background.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = chat_app(vec![
+            Message::user("a user message"),
+            Message::assistant("an assistant reply\nwith two lines"),
+        ]);
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: turn_id.clone(),
+            request: Some("a user message".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                    .with_turn(turn_id)
+                    .with_detail("cargo test")
+                    .with_output_preview("tests passed")
+                    .with_success(true),
+            ],
+        });
+        // Use a theme with a non-default (brownish) surface, the regression case.
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let lines = finalized_history_lines(&app, palette, 80);
+        assert!(!lines.is_empty(), "expected finalized history lines");
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            text.contains("Agent task completed"),
+            "activity log must be part of finalized history: {text:?}"
+        );
+        for line in &lines {
+            assert_eq!(
+                line.style.bg, None,
+                "finalized line carries a theme bg (brown block): {line:?}"
+            );
+            for span in &line.spans {
+                assert_eq!(
+                    span.style.bg, None,
+                    "finalized span carries a theme bg (brown block): {span:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_ui_height_is_bounded_below_screen_height() {
+        // Even with a huge live tail, the inline viewport must leave scrollback
+        // visible above it (so the user can always select/scroll prior output).
+        let mut app = chat_app(vec![Message::user("hi")]);
+        app.pending_messages = (0..50).map(|i| format!("queued {i}")).collect();
+        let height = 30;
+        let h = super::live_ui_height(&app, 100, height);
+        assert!(
+            h <= height.saturating_sub(super::LIVE_VIEWPORT_MIN_SCROLLBACK),
+            "live UI height {h} must leave >= {} rows of scrollback on a {height}-row screen",
+            super::LIVE_VIEWPORT_MIN_SCROLLBACK
+        );
+        assert!(h >= 1);
+    }
+
+    #[test]
+    fn wants_fullscreen_overlay_tracks_inspector_and_modals() {
+        let mut app = chat_app(vec![Message::user("hi")]);
+        assert!(
+            !super::wants_fullscreen_overlay(&app),
+            "plain chat should use the inline viewport, not alt-screen"
+        );
+        app.focus = FocusPane::Workspace;
+        assert!(
+            super::wants_fullscreen_overlay(&app),
+            "inspector panes should use the full-screen overlay"
+        );
+        app.focus = FocusPane::Composer;
+        app.task_output.active = true;
+        assert!(
+            super::wants_fullscreen_overlay(&app),
+            "an active detail modal should use the full-screen overlay"
+        );
+    }
+
+    #[test]
+    fn committed_fingerprint_changes_on_append_and_session_switch() {
+        let app1 = chat_app(vec![Message::user("hi")]);
+        let fp1 = committed_messages_fingerprint(&app1);
+        let app2 = chat_app(vec![Message::user("hi"), Message::assistant("yo")]);
+        let fp2 = committed_messages_fingerprint(&app2);
+        assert_ne!(fp1, fp2, "appending a message must change the fingerprint");
+        assert_eq!(fp1.session_id, fp2.session_id);
+        assert_eq!(fp2.message_count, 2);
     }
 }

@@ -1,5 +1,7 @@
 use crossterm::event::{KeyCode, KeyModifiers};
-use ratatui::{Frame, layout::Rect};
+use ratatui::layout::Rect;
+
+use crate::tui_terminal::FrameLike;
 
 use super::{
     KeyBinding, MenuFrame, MenuItem, MenuMode, MenuPreview as SpecPreview, MenuSpec,
@@ -75,7 +77,7 @@ pub(crate) fn height_hint(menu: &MenuSurface, terminal_width: u16) -> u16 {
 }
 
 pub(crate) fn render_menu_surface(
-    frame: &mut Frame<'_>,
+    frame: &mut impl FrameLike,
     area: Rect,
     menu: &MenuSurface,
     palette: Palette,

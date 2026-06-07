@@ -31,6 +31,8 @@ use crate::model::{
 /// presents them grouped into these coarse, explainable steps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WizardStep {
+    /// Choose the UI language for onboarding and the current session.
+    Language,
     /// Create the local profile (name / username / email).
     Profile,
     /// Choose the model family + model + provider route.
@@ -47,7 +49,8 @@ pub enum WizardStep {
 
 impl WizardStep {
     /// Ordered list of every step, used for the checklist + N-of-M math.
-    pub const ALL: [WizardStep; 6] = [
+    pub const ALL: [WizardStep; 7] = [
+        WizardStep::Language,
         WizardStep::Profile,
         WizardStep::Provider,
         WizardStep::Connect,
@@ -70,6 +73,7 @@ impl WizardStep {
     /// without ever switching on a translated string.
     fn key(self) -> &'static str {
         match self {
+            WizardStep::Language => "language",
             WizardStep::Profile => "profile",
             WizardStep::Provider => "provider",
             WizardStep::Connect => "connect",
@@ -88,6 +92,14 @@ impl WizardStep {
     pub fn purpose(self) -> Cow<'static, str> {
         t!(format!("onboarding.wizard.purpose.{}", self.key()))
     }
+
+    /// Multi-line explanatory prose for the right-side teaching panel: what
+    /// this step is for, what the user should do, and why it matters. The
+    /// source string embeds `\n` line breaks (see `locales/{en,zh}.yml`); the
+    /// menu render surface handles wrapping and CJK width.
+    pub fn explanation(self) -> Cow<'static, str> {
+        t!(format!("onboarding.wizard.explain.{}", self.key()))
+    }
 }
 
 /// Computed snapshot of the wizard's progress, derived from the wizard state.
@@ -95,7 +107,7 @@ impl WizardStep {
 pub struct WizardProgress {
     pub current: WizardStep,
     /// Completion mark per step, in [`WizardStep::ALL`] order.
-    pub done: [bool; 6],
+    pub done: [bool; 7],
 }
 
 impl WizardProgress {
@@ -107,6 +119,7 @@ impl WizardProgress {
         current_profile: Option<&str>,
         local_create_supported: bool,
     ) -> Self {
+        let language_done = true;
         let profile_done = state.effective_profile_id(current_profile).is_some()
             || (!local_create_supported && current_profile.is_some());
         let provider_done = state.selection_ready();
@@ -128,6 +141,7 @@ impl WizardProgress {
         let activate_done = false;
 
         let done = [
+            language_done,
             profile_done,
             provider_done,
             connect_done,
@@ -172,6 +186,55 @@ impl WizardProgress {
     /// Footer hint naming the next concrete action.
     pub fn footer_hint(&self, next_action: &str) -> String {
         t!("onboarding.wizard.footer", next = next_action).into_owned()
+    }
+
+    /// UX2 A.3: the right-side TEACHING panel. Replaces the sparse
+    /// checklist-only pane ("little information… waste of space") with genuinely
+    /// explanatory prose that updates per step:
+    ///
+    ///   * a compact progress line (`Step N of M`) + the per-step checklist so
+    ///     the user always sees where they are and what is left,
+    ///   * a blank separator,
+    ///   * the current step's title, then multi-line prose explaining what the
+    ///     step is for, what to do, and why it matters.
+    ///
+    /// Rendered as `MenuPreview::Text` so the body is free-flowing prose the
+    /// menu surface wraps (CJK width handled there), not `[label]: [value]`
+    /// rows. The `\n`-joined body keeps all width math in the render surface.
+    pub fn explanation_preview(&self) -> MenuPreview {
+        let mut body = String::new();
+        body.push_str(&t!(
+            "onboarding.wizard.explain_progress",
+            number = self.current.number(),
+            total = WizardStep::ALL.len(),
+        ));
+        body.push('\n');
+        for (step, &complete) in WizardStep::ALL.iter().zip(self.done.iter()) {
+            let marker = if *step == self.current {
+                "▸"
+            } else if complete {
+                "✓"
+            } else {
+                "·"
+            };
+            body.push('\n');
+            body.push_str(marker);
+            body.push(' ');
+            body.push_str(step.number().to_string().as_str());
+            body.push_str(". ");
+            body.push_str(&step.short_title());
+        }
+        body.push_str("\n\n");
+        body.push_str(&t!(
+            "onboarding.wizard.explain_now",
+            title = self.current.short_title(),
+        ));
+        body.push('\n');
+        body.push_str(&self.current.explanation());
+        MenuPreview::Text {
+            title: Some(t!("onboarding.wizard.explain_title").into_owned()),
+            body,
+        }
     }
 
     /// Right-side checklist preview: one row per step, current marked `>`,
@@ -232,38 +295,40 @@ mod tests {
     }
 
     #[test]
-    fn fresh_state_starts_on_profile_step() {
+    fn fresh_state_defaults_language_and_starts_on_profile_step() {
         let state = OnboardingWizardState::default();
         let progress = WizardProgress::from_state(&state, None, true);
         assert_eq!(progress.current, WizardStep::Profile);
-        assert_eq!(progress.current.number(), 1);
+        assert_eq!(progress.current.number(), 2);
         // Assert via the same i18n key (NOT a hardcoded English literal) so the
         // test tracks the source string across locales/wording changes. The
-        // step is 1-of-6 and names the Profile step's short title.
+        // language step is already satisfied by the default English locale, so
+        // the first required input is Profile at 2-of-7.
         assert_eq!(
             progress.header(),
             t!(
                 "onboarding.wizard.header",
-                number = 1,
-                total = 6,
+                number = 2,
+                total = 7,
                 title = WizardStep::Profile.short_title(),
             )
         );
-        assert!(progress.done.iter().all(|done| !done));
+        assert!(progress.done[0], "language defaults to complete");
+        assert!(progress.done[1..].iter().all(|done| !done));
     }
 
     #[test]
     fn resolved_profile_advances_to_provider_step() {
         let progress = WizardProgress::from_state(&state_with_profile(), None, true);
         assert_eq!(progress.current, WizardStep::Provider);
-        assert!(progress.done[0]);
+        assert!(progress.done[1]);
     }
 
     #[test]
     fn ready_selection_advances_to_connect_step() {
         let progress = WizardProgress::from_state(&state_with_selection(), None, true);
         assert_eq!(progress.current, WizardStep::Connect);
-        assert!(progress.done[1], "provider step complete");
+        assert!(progress.done[2], "provider step complete");
     }
 
     #[test]
@@ -275,8 +340,8 @@ mod tests {
 
         let progress = WizardProgress::from_state(&state, None, true);
         assert_eq!(progress.current, WizardStep::Activate);
-        assert!(progress.done[..5].iter().all(|done| *done));
-        assert!(!progress.done[5], "activate never self-marks complete");
+        assert!(progress.done[..6].iter().all(|done| *done));
+        assert!(!progress.done[6], "activate never self-marks complete");
     }
 
     #[test]
@@ -285,10 +350,37 @@ mod tests {
         let MenuPreview::KeyValues { rows, .. } = progress.checklist_preview() else {
             panic!("expected key-value checklist");
         };
-        assert_eq!(rows.len(), 6);
-        assert!(rows[0].label.starts_with("[x]"), "profile done");
-        assert!(rows[1].label.starts_with('>'), "provider current");
-        assert!(rows[2].label.starts_with("[ ]"), "connect pending");
+        assert_eq!(rows.len(), 7);
+        assert!(rows[0].label.starts_with("[x]"), "language done");
+        assert!(rows[1].label.starts_with("[x]"), "profile done");
+        assert!(rows[2].label.starts_with('>'), "provider current");
+        assert!(rows[3].label.starts_with("[ ]"), "connect pending");
+    }
+
+    /// UX2 A.3: the teaching panel is explanatory prose (not `[ ]/[x]` rows).
+    /// It must carry a progress line, the per-step list with a current marker,
+    /// and the current step's multi-line explanation body.
+    #[test]
+    fn explanation_preview_is_prose_with_progress_and_current_step() {
+        let progress = WizardProgress::from_state(&state_with_profile(), None, true);
+        let MenuPreview::Text { title, body } = progress.explanation_preview() else {
+            panic!("expected free-text teaching panel");
+        };
+        assert!(title.is_some(), "teaching panel has a title");
+        // The current step (Provider) explanation prose is present and the
+        // current-step marker appears. Assert via the same i18n source so the
+        // test tracks wording/locale changes instead of a hardcoded literal.
+        assert!(
+            body.contains(WizardStep::Provider.explanation().as_ref()),
+            "current step explanation prose is shown: {body}"
+        );
+        assert!(body.contains('▸'), "current step is marked: {body}");
+        assert!(body.contains('✓'), "completed step is marked: {body}");
+        // Genuinely explanatory: the prose is more than a one-line label.
+        assert!(
+            body.lines().count() >= WizardStep::ALL.len() + 2,
+            "panel is multi-line teaching prose, not a bare checklist: {body}"
+        );
     }
 
     #[test]
@@ -296,7 +388,7 @@ mod tests {
         let state = OnboardingWizardState::default();
         let progress = WizardProgress::from_state(&state, Some("server-prof"), false);
         assert!(
-            progress.done[0],
+            progress.done[1],
             "server-authenticated profile satisfies step 1"
         );
         assert_eq!(progress.current, WizardStep::Provider);

@@ -1,46 +1,78 @@
-use std::io::{self, Stdout};
+use std::io;
 use std::time::{Duration, Instant};
 
+#[cfg(not(test))]
 use crossterm::{
     cursor::Show,
+    event::{DisableBracketedPaste, DisableFocusChange},
+    terminal::disable_raw_mode,
+};
+use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-        EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        self, EnableBracketedPaste, EnableFocusChange, Event, KeyCode, KeyEvent, KeyEventKind,
         KeyModifiers, MouseEvent, MouseEventKind,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+        enable_raw_mode,
+    },
 };
 use eyre::Result;
 use octos_core::app_ui::AppUiEvent;
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::backend::{Backend, CrosstermBackend};
 
 use crate::{
     app,
     cli::Cli,
     client_event::ClientEvent,
+    insert_history::insert_history_lines,
     model::{AppUiCommand, ApprovalModalAction, FocusPane},
     store::Store,
     theme::Palette,
     transport::{AppUiBackend, build_backend},
+    tui_terminal::Terminal as InlineTerminal,
+    viewport::ScrollbackTracker,
 };
 
+/// Poll timeout while idle. Short enough that input stays responsive; we redraw
+/// on change (see `draw_dirty`), not on this tick, so this does not cause the
+/// 40×/sec repaint that wiped selections in the old alt-screen model.
 const UI_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const INITIAL_CAPABILITIES_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(1500);
+const INITIAL_CAPABILITIES_HANDSHAKE_POLL: Duration = Duration::from_millis(10);
+/// Redraw cadence while a turn is active, so the spinner/status animates without
+/// a fixed-rate repaint when nothing is happening.
+const ANIMATION_INTERVAL: Duration = Duration::from_millis(120);
 const MAX_BACKEND_EVENTS_PER_TICK: usize = 512;
+
+/// Which screen model the terminal is currently in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderMode {
+    /// Inline viewport at the bottom + normal scrollback above (the chat flow:
+    /// native select / scroll / copy work here with no mode key).
+    Inline,
+    /// Full-screen alternate buffer for a transient overlay (inspector,
+    /// onboarding wizard, detail modals) — matches codex's alt-screen overlays.
+    AltScreen,
+}
 
 pub fn run(cli: Cli) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        EnableFocusChange,
-        EnableMouseCapture
-    )?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    let guard = TerminalGuard;
+    // Inline-viewport model (codex-style): we do NOT enter the alternate screen
+    // for the main chat. The terminal keeps its normal scrollback, so finalized
+    // output written there (see `insert_history`) is natively mouse-selectable,
+    // wheel/scrollbar-scrollable, and copyable (incl. via tmux copy-mode) with
+    // NO app mode key. We also deliberately do NOT `EnableMouseCapture`, which
+    // would route click-drag to the app and defeat native selection.
+    execute!(stdout, EnableBracketedPaste, EnableFocusChange)?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = InlineTerminal::new(backend)?;
+    let mut guard = TerminalGuard {
+        mode: RenderMode::Inline,
+        saved_inline_viewport: None,
+    };
 
     // i18n: select the UI language before the first render. `t!()` reads this
     // process-global locale, chosen at launch via --lang / OCTOS_LANG / LANG
@@ -54,27 +86,57 @@ pub fn run(cli: Cli) -> Result<()> {
     // `/theme` menu mutates this field, so the palette below is recomputed each
     // frame from `store.state.theme` rather than captured once at startup.
     store.state.theme = cli.theme;
-    // Seed the onboarding workspace candidate from an explicit `--cwd` so the
-    // first-launch workspace probe validates the launch cwd. Without this the
-    // top-level `--cwd` reaches `session/open` but never the onboarding probe
-    // (which reads the transport label), so `/onboard finish` stays blocked on
-    // an unvalidated workspace and the profile runtime never bootstraps.
+    // Seed the onboarding workspace candidate so the first-launch workspace
+    // probe validates a real directory. The explicit `--cwd` wins; when it is
+    // absent the store falls back to the process working directory (for
+    // transport-local launches), so the documented `octos serve --stdio --solo`
+    // launch — which carries no `--cwd` and whose transport label resolves to
+    // `"stdio"`/empty — still validates out of the box instead of dead-ending on
+    // "no usable workspace cwd". Without this the onboarding probe (which reads
+    // the transport label, not the top-level `--cwd` that only reaches
+    // `session/open`) leaves `/onboard finish` blocked on an unvalidated
+    // workspace and the profile runtime never bootstraps.
     store.seed_onboarding_workspace_cwd(
         cli.cwd
             .as_ref()
             .map(|path| path.to_string_lossy().to_string()),
     );
     let mut input_state = TerminalInputState::default();
+    let mut scrollback = ScrollbackTracker::new();
+    // Force a draw on the first iteration.
+    let mut dirty = true;
+    if drain_initial_startup_events(backend.as_mut(), &mut store)? {
+        dirty = true;
+    }
+    let mut last_animation = Instant::now();
 
     loop {
-        drain_backend_events(backend.as_mut(), &mut store)?;
+        if drain_backend_events(backend.as_mut(), &mut store)? {
+            dirty = true;
+        }
 
-        let palette = Palette::for_theme(store.state.theme);
-        terminal.draw(|frame| app::render(frame, &store.state, palette))?;
+        // Redraw on change, not on a fixed tick. While a turn is active we also
+        // redraw on the animation cadence so the spinner/status moves; otherwise
+        // an idle UI emits no terminal writes and never wipes a live selection.
+        let turn_active = store.state.run_state.is_active();
+        if turn_active && last_animation.elapsed() >= ANIMATION_INTERVAL {
+            dirty = true;
+            last_animation = Instant::now();
+        }
+        if dirty {
+            draw(&mut terminal, &mut guard, &mut store, &mut scrollback)?;
+            dirty = false;
+        }
 
-        if event::poll(UI_EVENT_POLL_INTERVAL)? {
+        let poll = if turn_active {
+            ANIMATION_INTERVAL.min(UI_EVENT_POLL_INTERVAL)
+        } else {
+            UI_EVENT_POLL_INTERVAL
+        };
+        if event::poll(poll)? {
             let raw_event = event::read()?;
             let next_event_waiting = event::poll(Duration::from_millis(0))?;
+            let is_resize = matches!(raw_event, Event::Resize(_, _));
             match handle_terminal_event_with_input_state(
                 &mut store,
                 raw_event,
@@ -86,26 +148,227 @@ pub fn run(cli: Cli) -> Result<()> {
                 KeyAction::Quit => break,
                 KeyAction::Send(command) => send_command(backend.as_mut(), &mut store, command),
             }
+            // A resize invalidates the inline viewport layout; force a repaint.
+            if is_resize {
+                terminal.invalidate_viewport();
+            }
+            dirty = true;
         }
 
-        drain_backend_events(backend.as_mut(), &mut store)?;
+        if flush_pending_clipboard(&mut store) {
+            // The OSC 52 write does not touch the rendered frame, but staging it
+            // changed status text; redraw so the status line reflects the copy.
+            dirty = true;
+        }
+
+        if drain_backend_events(backend.as_mut(), &mut store)? {
+            dirty = true;
+        }
     }
 
     drop(guard);
     Ok(())
 }
 
-fn drain_backend_events(backend: &mut dyn AppUiBackend, store: &mut Store) -> Result<()> {
+/// Draw one frame. In `Inline` mode this flushes newly-finalized history into
+/// scrollback (so it becomes natively selectable) and renders only the live UI
+/// into the bottom inline viewport. For full-screen overlays it switches to the
+/// alternate screen and renders the legacy full layout (codex does the same for
+/// its transient overlays).
+fn draw<B>(
+    terminal: &mut InlineTerminal<B>,
+    guard: &mut TerminalGuard,
+    store: &mut Store,
+    scrollback: &mut ScrollbackTracker,
+) -> Result<()>
+where
+    B: Backend + io::Write,
+{
+    let palette = Palette::for_theme(store.state.theme);
+
+    if app::wants_fullscreen_overlay(&store.state) {
+        // Transient overlay → alternate screen, full legacy render.
+        guard.enter_alt_screen(terminal)?;
+        let size = terminal.size()?;
+        let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+        let resized = size != terminal.last_known_screen_size || terminal.viewport_area != area;
+        if resized {
+            terminal.set_viewport_area(area);
+            terminal.clear_visible_screen()?;
+            terminal.invalidate_viewport();
+            terminal.last_known_screen_size = size;
+        }
+        terminal.draw(|frame| {
+            // `render_inline_overlay` is generic over `FrameLike`, so it renders
+            // the legacy full-screen layout straight into the inline `Frame`'s
+            // buffer (no `ratatui::Terminal` needed for the overlay path).
+            app::render_inline_overlay(frame, &store.state, palette);
+        })?;
+        return Ok(());
+    }
+
+    // Inline chat flow.
+    guard.leave_alt_screen(terminal)?;
+
+    let size = terminal.size()?;
+    let width = size.width;
+
+    // The scrollback flush must wrap to the SAME width `insert_history_lines`
+    // uses (the full viewport width), so the line accounting stays consistent.
+    let wrap_width = usize::from(width).max(1);
+
+    let update = scrollback.sync(&store.state, palette, wrap_width);
+    let live_tail_finalization = update.live_tail_finalization.clone();
+    let height = app::live_ui_height_with_finalization(
+        &store.state,
+        width,
+        size.height,
+        live_tail_finalization.as_ref(),
+    );
+    let needs_history_insert = !update.lines_to_insert.is_empty();
+    let needs_resize = terminal.viewport_resize_needed(height, size);
+
+    // The inline structural order mirrors codex-rs: size/clear the viewport
+    // first, insert finalized history using that width/anchor, then draw. If a
+    // resize/clear or history insertion is pending, batch those structural
+    // writes with the frame inside DEC synchronized update so native selections
+    // are disturbed only when the terminal genuinely changes.
+    if needs_resize || needs_history_insert {
+        synchronized_terminal_update(terminal, |terminal| {
+            draw_inline_frame(
+                terminal,
+                &store.state,
+                palette,
+                height,
+                update.lines_to_insert,
+                live_tail_finalization,
+            )
+        })
+    } else {
+        draw_inline_frame(
+            terminal,
+            &store.state,
+            palette,
+            height,
+            update.lines_to_insert,
+            live_tail_finalization,
+        )
+    }
+}
+
+fn draw_inline_frame<B>(
+    terminal: &mut InlineTerminal<B>,
+    state: &crate::model::AppState,
+    palette: Palette,
+    height: u16,
+    lines_to_insert: Vec<ratatui::text::Line<'static>>,
+    live_tail_finalization: Option<app::LiveTurnFinalization>,
+) -> Result<()>
+where
+    B: Backend + io::Write,
+{
+    terminal.resize_viewport_to(height)?;
+    if !lines_to_insert.is_empty() {
+        insert_history_lines(terminal, lines_to_insert)?;
+        terminal.invalidate_viewport();
+    }
+    terminal.draw(|frame| {
+        app::render_viewport_with_finalization(
+            frame,
+            state,
+            palette,
+            live_tail_finalization.as_ref(),
+        );
+    })?;
+    Ok(())
+}
+
+fn synchronized_terminal_update<B>(
+    terminal: &mut InlineTerminal<B>,
+    operations: impl FnOnce(&mut InlineTerminal<B>) -> Result<()>,
+) -> Result<()>
+where
+    B: Backend + io::Write,
+{
+    execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    let operation_result = operations(terminal);
+    let end_result = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    match (operation_result, end_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(err), _) => Err(err),
+        (Ok(()), Err(err)) => Err(err.into()),
+    }
+}
+
+/// Drain a pending clipboard request by emitting the OSC 52 escape sequence to
+/// the terminal. The store stages the text (via `/copy` or `Ctrl+Y`) because it
+/// has no terminal handle; this is the one spot that owns stdout. OSC 52 is an
+/// out-of-band terminal command (it sets the clipboard, not screen cells) so it
+/// does not disturb the ratatui-rendered frame, and it travels in-band over the
+/// PTY/SSH channel — the only clipboard path that reaches the operator's local
+/// machine when the TUI runs against a remote fleet mini.
+///
+/// A failed write (e.g. a closed stdout during teardown) is intentionally
+/// swallowed: the copy is best-effort UX, never load-bearing, and the status
+/// line already reflected the attempt.
+fn flush_pending_clipboard(store: &mut Store) -> bool {
+    flush_pending_clipboard_to(store, &mut io::stdout())
+}
+
+/// Drain a staged clipboard request into `sink` as an OSC 52 escape sequence.
+/// Split from `flush_pending_clipboard` so tests can inject an in-memory buffer
+/// instead of writing to the real terminal — a direct `stdout` write bypasses
+/// libtest's capture, so a terminal that honors OSC 52 would otherwise clobber
+/// the developer's clipboard during `cargo test` (codex P2).
+fn flush_pending_clipboard_to<W: io::Write>(store: &mut Store, sink: &mut W) -> bool {
+    let Some(text) = store.state.pending_clipboard.take() else {
+        return false;
+    };
+    let sequence = crate::clipboard::osc52_copy_sequence(&text);
+    if sink.write_all(sequence.as_bytes()).is_ok() {
+        let _ = sink.flush();
+    }
+    true
+}
+
+/// Drain pending backend events into the store. Returns `true` when at least
+/// one event was applied, so the event loop knows the UI is dirty and must
+/// redraw (the inline-viewport model only repaints on change).
+fn drain_backend_events(backend: &mut dyn AppUiBackend, store: &mut Store) -> Result<bool> {
+    let mut applied = false;
     for _ in 0..MAX_BACKEND_EVENTS_PER_TICK {
         let Some(event) = backend.next_event()? else {
             drain_pending_autonomy_hydration(backend, store);
-            return Ok(());
+            return Ok(applied);
         };
         apply_client_event_and_send_followup(backend, store, event);
+        applied = true;
     }
 
     drain_pending_autonomy_hydration(backend, store);
-    Ok(())
+    Ok(applied)
+}
+
+/// Give the initial protocol capabilities probe a bounded chance to land before
+/// the first frame. First-launch onboarding is capability-gated, so drawing
+/// before this handshake can flash or stick on an empty inline composer.
+fn drain_initial_startup_events(backend: &mut dyn AppUiBackend, store: &mut Store) -> Result<bool> {
+    let deadline = Instant::now() + INITIAL_CAPABILITIES_HANDSHAKE_TIMEOUT;
+    let mut applied = false;
+    while should_wait_for_initial_capabilities(store) {
+        applied |= drain_backend_events(backend, store)?;
+        if !should_wait_for_initial_capabilities(store) || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(INITIAL_CAPABILITIES_HANDSHAKE_POLL);
+    }
+    Ok(applied)
+}
+
+fn should_wait_for_initial_capabilities(store: &Store) -> bool {
+    store.state.sessions.is_empty()
+        && store.state.capabilities.is_none()
+        && !store.state.menu_stack.is_active()
 }
 
 fn apply_client_event_and_send_followup(
@@ -255,6 +518,15 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
 
     if is_control_char(&key, 'o') {
         store.state.toggle_tool_output_expansion();
+        return KeyAction::Continue;
+    }
+
+    if is_control_char(&key, 'y') {
+        // Yank: copy the last assistant reply to the clipboard. The store
+        // stages the text; `flush_pending_clipboard` (called each tick from the
+        // run loop) emits the OSC 52 escape sequence so the copy reaches the
+        // operator's local clipboard even over SSH.
+        store.copy_last_reply();
         return KeyAction::Continue;
     }
 
@@ -569,7 +841,10 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
 
     match key.code {
         KeyCode::Esc => {
-            store.close_menu();
+            // Esc closes/backs out of menus, EXCEPT the root onboarding wizard
+            // step while onboarding is in progress: that menu is only auto-opened
+            // on first launch, so closing it would strand the user (issue #5).
+            store.handle_menu_escape();
         }
         KeyCode::Backspace if slash_help_capture_active(store) => {
             // Covers the bare `/` too (capture is active from the first char),
@@ -991,14 +1266,19 @@ mod tests {
     use crate::model::{ActivityKind, AppState, LiveReply, SessionView, TaskView};
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     use octos_core::{
-        SessionKey, TaskId,
+        Message, SessionKey, TaskId,
         ui_protocol::{
             ApprovalDecision, ApprovalId, ApprovalRequestedEvent, PreviewId, QuestionId,
             TaskRuntimeState, TurnId, UiNotification, UiProtocolCapabilities, UserQuestion,
             UserQuestionOption, UserQuestionRequestedEvent, approval_scopes,
         },
     };
+    use ratatui::{
+        backend::{ClearType, WindowSize},
+        layout::{Position, Rect, Size},
+    };
     use std::collections::VecDeque;
+    use std::io::Write;
 
     struct FakeBackend {
         events: VecDeque<ClientEvent>,
@@ -1011,6 +1291,85 @@ mod tests {
                 events: events.into(),
                 sent: Vec::new(),
             }
+        }
+    }
+
+    struct RecordingBackend {
+        buf: Vec<u8>,
+        size: Size,
+        cursor: Position,
+        clears: Vec<ClearType>,
+    }
+
+    impl RecordingBackend {
+        fn new(width: u16, height: u16) -> Self {
+            Self {
+                buf: Vec::new(),
+                size: Size::new(width, height),
+                cursor: Position { x: 0, y: 0 },
+                clears: Vec::new(),
+            }
+        }
+    }
+
+    impl Write for RecordingBackend {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            self.buf.extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Backend for RecordingBackend {
+        fn draw<'a, I>(&mut self, _content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            Ok(())
+        }
+
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn show_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            Ok(self.cursor)
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+            self.cursor = position.into();
+            Ok(())
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+            self.clears.push(clear_type);
+            Ok(())
+        }
+
+        fn size(&self) -> io::Result<Size> {
+            Ok(self.size)
+        }
+
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            Ok(WindowSize {
+                columns_rows: self.size,
+                pixels: Size::new(0, 0),
+            })
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 
@@ -1052,6 +1411,85 @@ mod tests {
         Store {
             state: AppState::new(sessions, 0, "ready".into(), None, false),
         }
+    }
+
+    fn store_with_live_reply_text(text: &str) -> Store {
+        let session = SessionView {
+            id: SessionKey("local:test".into()),
+            title: "test".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: Some(LiveReply {
+                turn_id: TurnId::new(),
+                text: text.into(),
+            }),
+        };
+        Store {
+            state: AppState::new(vec![session], 0, "ready".into(), None, false),
+        }
+    }
+
+    fn onboarding_capabilities_event() -> ClientEvent {
+        ClientEvent::Capabilities(crate::client_event::CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+                    &[],
+                ),
+            },
+            message: "AppUI capabilities refreshed: 1 method".into(),
+        })
+    }
+
+    #[test]
+    fn ctrl_y_stages_last_reply_for_clipboard() {
+        let mut store = store_with_live_reply_text("answer to copy");
+
+        let action = handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        );
+
+        assert!(matches!(action, KeyAction::Continue));
+        assert_eq!(
+            store.state.pending_clipboard.as_deref(),
+            Some("answer to copy")
+        );
+    }
+
+    #[test]
+    fn flush_pending_clipboard_writes_osc52_and_clears_the_request() {
+        // Drain into an in-memory sink (NOT real stdout) so `cargo test` can't
+        // emit OSC 52 to the developer's terminal and overwrite their clipboard
+        // (codex P2). This also lets us assert the exact bytes written.
+        let mut store = store_with_live_reply_text("answer");
+        store.state.pending_clipboard = Some("answer".into());
+
+        let mut sink: Vec<u8> = Vec::new();
+        flush_pending_clipboard_to(&mut store, &mut sink);
+
+        // The one-shot field is drained so a copy cannot re-fire on every tick.
+        assert!(store.state.pending_clipboard.is_none());
+        // And the OSC 52 sequence for "answer" was written to the sink.
+        assert_eq!(
+            String::from_utf8(sink).unwrap(),
+            crate::clipboard::osc52_copy_sequence("answer")
+        );
+    }
+
+    #[test]
+    fn flush_pending_clipboard_writes_nothing_when_unset() {
+        let mut store = store_with_live_reply_text("answer");
+        store.state.pending_clipboard = None;
+
+        let mut sink: Vec<u8> = Vec::new();
+        flush_pending_clipboard_to(&mut store, &mut sink);
+
+        assert!(
+            sink.is_empty(),
+            "no OSC 52 should be emitted with nothing staged"
+        );
     }
 
     fn store_with_visible_approval() -> (Store, ApprovalId) {
@@ -1172,6 +1610,142 @@ mod tests {
 
         assert!(backend.events.is_empty());
         assert_eq!(store.state.status, "three");
+    }
+
+    #[test]
+    fn startup_capabilities_render_onboarding_before_first_frame() {
+        let mut backend = FakeBackend::new(vec![onboarding_capabilities_event()]);
+        let mut store = Store {
+            state: AppState::new(
+                vec![],
+                0,
+                "starting".into(),
+                Some("stdio:octos serve --stdio --solo".into()),
+                false,
+            ),
+        };
+
+        let applied =
+            drain_initial_startup_events(&mut backend, &mut store).expect("startup drain");
+
+        assert!(applied);
+        assert!(app::wants_fullscreen_overlay(&store.state));
+
+        let mut terminal =
+            InlineTerminal::new(RecordingBackend::new(80, 24)).expect("recording terminal");
+        let mut guard = TerminalGuard {
+            mode: RenderMode::Inline,
+            saved_inline_viewport: None,
+        };
+        let mut scrollback = ScrollbackTracker::new();
+        draw(&mut terminal, &mut guard, &mut store, &mut scrollback)
+            .expect("draw onboarding overlay");
+
+        let written = String::from_utf8_lossy(&terminal.backend().buf);
+        assert!(
+            written.contains("Welcome to Octos"),
+            "onboarding should render before the first frame; wrote {written:?}"
+        );
+    }
+
+    #[test]
+    fn active_turn_completed_activity_is_history_only_in_raw_draw_bytes() {
+        let turn_id = TurnId::new();
+        let mut store = Store {
+            state: AppState::new(
+                vec![SessionView {
+                    id: SessionKey("local:test".into()),
+                    title: "test".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::user("run the checks")],
+                    tasks: vec![],
+                    live_reply: Some(LiveReply {
+                        turn_id: turn_id.clone(),
+                        text: "Still working".into(),
+                    }),
+                }],
+                0,
+                "Thinking".into(),
+                None,
+                false,
+            ),
+        };
+        store.state.set_run_state_in_progress();
+        store.state.push_activity(
+            crate::model::ActivityItem::new(ActivityKind::Tool, "shell", "running")
+                .with_turn(turn_id.clone())
+                .with_tool_call("call-running")
+                .with_detail("cargo clippy --all-targets"),
+        );
+        store.state.push_activity(
+            crate::model::ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                .with_turn(turn_id)
+                .with_tool_call("call-complete")
+                .with_detail("cargo test")
+                .with_success(true),
+        );
+
+        let mut terminal =
+            InlineTerminal::new(RecordingBackend::new(100, 30)).expect("recording terminal");
+        let mut guard = TerminalGuard {
+            mode: RenderMode::Inline,
+            saved_inline_viewport: None,
+        };
+        let mut scrollback = ScrollbackTracker::new();
+
+        draw(&mut terminal, &mut guard, &mut store, &mut scrollback)
+            .expect("draw active inline frame");
+
+        let written = String::from_utf8_lossy(&terminal.backend().buf);
+        assert_eq!(
+            written.matches("cargo test").count(),
+            1,
+            "completed activity should be emitted once via history insertion, not repainted in the live viewport: {written:?}"
+        );
+        assert!(
+            written.contains("cargo clippy --all-targets"),
+            "running activity should remain in the live viewport bytes: {written:?}"
+        );
+    }
+
+    #[test]
+    fn overlay_transition_restores_inline_viewport_for_resize_clear() {
+        let mut terminal =
+            InlineTerminal::new(RecordingBackend::new(80, 24)).expect("recording terminal");
+        terminal.set_viewport_area(Rect::new(0, 20, 80, 4));
+        terminal.last_known_screen_size = Size::new(80, 24);
+        let mut guard = TerminalGuard {
+            mode: RenderMode::Inline,
+            saved_inline_viewport: None,
+        };
+
+        guard
+            .enter_alt_screen(&mut terminal)
+            .expect("enter alt screen");
+        assert_eq!(guard.mode, RenderMode::AltScreen);
+        assert_eq!(terminal.viewport_area, Rect::new(0, 0, 80, 24));
+        assert_eq!(terminal.backend().clears, vec![ClearType::All]);
+
+        terminal.backend_mut().size = Size::new(60, 20);
+        guard
+            .leave_alt_screen(&mut terminal)
+            .expect("leave alt screen");
+        assert_eq!(guard.mode, RenderMode::Inline);
+        assert_eq!(terminal.viewport_area, Rect::new(0, 20, 80, 4));
+
+        terminal
+            .resize_viewport_to(4)
+            .expect("resize restored inline viewport");
+        assert_eq!(terminal.viewport_area, Rect::new(0, 16, 60, 4));
+        assert_eq!(terminal.backend().cursor, Position { x: 0, y: 16 });
+        assert_eq!(
+            terminal.backend().clears,
+            vec![ClearType::All, ClearType::AfterCursor]
+        );
+
+        let written = String::from_utf8_lossy(&terminal.backend().buf);
+        assert!(written.contains("\u{1b}[?1049h"));
+        assert!(written.contains("\u{1b}[?1049l"));
     }
 
     #[test]
@@ -2229,19 +2803,64 @@ mod tests {
     }
 }
 
-struct TerminalGuard;
+/// Tracks the current screen model and restores terminal state on drop.
+struct TerminalGuard {
+    mode: RenderMode,
+    saved_inline_viewport: Option<ratatui::layout::Rect>,
+}
+
+impl TerminalGuard {
+    /// Switch into the alternate screen for a full-screen overlay (if not
+    /// already there). The viewport is resized to the full screen by the caller.
+    fn enter_alt_screen<B>(&mut self, terminal: &mut InlineTerminal<B>) -> Result<()>
+    where
+        B: Backend + io::Write,
+    {
+        if self.mode == RenderMode::AltScreen {
+            return Ok(());
+        }
+        self.saved_inline_viewport = Some(terminal.viewport_area);
+        execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+        let size = terminal.size()?;
+        terminal.set_viewport_area(ratatui::layout::Rect::new(0, 0, size.width, size.height));
+        terminal.clear_visible_screen()?;
+        terminal.invalidate_viewport();
+        terminal.last_known_screen_size = size;
+        self.mode = RenderMode::AltScreen;
+        Ok(())
+    }
+
+    /// Return to the inline-viewport model (normal scrollback). On the way back
+    /// we force the next inline draw to repaint the whole viewport.
+    fn leave_alt_screen<B>(&mut self, terminal: &mut InlineTerminal<B>) -> Result<()>
+    where
+        B: Backend + io::Write,
+    {
+        if self.mode == RenderMode::Inline {
+            return Ok(());
+        }
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        let fallback = {
+            let size = terminal.size()?;
+            ratatui::layout::Rect::new(0, size.height.saturating_sub(1), size.width, 1)
+        };
+        terminal.set_viewport_area(self.saved_inline_viewport.take().unwrap_or(fallback));
+        terminal.invalidate_viewport();
+        self.mode = RenderMode::Inline;
+        Ok(())
+    }
+}
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let mut stdout: Stdout = io::stdout();
-        let _ = execute!(
-            stdout,
-            DisableBracketedPaste,
-            DisableFocusChange,
-            DisableMouseCapture,
-            Show,
-            LeaveAlternateScreen
-        );
+        #[cfg(not(test))]
+        {
+            let mut stdout = io::stdout();
+            if self.mode == RenderMode::AltScreen {
+                let _ = execute!(stdout, LeaveAlternateScreen);
+            }
+            let _ = disable_raw_mode();
+            let _ = execute!(stdout, DisableBracketedPaste, DisableFocusChange, Show);
+        }
     }
 }

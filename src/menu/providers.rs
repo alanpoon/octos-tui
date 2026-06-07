@@ -34,8 +34,8 @@ use crate::menu::{
         APPUI_METHOD_TOOL_STATUS_LIST, APPUI_ONBOARDING_METHODS_ANY,
         APPUI_PERMISSION_MENU_METHODS_ANY, APPUI_PROVIDER_MENU_METHODS_ANY,
         APPUI_TOOL_SETTINGS_MENU_METHODS_ANY, MENU_COST, MENU_HELP, MENU_KEYMAP, MENU_LOGIN,
-        MENU_MCP, MENU_MODEL, MENU_ONBOARD, MENU_PERMISSIONS, MENU_PROVIDER, MENU_SKILLS,
-        MENU_STATUS, MENU_STATUS_LINE, MENU_THEME, MENU_TITLE, MENU_TOOL_SETTINGS,
+        MENU_MCP, MENU_MODEL, MENU_ONBOARD, MENU_ONBOARD_LANGUAGE, MENU_PERMISSIONS, MENU_PROVIDER,
+        MENU_SKILLS, MENU_STATUS, MENU_STATUS_LINE, MENU_THEME, MENU_TITLE, MENU_TOOL_SETTINGS,
     },
 };
 use crate::model::{
@@ -55,9 +55,11 @@ pub fn core_menu_registry() -> MenuRegistry {
     for provider in [
         Provider::Help,
         Provider::Onboard,
+        Provider::OnboardLanguage,
         Provider::OnboardFamily,
         Provider::OnboardModel,
         Provider::OnboardRoute,
+        Provider::OnboardWorkspace,
         Provider::Login,
         Provider::Theme,
         Provider::Thinking,
@@ -85,9 +87,11 @@ pub fn core_menu_registry() -> MenuRegistry {
 enum Provider {
     Help,
     Onboard,
+    OnboardLanguage,
     OnboardFamily,
     OnboardModel,
     OnboardRoute,
+    OnboardWorkspace,
     Login,
     Theme,
     Thinking,
@@ -110,9 +114,11 @@ impl MenuProvider for Provider {
         MenuId::from(match self {
             Self::Help => MENU_HELP,
             Self::Onboard => MENU_ONBOARD,
+            Self::OnboardLanguage => MENU_ONBOARD_LANGUAGE,
             Self::OnboardFamily => crate::menu::registry::MENU_ONBOARD_FAMILY,
             Self::OnboardModel => crate::menu::registry::MENU_ONBOARD_MODEL,
             Self::OnboardRoute => crate::menu::registry::MENU_ONBOARD_ROUTE,
+            Self::OnboardWorkspace => crate::menu::registry::MENU_ONBOARD_WORKSPACE,
             Self::Login => MENU_LOGIN,
             Self::Theme => MENU_THEME,
             Self::Thinking => crate::menu::registry::MENU_THINKING,
@@ -135,9 +141,11 @@ impl MenuProvider for Provider {
         match self {
             Self::Help => MenuBuildResult::Ready(help_menu(ctx)),
             Self::Onboard => onboarding_menu(ctx),
+            Self::OnboardLanguage => MenuBuildResult::Ready(onboarding_language_menu()),
             Self::OnboardFamily => onboarding_family_menu(ctx),
             Self::OnboardModel => onboarding_model_menu(ctx),
             Self::OnboardRoute => onboarding_route_menu(ctx),
+            Self::OnboardWorkspace => onboarding_workspace_menu(ctx),
             Self::Login => login_menu(ctx),
             Self::Theme => MenuBuildResult::Ready(theme_menu(ctx)),
             Self::Thinking => MenuBuildResult::Ready(thinking_menu(ctx)),
@@ -206,30 +214,71 @@ fn help_menu(ctx: &MenuContext<'_>) -> MenuSpec {
     }
 }
 
-fn lang_menu(_ctx: &MenuContext<'_>) -> MenuSpec {
-    use crate::cli::Lang;
-    let current = rust_i18n::locale().to_string();
-    let items = [
-        ("en", "English", Lang::En),
-        ("zh", "中文 (Chinese)", Lang::Zh),
-    ]
-    .into_iter()
-    .enumerate()
-    .map(|(idx, (id, label, lang))| {
-        let mut state = MenuItemState::default();
-        state.current = current.as_str() == lang.code();
-        let mut item = MenuItem::new(
-            id,
-            label,
-            MenuAction::Local(LocalAction::SetLanguageCode(lang)),
-        )
-        .with_state(state);
-        if let Some(shortcut) = numeric_shortcut(idx) {
-            item = item.with_shortcut(shortcut);
+fn available_language_choices() -> Vec<crate::cli::Lang> {
+    let mut langs = Vec::new();
+    for locale in rust_i18n::available_locales!() {
+        if let Some(lang) = crate::cli::Lang::from_env_value(locale) {
+            if !langs.contains(&lang) {
+                langs.push(lang);
+            }
         }
-        item
-    })
-    .collect();
+    }
+    if langs.is_empty() {
+        langs.extend([crate::cli::Lang::En, crate::cli::Lang::Zh]);
+    }
+    langs.sort_by_key(|lang| match lang {
+        crate::cli::Lang::En => 0,
+        crate::cli::Lang::Zh => 1,
+    });
+    langs
+}
+
+fn current_language() -> crate::cli::Lang {
+    let current = rust_i18n::locale().to_string();
+    crate::cli::Lang::from_env_value(&current).unwrap_or(crate::cli::Lang::En)
+}
+
+fn language_label(lang: crate::cli::Lang) -> String {
+    match lang {
+        crate::cli::Lang::En => t!("menu.lang.item.en.label").into_owned(),
+        crate::cli::Lang::Zh => t!("menu.lang.item.zh.label").into_owned(),
+    }
+}
+
+fn language_description(lang: crate::cli::Lang) -> String {
+    match lang {
+        crate::cli::Lang::En => t!("menu.lang.item.en.desc").into_owned(),
+        crate::cli::Lang::Zh => t!("menu.lang.item.zh.desc").into_owned(),
+    }
+}
+
+fn language_menu_items(id_prefix: &str) -> Vec<MenuItem> {
+    let current = current_language();
+    available_language_choices()
+        .into_iter()
+        .enumerate()
+        .map(|(idx, lang)| {
+            let state = MenuItemState {
+                current: lang == current,
+                ..MenuItemState::default()
+            };
+            let mut item = MenuItem::new(
+                format!("{id_prefix}.{}", lang.code()),
+                language_label(lang),
+                MenuAction::Local(LocalAction::SetLanguageCode(lang)),
+            )
+            .with_description(language_description(lang))
+            .with_state(state);
+            if let Some(shortcut) = numeric_shortcut(idx) {
+                item = item.with_shortcut(shortcut);
+            }
+            item
+        })
+        .collect()
+}
+
+fn lang_menu(_ctx: &MenuContext<'_>) -> MenuSpec {
+    let items = language_menu_items("lang");
 
     MenuSpec {
         id: MenuId::from(crate::menu::registry::MENU_LANG),
@@ -243,6 +292,39 @@ fn lang_menu(_ctx: &MenuContext<'_>) -> MenuSpec {
         preview: None,
         mode: MenuMode::SingleSelect,
     }
+}
+
+fn onboarding_language_menu() -> MenuSpec {
+    let progress = crate::menu::wizard::WizardProgress {
+        current: crate::menu::wizard::WizardStep::Language,
+        done: [false; crate::menu::wizard::WizardStep::ALL.len()],
+    };
+    MenuSpec {
+        id: MenuId::from(MENU_ONBOARD_LANGUAGE),
+        title: t!("onboarding.language.title").into_owned(),
+        subtitle: Some(progress.subtitle()),
+        items: language_menu_items("onboard.language"),
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("onboarding.language.footer").into_owned()),
+        preview: Some(progress.explanation_preview()),
+        mode: MenuMode::SingleSelect,
+    }
+}
+
+fn onboarding_language_row() -> MenuItem {
+    MenuItem::new(
+        "onboard.language",
+        format!(
+            "{}: {}",
+            t!("onboarding.language.label"),
+            language_label(current_language())
+        ),
+        MenuAction::OpenMenu(MenuId::from(MENU_ONBOARD_LANGUAGE)),
+    )
+    .with_description(t!("onboarding.language.description"))
+    .with_state(MenuItemState::required(true))
 }
 
 fn thinking_menu(ctx: &MenuContext<'_>) -> MenuSpec {
@@ -713,6 +795,7 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
 
     let mut items = if local_profile_create {
         vec![
+            onboarding_language_row(),
             MenuItem::new(
                 "onboard.local.status",
                 onboarding_local_profile_label(state),
@@ -722,9 +805,13 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             MenuItem::new(
                 "onboard.local.name",
                 if state.has_name() {
-                    format!("Name: {}", state.name)
+                    format!("{}: {}", t!("onboarding.field.full_name"), state.name)
                 } else {
-                    "Name: not set".into()
+                    format!(
+                        "{}: {}",
+                        t!("onboarding.field.full_name"),
+                        t!("onboarding.value_not_set")
+                    )
                 },
                 MenuAction::Noop,
             )
@@ -733,9 +820,13 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             MenuItem::new(
                 "onboard.local.username",
                 if state.has_username() {
-                    format!("Username: {}", state.username)
+                    format!("{}: {}", t!("onboarding.field.username"), state.username)
                 } else {
-                    "Username: not set".into()
+                    format!(
+                        "{}: {}",
+                        t!("onboarding.field.username"),
+                        t!("onboarding.value_not_set")
+                    )
                 },
                 MenuAction::Noop,
             )
@@ -744,9 +835,13 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             MenuItem::new(
                 "onboard.local.email",
                 if state.has_email() {
-                    format!("Email: {}", state.email)
+                    format!("{}: {}", t!("onboarding.field.email"), state.email)
                 } else {
-                    "Email: not set".into()
+                    format!(
+                        "{}: {}",
+                        t!("onboarding.field.email"),
+                        t!("onboarding.value_not_set")
+                    )
                 },
                 MenuAction::Noop,
             )
@@ -764,6 +859,7 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         ]
     } else {
         vec![
+            onboarding_language_row(),
             MenuItem::new(
                 "onboard.status.auth",
                 onboarding_auth_label(state),
@@ -787,7 +883,6 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                 ctx,
                 state,
                 APPUI_METHOD_AUTH_SEND_CODE,
-                "email is empty",
             )),
             MenuItem::new(
                 "onboard.auth.verify",
@@ -823,7 +918,11 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     items.extend([
         MenuItem::new(
             "onboard.provider.current",
-            format!("Provider: {}", state.provider_label()),
+            format!(
+                "{}: {}",
+                t!("menu.onboard.item.provider_current.label"),
+                state.provider_label()
+            ),
             MenuAction::Noop,
         )
         .with_description(t!("menu.onboard.item.provider_current.desc"))
@@ -831,9 +930,17 @@ fn onboarding_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         MenuItem::new(
             "onboard.provider.key",
             if state.has_api_key() {
-                format!("API key: {}", state.api_key_label())
+                format!(
+                    "{}: {}",
+                    t!("menu.onboard.item.api_key.label"),
+                    state.api_key_label()
+                )
             } else {
-                "API key: not set".into()
+                format!(
+                    "{}: {}",
+                    t!("menu.onboard.item.api_key.label"),
+                    t!("onboarding.value_not_set")
+                )
             },
             MenuAction::Noop,
         )
@@ -921,13 +1028,11 @@ fn onboarding_provider_setup_menu(
     state: &OnboardingWizardState,
     current_profile: Option<&str>,
 ) -> MenuBuildResult {
+    // UX2 feedback: read-only status rows (Profile / Selected provider / Saved
+    // provider) are `Noop` — the user can't act on them by selecting — so they
+    // move to the right info pane (`onboarding_provider_preview`) and the left
+    // list holds only the actionable provider-config rows.
     let mut items = vec![
-        MenuItem::new(
-            "onboard.provider.profile",
-            format!("Profile: {}", state.profile_label(current_profile)),
-            MenuAction::Noop,
-        )
-        .with_description(t!("menu.onboard.item.profile.desc")),
         MenuItem::new(
             "onboard.catalog.refresh",
             if ctx.app.profile_llm_catalog.is_some() {
@@ -944,7 +1049,11 @@ fn onboarding_provider_setup_menu(
     items.extend([
         MenuItem::new(
             "onboard.provider.family",
-            format!("Model family: {}", onboarding_family_label(state)),
+            format!(
+                "{}: {}",
+                t!("menu.onboard.item.family.label"),
+                onboarding_family_label(state)
+            ),
             MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY)),
         )
         .with_description(t!("menu.onboard.item.family.desc"))
@@ -953,7 +1062,11 @@ fn onboarding_provider_setup_menu(
         )),
         MenuItem::new(
             "onboard.provider.model",
-            format!("Model: {}", onboarding_model_label(state)),
+            format!(
+                "{}: {}",
+                t!("menu.onboard.item.model.label"),
+                onboarding_model_label(state)
+            ),
             MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL)),
         )
         .with_description(t!("menu.onboard.item.model.desc"))
@@ -966,11 +1079,15 @@ fn onboarding_provider_setup_menu(
                 .family_id
                 .trim()
                 .is_empty()
-                .then_some("choose family first".into())
+                .then(|| t!("onboarding.disabled.choose_family_first").into_owned())
         }),
         MenuItem::new(
             "onboard.provider.route",
-            format!("Provider route: {}", onboarding_route_label(state)),
+            format!(
+                "{}: {}",
+                t!("menu.onboard.item.route.label"),
+                onboarding_route_label(state)
+            ),
             MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_ROUTE)),
         )
         .with_description(t!("menu.onboard.item.route.desc"))
@@ -978,33 +1095,23 @@ fn onboarding_provider_setup_menu(
             !state.provider.route.route_id.trim().is_empty(),
         ))
         .maybe_disabled(
-            (!onboarding_model_selected(state)).then_some("choose family and model first".into()),
+            (!onboarding_model_selected(state))
+                .then(|| t!("onboarding.disabled.choose_family_model_first").into_owned()),
         ),
     ]);
 
     items.extend([
-        MenuItem::new(
-            "onboard.provider.current",
-            format!("Selected provider: {}", state.provider_label()),
-            MenuAction::Noop,
-        )
-        .with_description(t!("menu.onboard.item.selected_provider.desc"))
-        .with_state(MenuItemState::required(state.selection_ready())),
-        MenuItem::new(
-            "onboard.provider.saved",
-            onboarding_provider_saved_status_label(state),
-            MenuAction::Noop,
-        )
-        .with_description(t!("menu.onboard.item.saved_provider.desc"))
-        .with_state(onboarding_provider_saved_status_state(state)),
         onboarding_edit_item(
             "onboard.provider.key",
-            t!("menu.onboard.item.api_key.label").into_owned(),
+            t!("menu.onboard.item.api_key.label").as_ref(),
             state.has_api_key().then_some(state.api_key_label()),
             "/onboard key ",
         )
         .with_state(MenuItemState::required(state.has_api_key()))
-        .maybe_disabled((!state.selection_ready()).then_some("choose provider first".into())),
+        .maybe_disabled(
+            (!state.selection_ready())
+                .then(|| t!("onboarding.disabled.choose_provider_first").into_owned()),
+        ),
         MenuItem::new(
             "onboard.provider.test",
             onboarding_provider_test_label(state),
@@ -1043,51 +1150,126 @@ fn onboarding_provider_setup_menu(
             state,
             APPUI_METHOD_PROFILE_LLM_UPSERT,
         )),
-        // M22-C: workspace step. Surfaces the staged candidate (or
-        // the active workspace root), its validation status, and
-        // gives the user an explicit re-validate row. Finish is
-        // disabled until validation reports `Valid`.
-        MenuItem::new(
-            "onboard.workspace.current",
-            format!(
-                "Workspace: {}",
-                onboarding_workspace_display(state, ctx.app.cwd.unwrap_or(""))
-            ),
-            MenuAction::Noop,
-        )
-        .with_description(t!("menu.onboard.item.workspace.desc"))
-        .with_state(MenuItemState::required(
-            state.workspace_validation.is_valid(),
+        // UX2 B.2: workspace staging + validation moved to its OWN step screen
+        // (`MENU_ONBOARD_WORKSPACE`). This provider menu now configures the LLM
+        // provider/model only; the user continues to the workspace screen,
+        // which also owns the final Activate action. Disabled until a provider
+        // is saved so the steps stay ordered.
+        {
+            let blocked = (!onboarding_has_saved_primary_provider(ctx, state, current_profile))
+                .then(|| t!("onboarding.wizard.workspace_locked_reason").into_owned());
+            MenuItem::new(
+                "onboard.workspace.open",
+                t!("onboarding.wizard.workspace_open_label"),
+                MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_WORKSPACE)),
+            )
+            .with_description(t!("onboarding.wizard.workspace_open_description"))
+            .with_state(MenuItemState::required(
+                state.workspace_validation.is_valid(),
+            ))
+            .maybe_disabled(blocked)
+        },
+    ]);
+
+    for (idx, item) in items.iter_mut().enumerate() {
+        if let Some(shortcut) = numeric_shortcut(idx) {
+            item.shortcut = Some(shortcut);
+        }
+    }
+
+    // Wizard framing: compute the coarse step (Provider → Connect → Save →
+    // Workspace → Activate) so the subtitle, footer, and right-side teaching
+    // panel all stay in lock-step with the granular rows above.
+    let progress = crate::menu::wizard::WizardProgress::from_state(
+        state,
+        current_profile,
+        local_profile_create_supported(ctx),
+    );
+    let next_action = onboarding_next_action_hint(ctx, state, current_profile);
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(MENU_ONBOARD),
+        title: t!("onboarding.wizard.setup_title").into_owned(),
+        subtitle: Some(progress.subtitle()),
+        items,
+        tabs: Vec::new(),
+        searchable: true,
+        search_placeholder: Some(t!("menu.onboard.search").into_owned()),
+        footer_hint: Some(progress.footer_hint(&next_action)),
+        preview: Some(onboarding_provider_preview(
+            &progress,
+            state,
+            current_profile,
         )),
-        MenuItem::new(
-            "onboard.workspace.status",
-            onboarding_workspace_status_label(state),
-            MenuAction::Noop,
-        )
-        .with_description(t!("menu.onboard.item.workspace_status.desc")),
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// Right-pane preview for the Provider (LLM config) step. Like the Workspace
+/// step, it surfaces the read-only status the user can't act on by selecting —
+/// the local profile, the currently-selected provider route, and the last
+/// saved provider — so the left list holds only the actionable config rows.
+fn onboarding_provider_preview(
+    progress: &crate::menu::wizard::WizardProgress,
+    state: &OnboardingWizardState,
+    current_profile: Option<&str>,
+) -> MenuPreview {
+    let mut preview = progress.explanation_preview();
+    if let MenuPreview::Text { body, .. } = &mut preview {
+        body.push_str("\n\n");
+        body.push_str(&t!("onboarding.preview.provider.configured_title"));
+        body.push_str(&format!(
+            "\n• {}: {}",
+            t!("onboarding.preview.provider.profile"),
+            state.profile_label(current_profile)
+        ));
+        body.push_str(&format!(
+            "\n• {}: {}",
+            t!("onboarding.preview.provider.selected"),
+            state.provider_label()
+        ));
+        // `onboarding_provider_saved_status_label` already carries its own prefix.
+        body.push_str(&format!(
+            "\n• {}",
+            onboarding_provider_saved_status_label(state)
+        ));
+    }
+    preview
+}
+
+/// UX2 B.2: the WORKSPACE step screen, split out of the provider-setup menu so
+/// LLM provider/model config and workspace staging+validation live on separate
+/// screens. This screen owns the workspace candidate display, validation
+/// status, the explicit re-validate action, the staged permission profile, and
+/// the final ACTIVATE action (open the coding session). Activate gating is
+/// unchanged — it still requires a saved provider AND a `Valid` workspace via
+/// `onboarding_open_session_disabled_reason`.
+fn onboarding_workspace_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let default_state;
+    let state = if let Some(state) = ctx.app.onboarding {
+        state
+    } else {
+        default_state = OnboardingWizardState::default();
+        &default_state
+    };
+    let current_profile = ctx.app.current_profile;
+
+    // UX2 feedback: the left list holds ONLY rows the user can act on by
+    // selecting them — Validate and Activate. The read-only staged items
+    // (workspace path, validation status, permission profile) are `Noop` (set
+    // via slash commands, not selectable), so they moved to the right info
+    // pane (see `onboarding_workspace_preview`) instead of cluttering the list
+    // with un-selectable rows.
+    let mut items = vec![
         MenuItem::new(
             "onboard.workspace.validate",
             t!("menu.onboard.item.workspace_validate.label"),
             MenuAction::Local(LocalAction::Onboarding(OnboardingAction::ValidateWorkspace)),
         )
         .with_description(t!("menu.onboard.item.workspace_validate.desc")),
-        // M22-D: permission profile staging row. The wizard only
-        // displays the staged choice — the server confirms it via
-        // the runtime policy stamp after `session/open`.
-        MenuItem::new(
-            "onboard.permissions.staged",
-            onboarding_permission_profile_label(state),
-            MenuAction::Noop,
-        )
-        .with_description(t!("menu.onboard.item.permissions_staged.desc"))
-        .with_state(MenuItemState::required(
-            state.staged_permission_profile.is_some(),
-        )),
-        // Issue #2/#4: the final ACTIVATE step. After model config + test +
-        // save succeed and the workspace validates, this is the one explicit
-        // action that opens the coding session and drops the user into the
-        // working surface. The label + description spell out exactly what to do
-        // ("press Enter") so the activation step is never a mystery.
+        // The final ACTIVATE step: after model config + test + save succeed and
+        // the workspace validates, this is the one explicit action that opens
+        // the coding session and drops the user into the working surface.
         {
             let activate_blocked =
                 onboarding_open_session_disabled_reason(ctx, state, current_profile);
@@ -1113,7 +1295,7 @@ fn onboarding_provider_setup_menu(
             .with_state(MenuItemState::required(activate_blocked.is_none()))
             .maybe_disabled(activate_blocked)
         },
-    ]);
+    ];
 
     for (idx, item) in items.iter_mut().enumerate() {
         if let Some(shortcut) = numeric_shortcut(idx) {
@@ -1121,9 +1303,6 @@ fn onboarding_provider_setup_menu(
         }
     }
 
-    // Wizard framing: compute the coarse step (Provider → Connect → Save →
-    // Workspace → Activate) so the subtitle, footer, and right-side checklist
-    // all stay in lock-step with the granular rows above.
     let progress = crate::menu::wizard::WizardProgress::from_state(
         state,
         current_profile,
@@ -1132,17 +1311,60 @@ fn onboarding_provider_setup_menu(
     let next_action = onboarding_next_action_hint(ctx, state, current_profile);
 
     MenuBuildResult::Ready(MenuSpec {
-        id: MenuId::from(MENU_ONBOARD),
-        title: t!("onboarding.wizard.setup_title").into_owned(),
+        id: MenuId::from(crate::menu::registry::MENU_ONBOARD_WORKSPACE),
+        title: t!("onboarding.wizard.workspace_title").into_owned(),
         subtitle: Some(progress.subtitle()),
         items,
         tabs: Vec::new(),
-        searchable: true,
-        search_placeholder: Some("Filter setup actions".into()),
+        searchable: false,
+        search_placeholder: None,
         footer_hint: Some(progress.footer_hint(&next_action)),
-        preview: Some(progress.checklist_preview()),
+        preview: Some(onboarding_workspace_preview(
+            &progress,
+            state,
+            ctx.app.cwd.unwrap_or(""),
+        )),
         mode: MenuMode::SingleSelect,
     })
+}
+
+/// Right-pane preview for the Workspace step. Beyond the standard step
+/// explanation it lists the read-only "staged" items the user can't select on
+/// this screen — the workspace path, its validation status, and the staged
+/// permission profile (all set via slash commands, not by selecting a row) —
+/// plus how to change each. This keeps the LEFT list to only the actions the
+/// user can actually take here (Validate, Activate).
+fn onboarding_workspace_preview(
+    progress: &crate::menu::wizard::WizardProgress,
+    state: &OnboardingWizardState,
+    active_workspace: &str,
+) -> MenuPreview {
+    let mut preview = progress.explanation_preview();
+    if let MenuPreview::Text { body, .. } = &mut preview {
+        body.push_str("\n\n");
+        body.push_str(&t!("onboarding.preview.workspace.staged_title"));
+        body.push_str(&format!(
+            "\n• {}: {}",
+            t!("onboarding.preview.workspace.workspace"),
+            onboarding_workspace_display(state, active_workspace)
+        ));
+        body.push_str(&format!(
+            "\n    {}",
+            t!("onboarding.preview.workspace.workspace_hint")
+        ));
+        // `onboarding_workspace_status_label` already carries the `Status:` prefix.
+        body.push_str(&format!("\n• {}", onboarding_workspace_status_label(state)));
+        // `onboarding_permission_profile_label` already carries the `Permissions:` prefix.
+        body.push_str(&format!(
+            "\n• {}",
+            onboarding_permission_profile_label(state)
+        ));
+        body.push_str(&format!(
+            "\n    {}",
+            t!("onboarding.preview.workspace.permissions_hint")
+        ));
+    }
+    preview
 }
 
 /// Compute the single next concrete action for the provider/setup phase of the
@@ -1193,6 +1415,7 @@ fn onboarding_next_action_hint(
 
 fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResult {
     let items = vec![
+        onboarding_language_row(),
         MenuItem::new(
             "onboard.local.status",
             t!("onboarding.local.title"),
@@ -1231,10 +1454,11 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
         .maybe_disabled(onboarding_local_profile_disabled_reason(state)),
     ];
 
-    // Wizard framing: this is Step 1 (Profile). The local-create branch is only
-    // reached when `profile/local/create` is supported AND no profile is
-    // resolved yet, so progress is computed with `local_create_supported = true`
-    // and `current_profile = None`.
+    // Wizard framing: the language step is already satisfied by the default
+    // English locale, so this screen is the first required profile input step.
+    // The local-create branch is only reached when `profile/local/create` is
+    // supported AND no profile is resolved yet, so progress is computed with
+    // `local_create_supported = true` and `current_profile = None`.
     let progress = crate::menu::wizard::WizardProgress::from_state(state, None, true);
     let next_action = if state.local_profile_ready() {
         t!("onboarding.wizard.next.local_continue")
@@ -1253,9 +1477,9 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
         footer_hint: Some(progress.footer_hint(next_action.as_ref())),
         // The first-run OCTOS splash renders in the MAIN window (see
         // `render_onboarding_first_launch_layout` in app.rs); the right pane now
-        // carries the wizard progress checklist so the user always sees where
-        // they are and what's left.
-        preview: Some(progress.checklist_preview()),
+        // carries the per-step TEACHING panel (explanatory prose + progress) so
+        // the user always sees where they are, what's left, and what to do.
+        preview: Some(progress.explanation_preview()),
         mode: MenuMode::SingleSelect,
     })
 }
@@ -1483,29 +1707,25 @@ fn onboarding_edit_item(
     .with_description(t!("onboarding.action_edit"))
 }
 
-fn onboarding_family_label(state: &OnboardingWizardState) -> &str {
-    state
-        .provider
-        .family_id
-        .trim()
-        .is_empty()
-        .then_some("not selected")
-        .unwrap_or(state.provider.family_id.as_str())
+fn onboarding_family_label(state: &OnboardingWizardState) -> String {
+    if state.provider.family_id.trim().is_empty() {
+        t!("onboarding.value_not_set").into_owned()
+    } else {
+        state.provider.family_id.clone()
+    }
 }
 
-fn onboarding_model_label(state: &OnboardingWizardState) -> &str {
-    state
-        .provider
-        .model_id
-        .trim()
-        .is_empty()
-        .then_some("not selected")
-        .unwrap_or(state.provider.model_id.as_str())
+fn onboarding_model_label(state: &OnboardingWizardState) -> String {
+    if state.provider.model_id.trim().is_empty() {
+        t!("onboarding.value_not_set").into_owned()
+    } else {
+        state.provider.model_id.clone()
+    }
 }
 
 fn onboarding_route_label(state: &OnboardingWizardState) -> String {
     if state.provider.route.route_id.trim().is_empty() {
-        "not selected".into()
+        t!("onboarding.value_not_set").into_owned()
     } else {
         state
             .provider
@@ -1523,23 +1743,31 @@ fn onboarding_model_selected(state: &OnboardingWizardState) -> bool {
 
 fn onboarding_auth_label(state: &OnboardingWizardState) -> String {
     if state.auth_verified {
-        "Auth: verified".into()
+        t!("onboarding.auth.verified").into_owned()
     } else if state.auth_code_sent {
-        format!("Auth: code sent to {}", state.email)
+        t!("onboarding.auth.code_sent", email = state.email.clone()).into_owned()
     } else if state.has_email() {
-        format!("Auth: email {}", state.email)
+        t!("onboarding.auth.email", email = state.email.clone()).into_owned()
     } else {
-        "Auth: email not set".into()
+        t!("onboarding.auth.email_not_set").into_owned()
     }
 }
 
 fn onboarding_local_profile_label(state: &OnboardingWizardState) -> String {
     if state.local_profile_created {
-        format!("Local profile: {}", state.profile_label(None))
+        t!(
+            "onboarding.profile.created",
+            profile = state.profile_label(None)
+        )
+        .into_owned()
     } else if state.local_profile_ready() {
-        format!("Local profile: ready for {}", state.username)
+        t!(
+            "onboarding.profile.ready",
+            username = state.username.clone()
+        )
+        .into_owned()
     } else {
-        "Local profile: name, username, and email required".into()
+        t!("onboarding.profile.required").into_owned()
     }
 }
 
@@ -1552,7 +1780,7 @@ fn onboarding_permission_profile_label(state: &OnboardingWizardState) -> String 
     use octos_core::ui_protocol::PermissionProfileMode;
     let staged = match state.staged_permission_profile.as_ref() {
         Some(update) => update,
-        None => return "Permissions: (default — use /onboard permissions <mode>)".into(),
+        None => return t!("onboarding.permissions.default_hint").into_owned(),
     };
     let mode = staged
         .mode
@@ -1567,19 +1795,39 @@ fn onboarding_permission_profile_label(state: &OnboardingWizardState) -> String 
                 t!("menu.permissions.item.full_access.label").into_owned()
             }
         })
-        .unwrap_or_else(|| "(mode unchanged)".to_owned());
-    let approval = staged.approval_policy.as_deref().unwrap_or("(unchanged)");
+        .unwrap_or_else(|| t!("onboarding.permissions.mode_unchanged").into_owned());
+    let approval = staged
+        .approval_policy
+        .clone()
+        .unwrap_or_else(|| t!("onboarding.permissions.unchanged").into_owned());
     let network = staged
         .network
         .map(|n| match n {
-            octos_core::ui_protocol::PermissionNetworkPolicy::Allow => "network allowed",
-            octos_core::ui_protocol::PermissionNetworkPolicy::Deny => "network blocked",
+            octos_core::ui_protocol::PermissionNetworkPolicy::Allow => {
+                t!("onboarding.permissions.network_allowed").into_owned()
+            }
+            octos_core::ui_protocol::PermissionNetworkPolicy::Deny => {
+                t!("onboarding.permissions.network_blocked").into_owned()
+            }
         })
-        .unwrap_or("(network unchanged)");
+        .unwrap_or_else(|| t!("onboarding.permissions.network_unchanged").into_owned());
     if let Some(mismatch) = state.permission_profile_mismatch.as_deref() {
-        format!("Permissions: staged {mode} · {approval} · {network} — server CLAMPED: {mismatch}")
+        t!(
+            "onboarding.permissions.staged_clamped",
+            mode = mode,
+            approval = approval,
+            network = network,
+            mismatch = mismatch,
+        )
+        .into_owned()
     } else {
-        format!("Permissions: staged {mode} · {approval} · {network}")
+        t!(
+            "onboarding.permissions.staged",
+            mode = mode,
+            approval = approval,
+            network = network,
+        )
+        .into_owned()
     }
 }
 
@@ -1591,11 +1839,11 @@ fn onboarding_local_profile_disabled_reason(state: &OnboardingWizardState) -> Op
     // accepts empty email; flipping the TUI now would invite the
     // user into a guaranteed-failure submission.
     if !state.has_name() {
-        Some("name is empty".into())
+        Some(t!("onboarding.disabled.name_empty").into_owned())
     } else if !state.has_username() {
-        Some("username is empty".into())
+        Some(t!("onboarding.disabled.username_empty").into_owned())
     } else if !state.has_email() {
-        Some("email is empty".into())
+        Some(t!("onboarding.disabled.email_empty").into_owned())
     } else {
         None
     }
@@ -1612,17 +1860,17 @@ fn onboarding_finish_disabled_reason(
     if local_profile_create_supported(ctx) {
         return onboarding_local_profile_disabled_reason(state);
     }
-    Some("profile is unresolved; use /onboard profile <profile_id>".into())
+    Some(t!("onboarding.disabled.profile_unresolved").into_owned())
 }
 
 fn onboarding_disabled_reason(
     ctx: &MenuContext<'_>,
     state: &OnboardingWizardState,
     method: &'static str,
-    missing_input: &'static str,
 ) -> Option<String> {
-    action_missing_reason(ctx, method)
-        .or_else(|| (!state.has_email()).then(|| missing_input.into()))
+    action_missing_reason(ctx, method).or_else(|| {
+        (!state.has_email()).then(|| t!("onboarding.disabled.email_empty").into_owned())
+    })
 }
 
 fn onboarding_verify_disabled_reason(
@@ -1631,9 +1879,9 @@ fn onboarding_verify_disabled_reason(
 ) -> Option<String> {
     action_missing_reason(ctx, APPUI_METHOD_AUTH_VERIFY).or_else(|| {
         if !state.has_email() {
-            Some("email is empty".into())
+            Some(t!("onboarding.disabled.email_empty").into_owned())
         } else if !state.has_otp_code() {
-            Some("OTP code is empty".into())
+            Some(t!("onboarding.disabled.otp_empty").into_owned())
         } else {
             None
         }
@@ -1647,9 +1895,9 @@ fn onboarding_provider_disabled_reason(
 ) -> Option<String> {
     action_missing_reason(ctx, method).or_else(|| {
         if !state.selection_ready() {
-            Some("provider selection is incomplete".into())
+            Some(t!("onboarding.disabled.provider_incomplete").into_owned())
         } else if !state.has_api_key() {
-            Some("API key is empty".into())
+            Some(t!("onboarding.disabled.api_key_empty").into_owned())
         } else {
             None
         }
@@ -1664,7 +1912,7 @@ fn onboarding_open_session_disabled_reason(
     onboarding_finish_disabled_reason(ctx, state, current_profile)
         .or_else(|| {
             (!onboarding_has_saved_primary_provider(ctx, state, current_profile))
-                .then_some("save provider first".into())
+                .then(|| t!("onboarding.disabled.save_provider_first").into_owned())
         })
         // M22-C: finish is disabled until workspace validation
         // reports `Valid` so `session/open` never fires against an
@@ -1676,13 +1924,13 @@ fn onboarding_workspace_disabled_reason(state: &OnboardingWizardState) -> Option
     match &state.workspace_validation {
         crate::model::OnboardingWorkspaceValidation::Valid { .. } => None,
         crate::model::OnboardingWorkspaceValidation::Unvalidated => {
-            Some("validate workspace first".into())
+            Some(t!("onboarding.disabled.validate_workspace_first").into_owned())
         }
         crate::model::OnboardingWorkspaceValidation::Validating => {
-            Some("workspace validation in progress".into())
+            Some(t!("onboarding.disabled.workspace_validating").into_owned())
         }
         crate::model::OnboardingWorkspaceValidation::Invalid { reason } => {
-            Some(format!("workspace invalid: {reason}"))
+            Some(t!("onboarding.disabled.workspace_invalid", reason = reason).into_owned())
         }
     }
 }
@@ -1698,32 +1946,45 @@ fn onboarding_workspace_display(state: &OnboardingWizardState, active_workspace:
                 if trimmed.is_empty() {
                     None
                 } else {
-                    Some(format!("{trimmed} (active)"))
+                    Some(t!("onboarding.workspace.active", path = trimmed).into_owned())
                 }
             })
-            .unwrap_or_else(|| "(use /onboard workspace <path>)".into()),
+            .unwrap_or_else(|| t!("onboarding.workspace.unset").into_owned()),
     }
 }
 
 fn onboarding_workspace_status_label(state: &OnboardingWizardState) -> String {
     match &state.workspace_validation {
-        crate::model::OnboardingWorkspaceValidation::Unvalidated => "Status: not validated".into(),
-        crate::model::OnboardingWorkspaceValidation::Validating => "Status: validating...".into(),
+        crate::model::OnboardingWorkspaceValidation::Unvalidated => {
+            t!("onboarding.workspace.status_unvalidated").into_owned()
+        }
+        crate::model::OnboardingWorkspaceValidation::Validating => {
+            t!("onboarding.workspace.status_validating").into_owned()
+        }
         crate::model::OnboardingWorkspaceValidation::Valid {
             writable,
             has_workspace_toml,
             ..
         } => {
-            let writable_label = if *writable { "writable" } else { "read-only" };
-            let toml_label = if *has_workspace_toml {
-                " · .octos-workspace.toml"
+            let writable_label = if *writable {
+                t!("onboarding.workspace.writable").into_owned()
             } else {
-                ""
+                t!("onboarding.workspace.read_only").into_owned()
             };
-            format!("Status: OK ({writable_label}{toml_label})")
+            let toml_label = if *has_workspace_toml {
+                t!("onboarding.workspace.toml_present").into_owned()
+            } else {
+                String::new()
+            };
+            t!(
+                "onboarding.workspace.status_ok",
+                writable = writable_label,
+                toml = toml_label,
+            )
+            .into_owned()
         }
         crate::model::OnboardingWorkspaceValidation::Invalid { reason } => {
-            format!("Status: INVALID — {reason}")
+            t!("onboarding.workspace.status_invalid", reason = reason).into_owned()
         }
     }
 }
@@ -1750,9 +2011,13 @@ fn onboarding_has_saved_primary_provider(
 
 fn onboarding_provider_test_label(state: &OnboardingWizardState) -> String {
     match state.provider_pending {
-        Some(OnboardingProviderPending::Test) => "Testing connection...".into(),
-        Some(OnboardingProviderPending::Save) => "Test unavailable while saving".into(),
-        None if state.provider_tested => "Connection tested".into(),
+        Some(OnboardingProviderPending::Test) => {
+            t!("onboarding.provider.test_testing").into_owned()
+        }
+        Some(OnboardingProviderPending::Save) => {
+            t!("onboarding.provider.test_unavailable_saving").into_owned()
+        }
+        None if state.provider_tested => t!("onboarding.provider.tested").into_owned(),
         None if state.provider_test_failure_reason.is_some() => {
             // M22-E: surface the typed test failure so the user
             // sees what went wrong and knows to edit the key or
@@ -1761,26 +2026,32 @@ fn onboarding_provider_test_label(state: &OnboardingWizardState) -> String {
                 .provider_test_failure_reason
                 .as_deref()
                 .unwrap_or_default();
-            format!("Test failed — {reason}")
+            t!("onboarding.provider.test_failed", reason = reason).into_owned()
         }
-        None => "Test connection".into(),
+        None => t!("onboarding.provider.test").into_owned(),
     }
 }
 
-fn onboarding_provider_save_label(state: &OnboardingWizardState) -> &'static str {
+fn onboarding_provider_save_label(state: &OnboardingWizardState) -> String {
     match state.provider_pending {
-        Some(OnboardingProviderPending::Save) => "Saving provider...",
-        Some(OnboardingProviderPending::Test) => "Save unavailable while testing",
-        None if state.provider_saved && state.provider_tested => "Provider saved",
-        None => "Save provider",
+        Some(OnboardingProviderPending::Save) => t!("onboarding.provider.saving").into_owned(),
+        Some(OnboardingProviderPending::Test) => {
+            t!("onboarding.provider.save_unavailable_testing").into_owned()
+        }
+        None if state.provider_saved && state.provider_tested => {
+            t!("onboarding.provider.saved").into_owned()
+        }
+        None => t!("onboarding.provider.save").into_owned(),
     }
 }
 
-fn onboarding_provider_fallback_label(state: &OnboardingWizardState) -> &'static str {
+fn onboarding_provider_fallback_label(state: &OnboardingWizardState) -> String {
     match state.provider_pending {
-        Some(OnboardingProviderPending::Save) => "Saving provider...",
-        Some(OnboardingProviderPending::Test) => "Fallback unavailable while testing",
-        None => "Add as fallback",
+        Some(OnboardingProviderPending::Save) => t!("onboarding.provider.saving").into_owned(),
+        Some(OnboardingProviderPending::Test) => {
+            t!("onboarding.provider.fallback_unavailable_testing").into_owned()
+        }
+        None => t!("onboarding.provider.add_fallback").into_owned(),
     }
 }
 
@@ -1789,11 +2060,16 @@ fn onboarding_provider_saved_status_label(state: &OnboardingWizardState) -> Stri
         state.last_saved_provider_target,
         state.last_saved_provider_label.as_deref(),
     ) {
-        format!("Saved provider: {} {label}", save_target_label(target))
+        t!(
+            "onboarding.provider.saved_status_target",
+            target = save_target_label(target),
+            label = label,
+        )
+        .into_owned()
     } else if let Some(label) = state.saved_primary_provider_label.as_deref() {
-        format!("Saved provider: primary {label}")
+        t!("onboarding.provider.saved_status_primary", label = label,).into_owned()
     } else {
-        "Saved provider: none".into()
+        t!("onboarding.provider.saved_status_none").into_owned()
     }
 }
 
@@ -1805,10 +2081,10 @@ fn onboarding_provider_saved_status_state(state: &OnboardingWizardState) -> Menu
     }
 }
 
-fn save_target_label(target: OnboardingProviderSaveTarget) -> &'static str {
+fn save_target_label(target: OnboardingProviderSaveTarget) -> String {
     match target {
-        OnboardingProviderSaveTarget::Primary => "primary",
-        OnboardingProviderSaveTarget::Fallback => "fallback",
+        OnboardingProviderSaveTarget::Primary => t!("onboarding.provider.primary").into_owned(),
+        OnboardingProviderSaveTarget::Fallback => t!("onboarding.provider.fallback").into_owned(),
     }
 }
 
@@ -2184,7 +2460,6 @@ fn login_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                 ctx,
                 state,
                 APPUI_METHOD_AUTH_SEND_CODE,
-                "email is empty",
             )),
         );
         items.push(
@@ -5099,19 +5374,34 @@ mod tests {
         // Assert via the i18n key (NOT a hardcoded English literal) so the test
         // tracks the source string and stays correct across locales.
         assert_eq!(spec.title, t!("onboarding.wizard.setup_title"));
-        // The provider/setup phase now carries the wizard progress checklist as
-        // its right-side preview pane.
+        // UX2 A.3: the provider/setup phase now carries the per-step TEACHING
+        // panel (explanatory prose + progress) as its right-side preview pane.
         assert!(
             matches!(
                 spec.preview,
-                Some(crate::menu::types::MenuPreview::KeyValues { .. })
+                Some(crate::menu::types::MenuPreview::Text { .. })
             ),
-            "provider setup menu should show the wizard progress checklist"
+            "provider setup menu should show the per-step explanation panel"
         );
         assert!(
             spec.items
                 .iter()
                 .any(|item| item.id == "onboard.provider.key")
+        );
+        // UX2 B.2: workspace staging lives on its OWN step screen now, reached
+        // via the "continue to workspace" row — it is NOT in the provider menu.
+        assert!(
+            spec.items
+                .iter()
+                .any(|item| item.id == "onboard.workspace.open"),
+            "provider menu routes to the workspace step"
+        );
+        assert!(
+            !spec
+                .items
+                .iter()
+                .any(|item| item.id == "onboard.workspace.validate"),
+            "workspace validation row moved off the provider menu"
         );
 
         let MenuBuildResult::Ready(family_spec) = registry.build(
@@ -5203,6 +5493,120 @@ mod tests {
         );
     }
 
+    /// UX2 B.2: the workspace step is its OWN menu (`MENU_ONBOARD_WORKSPACE`),
+    /// not part of the provider-setup screen. It owns the workspace candidate,
+    /// validation status, the re-validate action, the staged permission row,
+    /// and the final ACTIVATE action — and carries the per-step teaching panel.
+    #[test]
+    fn onboarding_workspace_menu_owns_workspace_validation_and_activate() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods([
+            APPUI_METHOD_AUTH_STATUS,
+            APPUI_METHOD_PROFILE_LLM_UPSERT,
+        ]);
+        // Profile resolved, provider saved, workspace validated → Activate is
+        // unblocked on the workspace screen.
+        let onboarding = OnboardingWizardState {
+            profile_id: Some("ada".into()),
+            provider: LlmSelectionConfig {
+                family_id: "moonshot".into(),
+                model_id: "kimi-k2.5".into(),
+                route: LlmRouteConfig {
+                    route_id: "moonshot".into(),
+                    ..LlmRouteConfig::default()
+                },
+                ..LlmSelectionConfig::default()
+            },
+            api_key: Some(crate::model::SecretString::new("sk-test")),
+            provider_tested: true,
+            provider_saved: true,
+            workspace_validation: crate::model::OnboardingWorkspaceValidation::Valid {
+                canonical: "/tmp/ws".into(),
+                writable: true,
+                has_workspace_toml: false,
+            },
+            ..OnboardingWizardState::default()
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("ada"),
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+
+        let MenuBuildResult::Ready(spec) = registry.build(
+            &MenuId::from(crate::menu::registry::MENU_ONBOARD_WORKSPACE),
+            &ctx,
+        ) else {
+            panic!("expected workspace step menu");
+        };
+        assert_eq!(spec.title, t!("onboarding.wizard.workspace_title"));
+        // UX2 feedback: the left list holds ONLY actionable rows — Validate +
+        // Activate. The read-only staged rows moved to the info pane.
+        for id in ["onboard.workspace.validate", "onboard.finish"] {
+            assert!(
+                spec.items.iter().any(|item| item.id == id),
+                "workspace menu must contain actionable `{id}`"
+            );
+        }
+        // The non-actionable (`Noop`) staged rows are NO LONGER in the left list
+        // — they're read-only info, surfaced in the right pane instead.
+        for id in [
+            "onboard.workspace.current",
+            "onboard.workspace.status",
+            "onboard.permissions.staged",
+        ] {
+            assert!(
+                !spec.items.iter().any(|item| item.id == id),
+                "read-only `{id}` must move to the info pane, not the left list"
+            );
+        }
+        // Provider config rows do NOT bleed into the workspace screen.
+        assert!(
+            !spec
+                .items
+                .iter()
+                .any(|item| item.id == "onboard.provider.key"),
+            "provider rows stay on the provider screen"
+        );
+        // Activate is unblocked given saved provider + valid workspace.
+        let activate = spec
+            .items
+            .iter()
+            .find(|item| item.id == "onboard.finish")
+            .expect("activate row");
+        assert!(
+            activate.is_enabled(),
+            "activate is unblocked with provider saved + workspace valid"
+        );
+        // The staged workspace path, validation status, and permission profile
+        // now ride in the right-side info pane (read-only text), not the list.
+        let Some(crate::menu::types::MenuPreview::Text { body, .. }) = &spec.preview else {
+            panic!("workspace step must keep a Text teaching pane");
+        };
+        assert!(
+            body.contains("/tmp/ws"),
+            "info pane should show the staged workspace path: {body:?}"
+        );
+        assert!(
+            body.contains(&onboarding_workspace_status_label(&onboarding)),
+            "info pane should show the validation status: {body:?}"
+        );
+        assert!(
+            body.contains(&onboarding_permission_profile_label(&onboarding)),
+            "info pane should show the staged permission profile: {body:?}"
+        );
+        assert!(
+            body.contains("/onboard workspace"),
+            "info pane should show how to change the workspace: {body:?}"
+        );
+    }
+
     #[test]
     fn onboarding_provider_menu_shows_api_test_progress() {
         let registry = core_menu_registry();
@@ -5246,7 +5650,10 @@ mod tests {
             .iter()
             .find(|item| item.id == "onboard.provider.test")
             .expect("test provider row");
-        assert_eq!(test_item.label, "Testing connection...");
+        assert_eq!(
+            test_item.label,
+            t!("onboarding.provider.test_testing").into_owned()
+        );
         assert!(test_item.state.loading);
         assert_eq!(test_item.disabled_reason, None);
         let save_item = spec
@@ -5254,7 +5661,10 @@ mod tests {
             .iter()
             .find(|item| item.id == "onboard.provider.save")
             .expect("save provider row");
-        assert_eq!(save_item.label, "Save unavailable while testing");
+        assert_eq!(
+            save_item.label,
+            t!("onboarding.provider.save_unavailable_testing").into_owned()
+        );
         assert_eq!(save_item.disabled_reason, None);
         let family_item = spec
             .items
@@ -5270,6 +5680,28 @@ mod tests {
             .expect("api key row");
         assert_eq!(key_item.disabled_reason, None);
         assert_eq!(key_item.state.required_valid, Some(true));
+
+        // UX2 feedback: the read-only `Noop` status rows are NOT in the left
+        // list — they moved to the right info pane.
+        for id in [
+            "onboard.provider.profile",
+            "onboard.provider.current",
+            "onboard.provider.saved",
+        ] {
+            assert!(
+                !spec.items.iter().any(|item| item.id == id),
+                "read-only `{id}` must move to the info pane, not the left list"
+            );
+        }
+        // ...and that status now rides in the right-side teaching pane.
+        let Some(crate::menu::types::MenuPreview::Text { body, .. }) = &spec.preview else {
+            panic!("provider step must keep a Text teaching pane");
+        };
+        assert!(
+            body.contains(t!("onboarding.preview.provider.selected").as_ref())
+                && body.contains(t!("onboarding.preview.provider.profile").as_ref()),
+            "info pane should surface the read-only provider/profile status: {body:?}"
+        );
     }
 
     #[test]
@@ -5316,7 +5748,10 @@ mod tests {
             .iter()
             .find(|item| item.id == "provider.test")
             .expect("provider test row");
-        assert_eq!(test_item.label, "Testing connection...");
+        assert_eq!(
+            test_item.label,
+            t!("onboarding.provider.test_testing").into_owned()
+        );
         assert!(test_item.state.loading);
         assert_eq!(test_item.disabled_reason, None);
         let fallback_item = spec
@@ -5324,7 +5759,10 @@ mod tests {
             .iter()
             .find(|item| item.id == "provider.fallback")
             .expect("provider fallback row");
-        assert_eq!(fallback_item.label, "Fallback unavailable while testing");
+        assert_eq!(
+            fallback_item.label,
+            t!("onboarding.provider.fallback_unavailable_testing").into_owned()
+        );
         assert_eq!(fallback_item.disabled_reason, None);
     }
 
@@ -5364,7 +5802,7 @@ mod tests {
 
         assert_eq!(
             saved_item.label,
-            "Saved provider: fallback minimax / MiniMax-M2.5-highspeed via wisemodel"
+            onboarding_provider_saved_status_label(&onboarding)
         );
         assert_eq!(saved_item.state.checked, Some(true));
         assert_eq!(saved_item.state.required_valid, Some(true));
@@ -5500,14 +5938,15 @@ mod tests {
         assert_eq!(spec.title, "Welcome to Octos");
         // The first-run splash renders in the MAIN window (app.rs
         // render_onboarding_first_launch_layout); the welcome menu now also
-        // carries the wizard progress checklist as its preview so the user sees
-        // the full Step-N-of-M path from the first screen.
+        // carries the per-step TEACHING panel (explanatory prose + progress) as
+        // its preview so the user sees the full Step-N-of-M path plus what to do
+        // from the first screen.
         assert!(
             matches!(
                 spec.preview,
-                Some(crate::menu::types::MenuPreview::KeyValues { .. })
+                Some(crate::menu::types::MenuPreview::Text { .. })
             ),
-            "welcome menu should show the wizard progress checklist"
+            "welcome menu should show the per-step explanation panel"
         );
         assert!(
             !spec

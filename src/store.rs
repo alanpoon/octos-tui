@@ -208,15 +208,29 @@ impl Store {
     ///
     /// Seeding the candidate from the explicit `--cwd` (the same path
     /// `session/open` uses) lets the probe validate it. `get_or_insert` keeps
-    /// a later explicit `/onboard workspace <path>` authoritative, and an
-    /// empty/absent cwd is a no-op — preserving the prior label-based behavior
-    /// for launches without `--cwd` (e.g. remote/WS workspaces whose root
-    /// lives on the server, not the local cwd).
+    /// a later explicit `/onboard workspace <path>` authoritative.
+    ///
+    /// UX2 (#1377 follow-up): when no `--cwd` is supplied the candidate now
+    /// falls back to the process working directory (the `octos-tui --cwd`
+    /// default the help text already documents), so the documented launch
+    /// `octos serve --stdio --solo` — which carries NO `--cwd` and whose
+    /// transport label resolves to `"stdio"`/empty — still validates a genuine
+    /// directory out of the box instead of dead-ending on
+    /// "no usable workspace cwd". The fallback is skipped for remote/WS
+    /// transports, where the workspace root lives on the server and the local
+    /// cwd would be wrong.
     pub fn seed_onboarding_workspace_cwd(&mut self, cwd: Option<String>) {
-        if let Some(cwd) = cwd {
-            if !cwd.trim().is_empty() {
-                self.state.onboarding.workspace_candidate.get_or_insert(cwd);
-            }
+        let resolved =
+            resolve_launch_workspace_cwd(cwd, !self.is_remote_transport_target(), || {
+                std::env::current_dir()
+                    .ok()
+                    .map(|path| path.to_string_lossy().into_owned())
+            });
+        if let Some(resolved) = resolved {
+            self.state
+                .onboarding
+                .workspace_candidate
+                .get_or_insert(resolved);
         }
     }
 
@@ -981,6 +995,10 @@ impl Store {
             LocalAction::SetLanguageCode(lang) => self.dispatch_set_language_code(lang),
             LocalAction::SetThinking => self.dispatch_set_thinking(inline_args.unwrap_or_default()),
             LocalAction::SetThinkingLevel(level) => self.dispatch_set_thinking_level(level),
+            LocalAction::CopyLastReply => {
+                self.copy_last_reply();
+                None
+            }
             LocalAction::Custom(name) => {
                 self.state.status = t!("status.local_action_not_wired", name = name).into_owned();
                 None
@@ -2524,6 +2542,11 @@ impl Store {
                     | crate::menu::registry::MENU_ONBOARD_FAMILY
                     | crate::menu::registry::MENU_ONBOARD_MODEL
                     | crate::menu::registry::MENU_ONBOARD_ROUTE
+                    // UX2 B.2: Activate now lives on the workspace step screen,
+                    // so pressing it there must also tear the wizard down (drop
+                    // the user into the coding surface), not leave the workspace
+                    // menu stacked over the chat.
+                    | crate::menu::registry::MENU_ONBOARD_WORKSPACE
             )
         })
     }
@@ -2580,6 +2603,31 @@ impl Store {
             return true;
         }
         false
+    }
+
+    /// True while the first-launch onboarding wizard is still in progress: the
+    /// wizard auto-opens only when there is no session yet, and finishing it
+    /// opens a profile-scoped session. So "no session" == "onboarding not yet
+    /// complete" for the purpose of the Esc trap below.
+    fn onboarding_in_progress(&self) -> bool {
+        self.state.sessions.is_empty()
+    }
+
+    /// Handle Esc on the active menu. Mirrors `close_menu` for every menu EXCEPT
+    /// the *root* onboarding step (`MENU_ONBOARD`) while onboarding is still in
+    /// progress: that wizard is only ever auto-opened on first launch (issue #5),
+    /// so closing it would strand the user with no way back. Esc on a child
+    /// onboarding step (family/model/route/workspace) still pops back to the
+    /// parent wizard step — that is just `close_menu`. Returns true when a menu
+    /// was actually closed.
+    pub fn handle_menu_escape(&mut self) -> bool {
+        if self.onboarding_in_progress()
+            && self.active_menu_id_is(crate::menu::registry::MENU_ONBOARD)
+        {
+            // No-op: keep the root onboarding wizard open.
+            return false;
+        }
+        self.close_menu()
     }
 
     pub fn close_all_menus(&mut self) -> bool {
@@ -3338,6 +3386,26 @@ impl Store {
         self.state.status = t!("status.nothing_to_clear").into_owned();
     }
 
+    /// `/copy` (and the `Ctrl+Y` keybinding): stage the last assistant reply
+    /// for a clipboard write. The store can't touch the terminal, so it parks
+    /// the text on `state.pending_clipboard`; the event loop drains it and
+    /// emits the OSC 52 escape sequence on the next tick. OSC 52 is used (vs a
+    /// local clipboard crate) because the TUI commonly runs over SSH against
+    /// the fleet minis — the copy must reach the *operator's* clipboard, not
+    /// the remote host's.
+    pub fn copy_last_reply(&mut self) {
+        match crate::clipboard::copyable_assistant_text(&self.state) {
+            Some(text) => {
+                let chars = text.chars().count();
+                self.state.pending_clipboard = Some(text);
+                self.state.status = t!("status.copied_last_reply", chars = chars).into_owned();
+            }
+            None => {
+                self.state.status = t!("status.nothing_to_copy").into_owned();
+            }
+        }
+    }
+
     pub fn show_pending_approval(&mut self) -> bool {
         let title = {
             let Some(approval) = self.state.approval.as_mut() else {
@@ -3887,6 +3955,18 @@ impl Store {
                 ));
                 self.state.status = event.message;
                 self.refresh_active_menu_if_open();
+                // Creating the profile flips the wizard from the local-profile
+                // (Step 1) screen to the provider (LLM config) step, which is
+                // rebuilt in place on the SAME menu frame. The frame still holds
+                // the `selected_index` of the local-profile "Continue" row, and
+                // that index lines up with "API key" in the provider menu — so
+                // without repositioning, the fresh provider step would open with
+                // the cursor on API key instead of the first config row. Drop
+                // the cursor onto the Model family row (the first thing the user
+                // fills in here). A no-op when the menu didn't transition (e.g.
+                // the auto-finish open-session path below), since the row id is
+                // absent there.
+                self.focus_provider_start_row();
                 let follow_up = open_session
                     .then(|| self.onboarding_finish_command())
                     .flatten();
@@ -7047,6 +7127,35 @@ fn non_empty_string(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// Resolve the workspace cwd to seed the onboarding candidate from at launch.
+///
+/// Precedence:
+///   1. an explicit, non-empty `--cwd` (always wins, including remote launches
+///      where the user named a server-side path on purpose);
+///   2. otherwise — only for transport-local launches (stdio / `ws://localhost`),
+///      gated by `allow_process_cwd_fallback` — the process working directory
+///      via `process_cwd`.
+///
+/// Returns `None` when neither yields a non-empty path (e.g. a remote launch
+/// with no `--cwd`), preserving the prior label/root-based behavior for
+/// remote/WS workspaces whose root lives on the server. `process_cwd` is
+/// injected so the fallback is deterministic under test.
+fn resolve_launch_workspace_cwd(
+    explicit: Option<String>,
+    allow_process_cwd_fallback: bool,
+    process_cwd: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if let Some(explicit) = explicit {
+        if !explicit.trim().is_empty() {
+            return Some(explicit);
+        }
+    }
+    if !allow_process_cwd_fallback {
+        return None;
+    }
+    process_cwd().filter(|cwd| !cwd.trim().is_empty())
+}
+
 fn onboarding_workspace_cwd(value: &str) -> Option<String> {
     let value = value.trim();
     if let Some(command) = value.strip_prefix("stdio:") {
@@ -7738,6 +7847,72 @@ mod tests {
         }
     }
 
+    fn store_with_assistant_message(text: &str) -> Store {
+        let session = SessionView {
+            id: SessionKey("local:test".into()),
+            title: "test".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![Message::user("prompt"), Message::assistant(text)],
+            tasks: vec![],
+            live_reply: None,
+        };
+        Store {
+            state: AppState::new(vec![session], 0, "ready".into(), None, false),
+        }
+    }
+
+    #[test]
+    fn copy_last_reply_stages_assistant_text_for_clipboard() {
+        let mut store = store_with_assistant_message("the deep-research report");
+        assert!(store.state.pending_clipboard.is_none());
+
+        store.copy_last_reply();
+
+        assert_eq!(
+            store.state.pending_clipboard.as_deref(),
+            Some("the deep-research report")
+        );
+        assert!(
+            store
+                .state
+                .status
+                .contains(t!("status.copied_last_reply", chars = 24).as_ref()),
+            "status should confirm the copy, got: {}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn copy_last_reply_reports_when_there_is_nothing_to_copy() {
+        let mut store = store_with_empty_session();
+
+        store.copy_last_reply();
+
+        assert!(store.state.pending_clipboard.is_none());
+        assert!(
+            store
+                .state
+                .status
+                .contains(t!("status.nothing_to_copy").as_ref()),
+            "status should explain the no-op, got: {}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn copy_command_dispatch_stages_clipboard() {
+        let mut store = store_with_assistant_message("final answer");
+
+        let command =
+            store.dispatch_local_action(crate::menu::types::LocalAction::CopyLastReply, None);
+
+        assert!(command.is_none(), "/copy is local-only, sends no command");
+        assert_eq!(
+            store.state.pending_clipboard.as_deref(),
+            Some("final answer")
+        );
+    }
+
     /// `/lang` with no/unknown code must NOT mutate the process-global locale
     /// (which would flake every other test that renders English). The success
     /// path (which calls `set_locale`) is covered by the lib's i18n_tests +
@@ -7758,6 +7933,88 @@ mod tests {
             store.state.status
         );
         assert_eq!(rust_i18n::locale().to_string(), before);
+    }
+
+    #[test]
+    fn onboarding_language_step_is_first() {
+        let mut store = protocol_store_without_sessions();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+        ]));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+
+        let root = store
+            .state
+            .active_menu
+            .as_ref()
+            .expect("onboarding menu is built");
+        let MenuBuildResult::Ready(spec) = root else {
+            panic!("expected ready onboarding menu");
+        };
+        assert_eq!(
+            spec.items.first().map(|item| item.id.as_str()),
+            Some("onboard.language"),
+            "language must be the first onboarding row"
+        );
+    }
+
+    #[test]
+    fn onboarding_language_selection_sets_zh_locale_in_child_process() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+            .args([
+                "--exact",
+                "store::tests::onboarding_language_selection_child_sets_zh_locale",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .output()
+            .expect("run child locale-selection test");
+        assert!(
+            output.status.success(),
+            "child locale-selection test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "spawned by onboarding_language_selection_sets_zh_locale_in_child_process"]
+    fn onboarding_language_selection_child_sets_zh_locale() {
+        rust_i18n::set_locale("en");
+
+        let mut store = protocol_store_without_sessions();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+        ]));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+
+        assert!(store.accept_active_menu_item().is_none());
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|frame| frame.id.as_str()),
+            Some(crate::menu::registry::MENU_ONBOARD_LANGUAGE)
+        );
+
+        store.select_next_menu_item();
+        let language_menu = store
+            .state
+            .active_menu
+            .as_ref()
+            .expect("language menu is built");
+        let MenuBuildResult::Ready(spec) = language_menu else {
+            panic!("expected ready language menu");
+        };
+        assert_eq!(
+            spec.items.get(1).map(|item| item.id.as_str()),
+            Some("onboard.language.zh"),
+            "zh should be the second available onboarding language"
+        );
+
+        assert!(store.accept_active_menu_item().is_none());
+        assert_eq!(rust_i18n::locale().to_string(), "zh");
     }
 
     #[test]
@@ -8089,7 +8346,7 @@ mod tests {
             store.state.onboarding.provider_pending,
             Some(OnboardingProviderPending::Test)
         );
-        assert_eq!(store.state.status, "Testing provider connection");
+        assert_eq!(store.state.status, t!("status.testing_provider_connection"));
 
         store.apply_client_event(ClientEvent::ProfileLlmMutation(
             ProfileLlmMutationClientEvent {
@@ -8481,6 +8738,103 @@ mod tests {
         assert!(store.state.onboarding.workspace_candidate.is_none());
     }
 
+    /// UX2 B.1: the documented `octos serve --stdio --solo` launch carries no
+    /// `--cwd` and its transport label resolves to `"stdio"`/empty. With the
+    /// process-cwd fallback the onboarding candidate is seeded to the launch
+    /// directory, so the first-launch probe validates a genuine folder instead
+    /// of dead-ending on "no usable workspace cwd".
+    #[test]
+    fn stdio_launch_without_cwd_falls_back_to_process_cwd() {
+        let stdio_label = "stdio:/abs/octos serve --stdio --solo";
+        let mut store = Store::from_snapshot(AppUiSnapshot {
+            sessions: vec![],
+            selected_session: 0,
+            status: "ready".into(),
+            target: Some(stdio_label.into()),
+            readonly: false,
+        });
+        // Pre-seed deterministically (the public seed reads the real process
+        // cwd; the resolver itself is unit-tested below with an injected cwd).
+        let resolved = resolve_launch_workspace_cwd(None, true, || Some("/launch/dir".into()));
+        store.state.onboarding.workspace_candidate = resolved;
+        assert_eq!(
+            store.state.onboarding.workspace_candidate.as_deref(),
+            Some("/launch/dir"),
+        );
+        let root = store.state.workspace.root.clone();
+        assert_eq!(
+            store.state.onboarding.workspace_target(&root),
+            "/launch/dir",
+        );
+    }
+
+    /// UX2 B.1: the real `seed_onboarding_workspace_cwd` path resolves a usable
+    /// directory for an stdio launch with no `--cwd`. The seeded candidate must
+    /// be a genuine, existing directory so the probe would validate it (here we
+    /// just assert it is non-empty and exists, since the process cwd at test
+    /// time is the crate root).
+    #[test]
+    fn seed_without_cwd_resolves_a_real_directory_for_local_transport() {
+        let mut store = Store::from_snapshot(AppUiSnapshot {
+            sessions: vec![],
+            selected_session: 0,
+            status: "ready".into(),
+            target: Some("stdio:/abs/octos serve --stdio --solo".into()),
+            readonly: false,
+        });
+        store.seed_onboarding_workspace_cwd(None);
+        let candidate = store
+            .state
+            .onboarding
+            .workspace_candidate
+            .clone()
+            .expect("stdio launch without --cwd seeds the process cwd");
+        assert!(!candidate.trim().is_empty());
+        assert!(
+            std::path::Path::new(&candidate).is_dir(),
+            "seeded candidate must be an existing directory: {candidate}"
+        );
+    }
+
+    /// UX2 B.1: an explicit `--cwd` override always wins, even over the
+    /// process-cwd fallback, and a remote transport without `--cwd` still
+    /// resolves to nothing (the server owns the workspace root).
+    #[test]
+    fn resolve_launch_workspace_cwd_precedence() {
+        // Explicit override wins regardless of fallback availability.
+        assert_eq!(
+            resolve_launch_workspace_cwd(Some("/explicit".into()), true, || Some(
+                "/fallback".into()
+            )),
+            Some("/explicit".into()),
+        );
+        // Blank explicit falls through to the process cwd for local transports.
+        assert_eq!(
+            resolve_launch_workspace_cwd(Some("   ".into()), true, || Some("/fallback".into())),
+            Some("/fallback".into()),
+        );
+        // No explicit + local transport → process cwd.
+        assert_eq!(
+            resolve_launch_workspace_cwd(None, true, || Some("/fallback".into())),
+            Some("/fallback".into()),
+        );
+        // Remote transport (fallback disallowed) + no explicit → None.
+        assert_eq!(
+            resolve_launch_workspace_cwd(None, false, || Some("/fallback".into())),
+            None,
+        );
+        // Remote transport + explicit cwd still honors the explicit path.
+        assert_eq!(
+            resolve_launch_workspace_cwd(Some("/explicit".into()), false, || None),
+            Some("/explicit".into()),
+        );
+        // Empty process cwd is treated as no fallback.
+        assert_eq!(
+            resolve_launch_workspace_cwd(None, true, || Some("  ".into())),
+            None,
+        );
+    }
+
     #[test]
     fn solo_onboarding_finish_creates_local_profile_without_otp() {
         let mut store = protocol_store_with_methods(&[
@@ -8597,6 +8951,82 @@ mod tests {
     }
 
     #[test]
+    fn provider_step_opens_on_model_family_after_local_profile_create() {
+        // First launch advertises local-solo profile create, which auto-opens
+        // the onboarding wizard on the local-profile (Step 1) screen.
+        let mut store = protocol_store_without_sessions();
+        store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[
+                        crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+                        crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+                    ],
+                    &[],
+                ),
+            },
+            message: "AppUI capabilities refreshed".into(),
+        }));
+
+        // The user fills the fields and lands the cursor on the final
+        // "Continue" row (the create action) before pressing Enter. That row's
+        // index in the local-profile menu happens to line up with "API key" in
+        // the provider menu — which is the bug we are guarding against.
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected local-profile onboarding menu");
+        };
+        let create_index = spec
+            .items
+            .iter()
+            .position(|item| item.id == "onboard.local.create")
+            .expect("local create row");
+        store
+            .state
+            .menu_stack
+            .active_mut()
+            .expect("active menu")
+            .selected_index = create_index;
+
+        // The server confirms the profile; the wizard transitions in-place to
+        // the provider (LLM config) step.
+        store.apply_client_event(ClientEvent::ProfileLocalCreate(
+            crate::client_event::ProfileLocalCreateClientEvent {
+                result: ProfileLocalCreateResult {
+                    profile_id: "ada-server".into(),
+                    user_id: "ada-user".into(),
+                    name: "Ada Lovelace".into(),
+                    username: "ada".into(),
+                    email: "ada@example.com".into(),
+                    created: true,
+                    runtime_mode: "solo".into(),
+                },
+                message: "Local solo profile created: ada-server".into(),
+            },
+        ));
+
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected provider setup menu after local profile create");
+        };
+        // Sanity: this really is the provider step, not the local-profile step.
+        assert!(
+            spec.items
+                .iter()
+                .any(|item| item.id == "onboard.provider.family"),
+            "expected provider step with the Model family row"
+        );
+        let selected = store
+            .state
+            .menu_stack
+            .active()
+            .expect("active menu")
+            .selected_index;
+        assert_eq!(
+            spec.items[selected].id, "onboard.provider.family",
+            "fresh provider step must land on Model family, not the stale row carried over from the local-profile Continue button"
+        );
+    }
+
+    #[test]
     fn first_launch_opens_onboarding_menu_when_server_advertises_solo_profile_create() {
         let mut store = protocol_store_without_sessions();
 
@@ -8619,6 +9049,62 @@ mod tests {
             spec.items
                 .iter()
                 .any(|item| item.id == "onboard.local.create")
+        );
+    }
+
+    #[test]
+    fn esc_on_root_onboarding_menu_keeps_the_wizard_open() {
+        // Issue #5: the onboarding wizard is only auto-opened on first launch, so
+        // if Esc closed the root step the user would be stranded with no relaunch.
+        // Esc on the ROOT onboarding menu must be a no-op (wizard stays open).
+        let mut store = protocol_store_without_sessions();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        assert!(store.state.sessions.is_empty(), "onboarding-in-progress");
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+
+        let closed = store.handle_menu_escape();
+
+        assert!(!closed, "Esc on the root onboarding menu must not close it");
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD),
+            "root onboarding wizard should stay open after Esc"
+        );
+    }
+
+    #[test]
+    fn esc_on_child_onboarding_step_goes_back_to_the_root_wizard() {
+        // Esc on a CHILD step (family/model/route/workspace) should still pop back
+        // to the parent (root) wizard step — not quit the wizard.
+        let mut store = protocol_store_without_sessions();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL));
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD_MODEL));
+
+        let closed = store.handle_menu_escape();
+
+        assert!(closed, "Esc on a child step should pop a frame");
+        assert!(
+            store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD),
+            "Esc on a child onboarding step should return to the root wizard"
+        );
+    }
+
+    #[test]
+    fn esc_on_non_onboarding_menu_closes_it_as_before() {
+        // Regression guard: Esc behavior is unchanged for non-onboarding menus.
+        // A store with a session is NOT onboarding-in-progress, so even the
+        // generic Esc trap does not apply.
+        let mut store = protocol_store_with_methods(&[]);
+        assert!(!store.state.sessions.is_empty());
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_THEME));
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_THEME));
+
+        let closed = store.handle_menu_escape();
+
+        assert!(closed, "Esc on a non-onboarding menu should close it");
+        assert!(
+            !store.state.menu_stack.is_active(),
+            "the theme menu should be closed after Esc"
         );
     }
 
@@ -9797,8 +10283,16 @@ mod tests {
             result.is_none(),
             "session/open must not fire while workspace validation is Invalid"
         );
+        let expected_status =
+            if let crate::model::OnboardingWorkspaceValidation::Invalid { reason } =
+                &store.state.onboarding.workspace_validation
+            {
+                t!("status.cannot_open_workspace_invalid", reason = reason).into_owned()
+            } else {
+                panic!("expected invalid workspace validation");
+            };
         assert!(
-            store.state.status.contains("workspace invalid"),
+            store.state.status == expected_status,
             "expected blocked-status message, got: {}",
             store.state.status
         );
@@ -9993,7 +10487,12 @@ mod tests {
 
         match &store.state.onboarding.workspace_validation {
             crate::model::OnboardingWorkspaceValidation::Invalid { reason } => {
-                assert!(reason.contains("no usable workspace cwd"));
+                let expected = t!("status.no_usable_workspace_cwd", target = "stdio");
+                assert_eq!(reason, expected.as_ref());
+                assert!(
+                    reason.contains("/onboard workspace"),
+                    "reason should name the override command: {reason}"
+                );
             }
             other => panic!("expected Invalid, got: {other:?}"),
         }
@@ -10159,6 +10658,34 @@ mod tests {
             store.state.menu_stack.is_active(),
             "a non-onboarding menu stays open across session open"
         );
+    }
+
+    /// UX2 B.2: Activate moved to the WORKSPACE step screen, so opening a
+    /// session while THAT menu is active must also tear the wizard down (drop
+    /// the user into the coding surface) — the same as the other onboarding
+    /// menus. Without `MENU_ONBOARD_WORKSPACE` in `active_menu_is_onboarding`,
+    /// the workspace menu would stay stacked over the chat after activation.
+    #[test]
+    fn session_opened_tears_down_workspace_step_menu() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::SessionOpened;
+
+        let mut store = store_with_empty_session();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_WORKSPACE));
+        assert!(store.state.menu_stack.is_active());
+
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": SessionKey("alice:local:tui#coding".into()),
+            "active_profile_id": "alice",
+        }))
+        .expect("session/opened payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+
+        assert!(
+            !store.state.menu_stack.is_active(),
+            "the workspace step menu is torn down once the session opens"
+        );
+        assert_eq!(store.state.focus, FocusPane::Composer);
     }
 
     #[test]
