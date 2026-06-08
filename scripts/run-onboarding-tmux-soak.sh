@@ -1273,16 +1273,31 @@ restart_stdio_child() {
     kill "$pid" 2>/dev/null || true
   done
 
+  # Wait for the ORIGINAL backend process(es) to exit. The TUI's stdio
+  # transport auto-relaunches a fresh backend after the child dies — that
+  # relaunch is exactly the reconnect behavior under test, so a NEW pid
+  # appearing is expected and must NOT be treated as "did not exit". Only
+  # the pids we signalled need to be gone.
   local shutdown_deadline=$((SECONDS + ${OCTOS_TUI_SOAK_STDIO_SHUTDOWN_WAIT_SECS:-10}))
-  local remaining
+  local still_alive
   while [ "$SECONDS" -le "$shutdown_deadline" ]; do
-    remaining="$(stdio_backend_pids | sort -u)"
-    [ -z "$remaining" ] && break
+    still_alive=""
+    for pid in $pids; do
+      if kill -0 "$pid" 2>/dev/null; then
+        still_alive="$still_alive $pid"
+      fi
+    done
+    [ -z "$still_alive" ] && break
     sleep 0.2
   done
-  remaining="$(stdio_backend_pids | sort -u)"
-  if [ -n "$remaining" ]; then
-    die "Scoped stdio backend did not exit after SIGTERM: $remaining"
+  still_alive=""
+  for pid in $pids; do
+    if kill -0 "$pid" 2>/dev/null; then
+      still_alive="$still_alive $pid"
+    fi
+  done
+  if [ -n "$still_alive" ]; then
+    die "Scoped stdio backend did not exit after SIGTERM:$still_alive"
   fi
 
   {

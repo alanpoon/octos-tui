@@ -1431,14 +1431,38 @@ fn websocket_request(
     }
     request.headers_mut().insert(
         "X-Octos-Ui-Features",
-        format!(
-            "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}, {UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1}, {UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1}, {UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1}, {UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1}, {UI_PROTOCOL_FEATURE_USER_QUESTION_V1}"
-        )
-        .parse()
-        .wrap_err("failed to build UI protocol feature header")?,
+        appui_feature_header_value()
+            .parse()
+            .wrap_err("failed to build UI protocol feature header")?,
     );
 
     Ok(request)
+}
+
+/// Build the `X-Octos-Ui-Features` negotiation value.
+///
+/// Normally the TUI advertises the full modern feature set. When
+/// `OCTOS_TUI_OLD_SERVER_FEATURES=1` is set it advertises only the
+/// pre-autonomy baseline, dropping the coding autonomy / agent-control /
+/// goal / loop / harness-task-control features. This lets the onboarding
+/// soak exercise the genuine old-server fallback path (header-negotiated):
+/// a backend that never advertises supervised-task inspection, so the TUI
+/// must hide those controls and never probe `review/start`, `task/list`,
+/// or `task/artifact/*`.
+fn appui_feature_header_value() -> String {
+    let old_server = std::env::var("OCTOS_TUI_OLD_SERVER_FEATURES").as_deref() == Ok("1");
+    appui_feature_header_for(old_server)
+}
+
+fn appui_feature_header_for(old_server: bool) -> String {
+    if old_server {
+        return format!(
+            "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}, {UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1}, {UI_PROTOCOL_FEATURE_USER_QUESTION_V1}"
+        );
+    }
+    format!(
+        "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}, {UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1}, {UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1}, {UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1}, {UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1}, {UI_PROTOCOL_FEATURE_USER_QUESTION_V1}"
+    )
 }
 
 fn protocol_snapshot_from_launch(launch: &AppUiLaunch, endpoint: &str) -> AppUiSnapshot {
@@ -1485,8 +1509,37 @@ fn protocol_target_label(endpoint: &str) -> String {
     if is_websocket_url(endpoint) {
         endpoint.into()
     } else {
-        format!("stdio:{endpoint}")
+        format!("stdio:{}", redact_secret_assignments(endpoint))
     }
+}
+
+/// Redact secret-bearing `NAME=VALUE` assignments inside a displayed
+/// stdio backend command. A `--stdio-command` may carry an inline
+/// `env DEEPSEEK_API_KEY=sk-...` prefix; the raw value must never reach
+/// a rendered status pane (it ends up in tmux/screen captures and soak
+/// artifacts). Only the value of an assignment whose name looks like a
+/// credential (`*KEY`, `*TOKEN`, `*SECRET`, `*PASSWORD`, `*_API_KEY`) is
+/// masked — the command structure stays visible for debugging.
+fn redact_secret_assignments(command: &str) -> String {
+    command
+        .split(' ')
+        .map(|token| match token.split_once('=') {
+            Some((name, value)) if !value.is_empty() && is_secret_env_name(name) => {
+                format!("{name}=<redacted>")
+            }
+            _ => token.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_secret_env_name(name: &str) -> bool {
+    let upper = name.trim().to_ascii_uppercase();
+    upper.ends_with("KEY")
+        || upper.ends_with("TOKEN")
+        || upper.ends_with("SECRET")
+        || upper.ends_with("PASSWORD")
+        || upper.contains("API_KEY")
 }
 
 fn protocol_transport_description(endpoint: &str) -> &'static str {
@@ -4194,6 +4247,61 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn stdio_target_label_redacts_inline_secret_env_assignments() {
+        let cmd = "env DEEPSEEK_API_KEY=sk-abc123secret OCTOS_FOO=1 octos serve --stdio --solo --data-dir /d";
+        let label = protocol_target_label(cmd);
+        assert!(
+            label.starts_with("stdio:"),
+            "stdio target label must keep the stdio: scheme: {label}"
+        );
+        assert!(
+            !label.contains("sk-abc123secret"),
+            "secret API key value must not appear in the displayed stdio target: {label}"
+        );
+        assert!(
+            label.contains("DEEPSEEK_API_KEY=<redacted>"),
+            "secret env name must remain visible with a redacted value: {label}"
+        );
+        // Non-secret structure stays intact for debuggability.
+        assert!(
+            label.contains("OCTOS_FOO=1"),
+            "non-secret env preserved: {label}"
+        );
+        assert!(
+            label.contains("serve --stdio --solo"),
+            "command preserved: {label}"
+        );
+    }
+
+    #[test]
+    fn websocket_target_label_is_unchanged() {
+        let ws = "ws://127.0.0.1:50179/api/ui-protocol/ws";
+        assert_eq!(protocol_target_label(ws), ws);
+    }
+
+    #[test]
+    fn old_server_features_drop_autonomy_negotiation() {
+        // Modern (default) advertises the full autonomy/agent-control set.
+        let modern = appui_feature_header_for(false);
+        assert!(modern.contains(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1));
+        assert!(modern.contains(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1));
+        assert!(modern.contains(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+
+        // Old-server mode drops autonomy/agent-control/goal/loop/task-control
+        // so the backend behaves as a pre-autonomy server and the TUI hides
+        // supervised-task inspection controls.
+        let legacy = appui_feature_header_for(true);
+        assert!(!legacy.contains(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1));
+        assert!(!legacy.contains(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1));
+        assert!(!legacy.contains(UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1));
+        assert!(!legacy.contains(UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1));
+        assert!(!legacy.contains(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+        // Baseline features remain so the session still works.
+        assert!(legacy.contains(UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1));
+        assert!(legacy.contains(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1));
+    }
 
     fn unwrap_app_event(event: ClientEvent) -> AppUiEvent {
         let ClientEvent::App(event) = event else {
