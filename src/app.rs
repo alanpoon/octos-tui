@@ -83,10 +83,20 @@ fn inspector_visible(app: &AppState) -> bool {
 pub fn wants_fullscreen_overlay(app: &AppState) -> bool {
     inspector_visible(app)
         || onboarding_first_launch_active(app)
+        || app.transcript_pager_active
         || app.task_output.active
         || app.artifact_detail.active
         || app.thread_graph_detail.active
         || app.turn_state_detail.active
+}
+
+/// Mouse capture policy. In the default `native` scroll-mode, capture is on
+/// ONLY while the transcript pager is up, so the wheel scrolls the pager and
+/// the inline chat flow keeps native terminal selection/copy untouched. In
+/// `pinned` scroll-mode the user explicitly trades native selection for a
+/// wheel that always scrolls the app (composer pinned), so capture stays on.
+pub fn wants_mouse_capture(app: &AppState) -> bool {
+    app.transcript_pager_active || app.pinned_scroll
 }
 
 /// Watermarks for active-turn content that has already been written into native
@@ -94,11 +104,11 @@ pub fn wants_fullscreen_overlay(app: &AppState) -> bool {
 /// hide the same stable prefix so spinner ticks only repaint the live tail.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LiveTurnFinalization {
-    pub(crate) session_id: String,
-    pub(crate) turn_id: String,
-    pub(crate) reply_flushed_text: String,
-    pub(crate) activity_flushed_items: usize,
-    pub(crate) activity_flushed_keys: Vec<String>,
+    pub session_id: String,
+    pub turn_id: String,
+    pub reply_flushed_text: String,
+    pub activity_flushed_items: usize,
+    pub activity_flushed_keys: Vec<String>,
 }
 
 impl LiveTurnFinalization {
@@ -203,8 +213,11 @@ pub fn render_viewport_with_finalization(
     let area = frame.area();
     let composer_height = composer_height_for_size(app, area.width, area.height);
     let active_menu = active_menu_surface(app);
-    let menu_height = menu_height_hint(active_menu.as_ref(), area.width, area.height)
-        .min(area.height.saturating_sub(composer_height + 1));
+    let menu_height = menu_height_for_viewport(
+        active_menu.as_ref(),
+        area.width,
+        area.height.saturating_sub(composer_height + 1),
+    );
     let autonomy_height = autonomy_indicator_height(app);
     let harness_height = harness_status_height(app);
 
@@ -387,7 +400,7 @@ pub fn finalized_history_lines_range(
             .iter()
             .filter(|(anchor_idx, _)| *anchor_idx == idx)
         {
-            push_turn_activity_log_section(&mut lines, palette, log, app);
+            push_turn_activity_log_section(&mut lines, palette, log, app, false);
         }
     }
     // Scrollback content must render on the terminal's NATIVE background, not the
@@ -426,7 +439,10 @@ pub fn finalized_history_lines_range_dedup_live(
         if let Some(coverage) = reply_coverage {
             let suffix = &message.content[coverage.reply_flushed_text.len()..];
             if !suffix.trim().is_empty() {
-                push_live_reply_block(&mut lines, palette, suffix, wrap_width);
+                // Continuation of a reply whose prefix is already in
+                // scrollback (coverage is only matched when non-empty) —
+                // never re-issue the bullet.
+                push_live_reply_block(&mut lines, palette, suffix, wrap_width, false);
             }
         } else {
             push_message_block(
@@ -457,7 +473,7 @@ pub fn finalized_history_lines_range_dedup_live(
             {
                 push_turn_activity_log_section_unflushed(&mut lines, palette, log, app, coverage);
             } else {
-                push_turn_activity_log_section(&mut lines, palette, log, app);
+                push_turn_activity_log_section(&mut lines, palette, log, app, false);
             }
         }
     }
@@ -532,7 +548,8 @@ pub fn finalized_live_turn_lines_between(
     {
         let new_reply = &next.reply_flushed_text[previous.reply_flushed_text.len()..];
         if !new_reply.trim().is_empty() {
-            push_live_reply_block(&mut lines, palette, new_reply, wrap_width);
+            let first = previous.reply_flushed_text.is_empty();
+            push_live_reply_block(&mut lines, palette, new_reply, wrap_width, first);
         }
     }
 
@@ -643,10 +660,53 @@ pub fn committed_reply_matches_live_finalization(
         })
 }
 
+/// Largest prefix of the streaming reply that is safe to flush into the
+/// IMMUTABLE terminal scrollback (codex's markdown-stream model): the cut may
+/// only land on a *completed block* boundary — a closed code fence, or a blank
+/// line ending a paragraph/table/list run. Completed blocks are self-contained,
+/// so rendering each flushed batch as an independent document stays correct;
+/// an unclosed fence or a still-accumulating paragraph is held back (it keeps
+/// re-rendering in the live tail) rather than written out half-parsed and
+/// frozen wrong forever. The state machine is line-oriented: only lines
+/// terminated by `\n` are considered at all.
 fn stable_live_reply_prefix_len(text: &str) -> usize {
-    text.rfind('\n')
-        .map(|idx| idx + '\n'.len_utf8())
-        .unwrap_or(0)
+    let mut safe_end = 0;
+    let mut offset = 0;
+    let mut in_fence = false;
+    let mut fence_start = 0;
+    for segment in text.split_inclusive('\n') {
+        if !segment.ends_with('\n') {
+            // Trailing partial line: never flushable.
+            break;
+        }
+        let line_start = offset;
+        offset += segment.len();
+        let trimmed = segment.trim();
+        if trimmed.starts_with("```") {
+            if in_fence {
+                // Fence closed → the whole fenced block just completed.
+                in_fence = false;
+                safe_end = offset;
+            } else {
+                in_fence = true;
+                fence_start = line_start;
+            }
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if trimmed.is_empty() {
+            // Blank line ends any open paragraph / table / list run.
+            safe_end = offset;
+        }
+    }
+    if in_fence {
+        // An unclosed fence pins the watermark before the fence opener, even
+        // if blank lines were seen inside the fence body.
+        safe_end = safe_end.min(fence_start);
+    }
+    safe_end
 }
 
 fn strip_lines_background(lines: &mut [Line<'static>]) {
@@ -1064,6 +1124,29 @@ fn menu_height_hint(
         .max(4.min(max_height))
 }
 
+/// Menu height for the INLINE VIEWPORT render pass. `menu_height_hint` budgets
+/// against the full TERMINAL height (its `-15` heuristic reserves scrollback
+/// rows) and sizes the viewport accordingly; re-applying that heuristic to the
+/// viewport's own (much smaller) height collapsed the menu to zero rows — the
+/// slash popup's space was reserved but rendered blank once the activity
+/// collapse made viewports short. Here the menu simply takes its desired
+/// height, clamped to the room the viewport actually has.
+fn menu_height_for_viewport(
+    menu: Option<&menu_render::MenuSurface>,
+    viewport_width: u16,
+    available: u16,
+) -> u16 {
+    let Some(menu) = menu else {
+        return 0;
+    };
+    if available == 0 {
+        return 0;
+    }
+    menu_render::height_hint(menu, viewport_width)
+        .min(available)
+        .max(4.min(available))
+}
+
 const COMPOSER_CHROME_ROWS: u16 = 4;
 const COMPOSER_MIN_HEIGHT: u16 = 5;
 const COMPOSER_MAX_INPUT_ROWS: u16 = 12;
@@ -1446,7 +1529,7 @@ fn render_transcript(app: &AppState, palette: Palette, area: Rect) -> Paragraph<
                 .iter()
                 .filter(|(anchor_idx, _)| *anchor_idx == idx)
             {
-                push_turn_activity_log_section(&mut lines, palette, log, app);
+                push_turn_activity_log_section(&mut lines, palette, log, app, true);
             }
 
             if turn_flow_visible && Some(idx) == latest_user_index {
@@ -1493,10 +1576,32 @@ fn render_transcript(app: &AppState, palette: Palette, area: Rect) -> Paragraph<
     }
     let scroll_top = scroll_top as u16;
 
+    // In the pager the transcript blends with the terminal's DEFAULT
+    // background, exactly like the inline live tail: pinned-mode wheel
+    // scrolling enters the pager seamlessly, and painting `surface_alt` here
+    // would flip the whole screen to the theme color mid-scroll (the
+    // user-reported "screen went black"). Other full-screen surfaces
+    // (inspector, detail-modal backdrops) keep `surface_alt`.
+    let block_style = if app.transcript_pager_active {
+        // Span-level backgrounds (message-block "bubbles") must go too:
+        // committed history in native scrollback renders without them, so
+        // keeping them here paints text-shaped theme-color stripes over the
+        // terminal background the moment the user scrolls into the pager.
+        for line in &mut lines {
+            line.style.bg = None;
+            for span in &mut line.spans {
+                span.style.bg = None;
+            }
+        }
+        Style::default().fg(palette.text)
+    } else {
+        Style::default().fg(palette.text).bg(palette.surface_alt)
+    };
+
     Paragraph::new(Text::from(lines))
         .block(
             Block::default()
-                .style(Style::default().fg(palette.text).bg(palette.surface_alt))
+                .style(block_style)
                 .border_style(palette.border()),
         )
         .scroll((scroll_top, 0))
@@ -1630,7 +1735,11 @@ fn push_turn_flow(
             live_reply.text.as_str()
         };
         if !reply_text.trim().is_empty() {
-            push_live_reply_block(lines, palette, reply_text, width);
+            // The live-tail view shows the not-yet-flushed remainder; the
+            // bullet belongs to it only while nothing was flushed yet.
+            let first = live_finalization
+                .is_none_or(|finalization| finalization.reply_flushed_text.is_empty());
+            push_live_reply_block(lines, palette, reply_text, width, first);
         }
     }
 
@@ -1656,13 +1765,36 @@ fn push_recent_user_context(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
     content: &str,
-    width: usize,
+    _width: usize,
 ) {
+    push_user_message_block(lines, palette, content);
+}
+
+/// User input gets the role-contrast treatment: an accent-colored `▌` gutter
+/// on every logical line plus a bold body. It is the single strongest visual
+/// anchor in the transcript (scanning for "what did I say" is the most common
+/// review motion), works without any background color (backgrounds are
+/// unreliable in the pager, the terminal theme, and native scrollback), and
+/// echoes the input verbatim — user text is a quote, not a markdown document.
+fn push_user_message_block(lines: &mut Vec<Line<'static>>, palette: Palette, content: &str) {
     if !lines.is_empty() && !line_is_blank(lines.last()) {
         lines.push(Line::from(""));
     }
-    let bg = chat_message_bg(palette, "user");
-    push_formatted_body(lines, palette, content, "› ", Some(bg), width);
+    let gutter = Style::default().fg(palette.accent);
+    let body = palette.text().add_modifier(Modifier::BOLD);
+    if content.trim().is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("▌ ", gutter),
+            Span::styled("<empty>", palette.muted()),
+        ]));
+        return;
+    }
+    for raw_line in content.lines() {
+        lines.push(Line::from(vec![
+            Span::styled("▌ ", gutter),
+            Span::styled(raw_line.trim_end().to_string(), body),
+        ]));
+    }
 }
 
 fn push_message_block(
@@ -1676,13 +1808,17 @@ fn push_message_block(
         return;
     }
 
+    if role == "user" {
+        push_user_message_block(lines, palette, content);
+        return;
+    }
+
     if !lines.is_empty() && !line_is_blank(lines.last()) {
         lines.push(Line::from(""));
     }
 
     let bg = chat_message_bg(palette, role);
     let indent = match role {
-        "user" => "› ",
         "tool" => "$ ",
         "reasoning" => "· ",
         _ => "",
@@ -1711,18 +1847,24 @@ fn push_message_block(
     );
 }
 
+/// Render a (chunk of a) streaming reply. `first` controls the `• ` prose
+/// marker: a reply flushed across several scrollback batches must carry the
+/// bullet exactly once — on its first batch — or the transcript reads as
+/// several separate replies.
 fn push_live_reply_block(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
     content: &str,
     width: usize,
+    first: bool,
 ) {
     if !lines.is_empty() && !line_is_blank(lines.last()) {
         lines.push(Line::from(""));
     }
 
     let bg = chat_message_bg(palette, "assistant");
-    push_formatted_body_marked(lines, palette, content, "", Some("• "), Some(bg), width);
+    let marker = first.then_some("• ");
+    push_formatted_body_marked(lines, palette, content, "", marker, Some(bg), width);
 }
 
 fn push_pending_messages_block(
@@ -1768,6 +1910,36 @@ fn push_pending_messages_block(
     }
 }
 
+/// Emit the framed body rows of a fenced code block, highlighted via the
+/// memoizing block cache. `complete` marks a closed fence (cacheable);
+/// still-streaming blocks render uncached. The fallback style is fg-only —
+/// the row background stays line-level (`chat_line`) per the no-span-bg rule.
+fn push_code_block_lines(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    indent: &'static str,
+    bg: Option<Color>,
+    language: &str,
+    body: &[String],
+    complete: bool,
+) {
+    let rendered = crate::highlight::highlight_block(
+        language,
+        body,
+        palette.muted(),
+        complete,
+        palette.code_theme,
+    );
+    for row in rendered.iter() {
+        let mut spans = vec![
+            Span::styled(indent, style_bg(palette.border(), bg)),
+            Span::styled("│ ", style_bg(palette.border(), bg)),
+        ];
+        spans.extend(row.iter().cloned());
+        lines.push(chat_line(spans, bg));
+    }
+}
+
 fn chat_message_bg(palette: Palette, role: &str) -> Color {
     match role {
         "user" => palette.diff_context_bg,
@@ -1798,7 +1970,11 @@ fn push_formatted_body_marked(
     bg: Option<Color>,
     width: usize,
 ) {
-    let mut in_code = false;
+    // `Some((language, collected body))` while inside a fenced block: the body
+    // is rendered as ONE unit when the fence closes (or at end of input for a
+    // still-streaming block) so highlighting can be memoized per block — the
+    // pager re-renders all history every scroll frame.
+    let mut in_code: Option<(String, Vec<String>)> = None;
     let mut last_blank = false;
     let mut prose = Vec::new();
     let mut table = Vec::new();
@@ -1806,12 +1982,16 @@ fn push_formatted_body_marked(
     let normalized = content.trim_matches(|ch: char| ch.is_whitespace() && ch != '\n');
 
     for raw_line in normalized.lines() {
-        let line = if in_code { raw_line } else { raw_line.trim() };
+        let line = if in_code.is_some() {
+            raw_line
+        } else {
+            raw_line.trim()
+        };
         if let Some(rest) = line.trim_start().strip_prefix("```") {
             flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
             flush_markdown_table(lines, palette, &mut table, indent, bg, width);
-            if in_code {
-                in_code = false;
+            if let Some((language, body)) = in_code.take() {
+                push_code_block_lines(lines, palette, indent, bg, &language, &body, true);
                 lines.push(chat_line(
                     vec![
                         Span::styled(indent, style_bg(palette.border(), bg)),
@@ -1820,7 +2000,6 @@ fn push_formatted_body_marked(
                     bg,
                 ));
             } else {
-                in_code = true;
                 let language = rest
                     .split_whitespace()
                     .next()
@@ -1831,28 +2010,18 @@ fn push_formatted_body_marked(
                     vec![
                         Span::styled(indent, style_bg(palette.border(), bg)),
                         Span::styled("┌─ ", style_bg(palette.border(), bg)),
-                        Span::styled(language, style_bg(palette.selected(), bg)),
+                        Span::styled(language.clone(), style_bg(palette.selected(), bg)),
                     ],
                     bg,
                 ));
+                in_code = Some((language, Vec::new()));
             }
             last_blank = false;
             continue;
         }
 
-        if in_code {
-            flush_markdown_table(lines, palette, &mut table, indent, bg, width);
-            lines.push(chat_line(
-                vec![
-                    Span::styled(indent, style_bg(palette.border(), bg)),
-                    Span::styled("│ ", style_bg(palette.border(), bg)),
-                    Span::styled(
-                        truncate_terminal_line(line, CODE_BLOCK_LINE_LIMIT),
-                        style_bg(palette.muted(), bg),
-                    ),
-                ],
-                bg,
-            ));
+        if let Some((_, body)) = in_code.as_mut() {
+            body.push(truncate_terminal_line(line, CODE_BLOCK_LINE_LIMIT));
             last_blank = false;
             continue;
         }
@@ -1982,6 +2151,12 @@ fn push_formatted_body_marked(
         prose.push(line.to_string());
     }
 
+    if let Some((language, body)) = in_code.take() {
+        // Fence still open at end of input (streaming): render it too so the
+        // live tail shows the in-flight code — uncached, the body grows every
+        // frame.
+        push_code_block_lines(lines, palette, indent, bg, &language, &body, false);
+    }
     flush_prose_paragraph(lines, palette, &mut prose, indent, prose_marker, bg);
     flush_markdown_table(lines, palette, &mut table, indent, bg, width);
 }
@@ -2926,6 +3101,7 @@ fn push_activity_section_with_finalization(
                     pending_continuations,
                     is_active_group(app, last_turn),
                     app.expanded_tool_outputs,
+                    true,
                 );
                 group.clear();
             }
@@ -2944,6 +3120,7 @@ fn push_activity_section_with_finalization(
             pending_continuations,
             is_active_group(app, last_turn),
             app.expanded_tool_outputs,
+            true,
         );
     }
     if flow_activity.len() > recent.len() {
@@ -3045,6 +3222,7 @@ fn push_turn_activity_log_section(
     palette: Palette,
     log: &TurnActivityLog,
     app: &AppState,
+    collapse_settled: bool,
 ) {
     if log.items.is_empty() {
         return;
@@ -3073,6 +3251,7 @@ fn push_turn_activity_log_section(
         active_session_pending_continuations(app),
         is_active_group(app, Some(&log.turn_id)),
         app.expanded_tool_outputs,
+        collapse_settled,
     );
     if full.len() > shown.len() {
         let hidden = full.len() - shown.len();
@@ -3140,6 +3319,8 @@ fn push_finalized_activity_items_section(
         0,
         false,
         app.expanded_tool_outputs,
+        // Scrollback flush path: the archive never collapses.
+        false,
     );
 }
 
@@ -3213,6 +3394,7 @@ fn push_agent_task_group(
     pending_continuations: u32,
     is_active_group: bool,
     expanded: bool,
+    collapse_settled: bool,
 ) {
     let active_subagents = subagent_titles.len();
     if items.is_empty() && subagent_titles.is_empty() {
@@ -3254,12 +3436,24 @@ fn push_agent_task_group(
     // a settled chip keeps the static bullet. Both are 1 col wide so the title
     // stays aligned whether running or done.
     let icon = if in_progress { spinner_frame() } else { "•" };
+    // Role-contrast: runtime/tool activity is the LOW tier of the transcript's
+    // visual hierarchy — muted header (bold kept for grouping), status icons
+    // keep their state colors (spinner/✓/✗ carry information).
     let spans = vec![
         Span::styled(format!("{icon} "), palette.selected()),
-        Span::styled(title, palette.title().add_modifier(Modifier::BOLD)),
+        Span::styled(title, palette.muted().add_modifier(Modifier::BOLD)),
         Span::styled(format!(" ({})", metadata.join(" · ")), palette.muted()),
     ];
     lines.push(Line::from(spans));
+
+    // Settled groups collapse to their one-line summary in the repainting
+    // views (Ctrl+O expands); the scrollback flush path never collapses (the
+    // archive stays complete). A group is NOT settled while it is the active
+    // turn OR while it is still in progress on its own — a finished turn with
+    // sub-agents still running keeps its spinner AND its children visible.
+    if collapse_settled && !is_active_group && !in_progress && !expanded {
+        return;
+    }
 
     for (idx, item) in items.iter().enumerate() {
         push_agent_task_child(lines, palette, item, idx == 0, expanded);
@@ -3275,7 +3469,7 @@ fn push_agent_task_group(
         lines.push(Line::from(vec![
             Span::styled(prefix, palette.border()),
             Span::styled("◻ ", palette.selected()),
-            Span::styled(title.clone(), palette.text()),
+            Span::styled(title.clone(), palette.muted()),
             Span::styled(format!("  {}", t!("app.activity.running")), palette.muted()),
         ]));
     }
@@ -3305,13 +3499,15 @@ fn push_agent_task_child(
 
 fn compact_activity_spans(item: &ActivityItem, palette: Palette) -> Vec<Span<'static>> {
     if let Some(mutation) = FileMutationActivity::from_item(item) {
+        // Activity rows render uniformly muted, no bold: the runtime log must
+        // never outweigh the reply prose or the user's own words.
         let mut spans = vec![
             Span::styled(
                 file_mutation_action_label(&mutation.operation),
-                palette.text().add_modifier(Modifier::BOLD),
+                palette.muted(),
             ),
             Span::styled(" ", palette.muted()),
-            Span::styled(compact_file_path(&mutation.path), palette.text()),
+            Span::styled(compact_file_path(&mutation.path), palette.muted()),
             Span::styled(format!("  {}", mutation.operation), palette.muted()),
         ];
         if mutation.preview_ready {
@@ -3326,19 +3522,16 @@ fn compact_activity_spans(item: &ActivityItem, palette: Palette) -> Vec<Span<'st
     if item.kind == ActivityKind::Tool {
         let running = is_running_activity(item);
         let mut spans = vec![
-            Span::styled(
-                tool_action_label(item, running),
-                palette.text().add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(tool_action_label(item, running), palette.muted()),
             Span::styled(" ", palette.muted()),
-            Span::styled(item.title.clone(), palette.text()),
+            Span::styled(item.title.clone(), palette.muted()),
         ];
         if let Some(invocation) = tool_invocation_text(item) {
             let prompt = if item.title == "shell" { "$ " } else { "" };
             spans.push(Span::styled(": ", palette.muted()));
             spans.push(Span::styled(
                 format!("{prompt}{}", truncate_terminal_line(&invocation, 96)),
-                palette.text(),
+                palette.muted(),
             ));
         }
         push_compact_metadata_spans(&mut spans, palette, item);
@@ -3346,10 +3539,7 @@ fn compact_activity_spans(item: &ActivityItem, palette: Palette) -> Vec<Span<'st
     }
 
     let mut spans = vec![
-        Span::styled(
-            item.title.clone(),
-            palette.text().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(item.title.clone(), palette.muted()),
         Span::styled(format!("  {}", item.status), palette.muted()),
     ];
     if let Some(detail) = item.detail.as_deref().filter(|detail| !detail.is_empty()) {
@@ -4875,6 +5065,16 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
         })
         .unwrap_or_else(|| t!("app.status.no_session").to_string());
     let work = status_bar_work_text(app);
+    // The pager has no native scrollbar (alt-screen has no terminal
+    // scrollback), so the hint doubles as the position indicator: scrolled up
+    // → "reviewing" with the way back; at the bottom → the plain key hints.
+    let key_hint = if app.transcript_pager_active && app.transcript_scroll > 0 {
+        t!("app.hint.pager_reviewing").into_owned()
+    } else if app.transcript_pager_active {
+        t!("app.hint.pager_keys").into_owned()
+    } else {
+        t!("app.hint.statusbar_keys").into_owned()
+    };
 
     Paragraph::new(Line::from(vec![
         Span::styled(
@@ -4907,10 +5107,7 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
         Span::styled(short_path(cwd), palette.muted().bg(palette.surface_alt)),
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
-        Span::styled(
-            t!("app.hint.statusbar_keys").into_owned(),
-            palette.selected().bg(palette.surface_alt),
-        ),
+        Span::styled(key_hint, palette.selected().bg(palette.surface_alt)),
     ]))
     .style(Style::default().fg(palette.text).bg(palette.surface_alt))
 }
@@ -5871,7 +6068,7 @@ mod tests {
     }
 
     #[test]
-    fn render_chat_bubbles_hide_role_titles_and_use_distinct_backgrounds() {
+    fn render_chat_roles_use_gutter_anchor_and_distinct_styles() {
         let app = AppState::new(
             vec![SessionView {
                 id: SessionKey("local:test".into()),
@@ -5909,9 +6106,15 @@ mod tests {
         let assistant_style =
             style_for_text(&buffer, "done with bubble colors").expect("assistant style");
 
-        assert_eq!(user_style.bg, Some(palette.diff_context_bg));
+        // Role-contrast contract: the user's words are the transcript's anchor
+        // — accent gutter + bold body, NO bubble background (backgrounds are
+        // unreliable in the pager / terminal theme / native scrollback).
+        assert!(text.contains("▌ please fix bubble colors"));
+        assert!(user_style.add_modifier.contains(Modifier::BOLD));
+        assert_ne!(user_style.bg, Some(palette.diff_context_bg));
+        // Assistant prose keeps its existing baseline rendering.
         assert_eq!(assistant_style.bg, Some(palette.surface));
-        assert_ne!(user_style.bg, assistant_style.bg);
+        assert!(!text.contains("▌ done with bubble colors"));
     }
 
     #[test]
@@ -6168,6 +6371,7 @@ mod tests {
                 .with_success(true),
         );
 
+        app.expanded_tool_outputs = true;
         let buffer = rendered_buffer(&app, Palette::for_theme(ThemeName::Codex));
         let rows = rendered_rows(&buffer);
         let activity = row_index_containing(&rows, "Read");
@@ -6255,7 +6459,7 @@ mod tests {
         let buffer = rendered_buffer(&app, Palette::for_theme(ThemeName::Codex));
         let rows = rendered_rows(&buffer);
         let diff = row_index_containing(&rows, "Diff Preview");
-        let latest_prompt = row_index_containing(&rows, "› done?");
+        let latest_prompt = row_index_containing(&rows, "▌ done?");
         let composer = row_index_containing(&rows, "Composer");
 
         assert!(
@@ -7809,6 +8013,7 @@ mod tests {
                 .with_success(true),
         );
 
+        app.expanded_tool_outputs = true;
         let text = rendered_text(&app);
         let first_prompt = text.find("what is the status").expect("first prompt");
         let latest_prompt = text.find("are you working").expect("latest prompt");
@@ -7854,6 +8059,7 @@ mod tests {
             ],
         });
 
+        app.expanded_tool_outputs = true;
         let text = rendered_text(&app);
         let prompt = text.find("build the site").expect("user prompt");
         let work_log = text.find("Agent task completed").expect("agent task");
@@ -8871,6 +9077,7 @@ mod tests {
                 .with_duration_ms(18),
         );
 
+        app.expanded_tool_outputs = true;
         let text = rendered_text(&app);
 
         assert!(text.contains("Waited"));
@@ -8906,6 +9113,7 @@ mod tests {
             .with_detail("modify /tmp/work/blue-origin/src/pages/index.astro | diff preview ready"),
         );
 
+        app.expanded_tool_outputs = true;
         let text = rendered_text(&app);
 
         assert!(text.contains("Changed"));
@@ -9185,6 +9393,7 @@ mod tests {
                 .with_success(true),
         );
 
+        app.expanded_tool_outputs = true;
         let text = rendered_text(&app);
 
         assert!(text.contains("failed"));
@@ -9223,8 +9432,11 @@ mod tests {
         );
 
         let collapsed = rendered_text(&app);
-        assert!(collapsed.contains("9 more line(s) hidden (Ctrl+O expand)"));
+        // New contract: a settled group collapses to its one-line header — no
+        // child rows, no per-tool preview hint, until Ctrl+O expands.
         assert!(!collapsed.contains("line10"));
+        assert!(!collapsed.contains("cargo test"));
+        assert!(collapsed.contains("(1"));
 
         app.expanded_tool_outputs = true;
         let expanded = rendered_text(&app);
@@ -10229,7 +10441,7 @@ mod tests {
                 tasks: vec![],
                 live_reply: Some(crate::model::LiveReply {
                     turn_id,
-                    text: "finalized assistant line\nstreaming suffix still live".into(),
+                    text: "finalized assistant line\n\nstreaming suffix still live".into(),
                 }),
             }],
             0,
@@ -10288,7 +10500,7 @@ mod tests {
                 tasks: vec![],
                 live_reply: Some(crate::model::LiveReply {
                     turn_id: turn_id.clone(),
-                    text: "already flushed line\nfinal answer tail".into(),
+                    text: "already flushed line\n\nfinal answer tail".into(),
                 }),
             }],
             0,
@@ -10308,7 +10520,7 @@ mod tests {
 
         app.sessions[0].live_reply = None;
         app.sessions[0].messages.push(Message::assistant(
-            "already flushed line\nfinal answer tail",
+            "already flushed line\n\nfinal answer tail",
         ));
         app.turn_activity_logs.push(TurnActivityLog {
             session_id,

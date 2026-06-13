@@ -130,6 +130,8 @@ app:
     list_nav: "j/k or Up/Down"
     composer_send: "Enter send | Tab inspector"
     statusbar_keys: "Tab inspector | Ctrl+O expand"
+    pager_keys: "Transcript | PgUp/PgDn scroll | Esc or Ctrl+T close"
+    pager_reviewing: "Reviewing history ↑ | End latest | Esc close"
     ctrl_o_collapse: "Ctrl+O collapse"
     ctrl_o_expand: "Ctrl+O expand"
     task_output_modal: "o read more | PgUp/PgDn | Esc close"
@@ -221,12 +223,15 @@ app:
 
 onboarding:
   welcome_title: "Welcome to Octos"
+  value_saved: "%{value} (saved)"
+  api_key_saved: "saved in profile"
   value_not_set: "not set"
   action_edit: "Enter edit"
   field:
     full_name: "Full name"
     username: "Username"
     email: "Email"
+    existing_profile: "Use existing profile (ID)"
   local:
     title: "Create your local Octos profile"
     description: "This stays on this machine; no email OTP is sent."
@@ -381,6 +386,11 @@ lang:
   switched: "Language switched to English."
   usage: "Current language: %{current}. Usage: /lang <en|zh>."
   unknown: "Unknown language '%{value}'. Available: en, zh."
+scrollmode:
+  current: "(current: %{mode})"
+  set_pinned: "Scroll mode: pinned — the wheel scrolls the transcript, composer stays at the bottom (Shift+drag to select)."
+  set_native: "Scroll mode: native — the wheel belongs to the terminal again (Ctrl+T opens the pager)."
+  unknown: "Unknown scroll mode '%{value}'. Available: native, pinned."
 thinking:
   usage: "Reasoning effort: %{current}. Usage: /thinking <low|medium|high|max|default>."
   set: "Reasoning effort set to %{level}."
@@ -781,6 +791,8 @@ command:
     desc: Read backend task artifacts.
   theme:
     desc: Choose the local TUI theme.
+  scrollmode:
+    desc: 'Switch wheel-scroll behavior: /scrollmode [native|pinned] (bare toggles).'
   thinking:
     desc: 'Set reasoning effort for thinking models: /thinking low|medium|high|max|default.'
   threads:
@@ -972,6 +984,9 @@ menu:
       local_create:
         desc: Uses profile/local/create; no OTP is sent.
         label: Create local profile
+      exit:
+        desc: "Quit without creating a profile. Tip: launch with --profile-id <id> to skip this screen."
+        label: Exit octos-tui
       local_email:
         desc: Use /onboard email <address>. Email is local metadata only.
       local_name:
