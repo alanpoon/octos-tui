@@ -183,3 +183,144 @@ fn rows_show_not_set_without_saved_provider() {
     let model = menu_label(&store, "onboard.provider.model");
     assert!(model.contains("not set"));
 }
+
+// --- Guidance agreement (#203) -------------------------------------------
+//
+// The footer hint and step progress must agree with what the rows display:
+// a hydrated saved primary (with a key) and an untouched draft satisfy the
+// provider/connect/save steps via server truth, so guidance moves to the
+// first post-provider step instead of demanding "choose a model family"
+// under rows that already show "(saved)" values.
+
+fn menu_footer(store: &Store) -> String {
+    let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+        panic!("expected an open, ready menu");
+    };
+    spec.footer_hint
+        .clone()
+        .expect("the onboarding wizard always renders a footer hint")
+}
+
+fn menu_subtitle(store: &Store) -> String {
+    let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+        panic!("expected an open, ready menu");
+    };
+    spec.subtitle
+        .clone()
+        .expect("the onboarding wizard always renders a progress subtitle")
+}
+
+fn saved_moonshot_state_without_key(profile_id: &str) -> ProfileLlmListResult {
+    serde_json::from_value(json!({
+        "profile_id": profile_id,
+        "primary": {
+            "provider": "moonshot",
+            "model": "kimi-k2.6",
+            "family_id": "moonshot",
+            "model_id": "kimi-k2.6",
+            "route_id": "moonshot",
+            "has_api_key": false
+        }
+    }))
+    .expect("llm state fixture parses")
+}
+
+#[test]
+fn saved_provider_with_untouched_draft_skips_provider_guidance() {
+    let mut store = first_launch_store();
+    run_command(&mut store, "/onboard profile alex");
+    apply_llm_state(&mut store, saved_moonshot_state("alex"));
+
+    let footer = menu_footer(&store);
+    assert!(
+        !footer.contains("choose a model family"),
+        "rows show the saved provider, so guidance must not demand a family; footer: {footer:?}"
+    );
+    assert!(
+        footer.contains("validate the workspace"),
+        "guidance must move to the first post-provider step; footer: {footer:?}"
+    );
+    let subtitle = menu_subtitle(&store);
+    assert!(
+        subtitle.contains("Workspace"),
+        "progress must mark provider/connect/save complete and land on Workspace; subtitle: {subtitle:?}"
+    );
+}
+
+#[test]
+fn draft_input_overrides_saved_guidance() {
+    let mut store = first_launch_store();
+    run_command(&mut store, "/onboard profile alex");
+    apply_llm_state(&mut store, saved_moonshot_state("alex"));
+
+    // The user starts re-configuring: guidance follows the draft path again
+    // (whose first unmet prerequisite in this fixture is the catalog load).
+    run_command(&mut store, "/onboard family deepseek");
+
+    let footer = menu_footer(&store);
+    assert!(
+        !footer.contains("validate the workspace"),
+        "a touched draft must restore draft-first guidance; footer: {footer:?}"
+    );
+    assert!(
+        footer.contains("load the provider catalog"),
+        "draft-path guidance resumes at its first unmet prerequisite; footer: {footer:?}"
+    );
+}
+
+/// The draft is "touched" by ANY staged provider edit, not just family/model.
+/// Route metadata (`/onboard label`, `/onboard env`, `/onboard api-type`)
+/// flows through the same `mark_onboarding_provider_dirty` path, so it must
+/// also restore draft-first guidance — otherwise the saved short-circuit
+/// silently swallows the user's edit (codex P2 on #204).
+#[test]
+fn route_metadata_edit_overrides_saved_guidance() {
+    // `api-type` is seeded to "openai" in an untouched draft, so the divergent
+    // value here is "anthropic" — setting it back to "openai" is a genuine
+    // no-op and correctly does NOT count as a touch.
+    for edit in [
+        "/onboard label my-route",
+        "/onboard env MOONSHOT_API_KEY",
+        "/onboard api-type anthropic",
+    ] {
+        let mut store = first_launch_store();
+        run_command(&mut store, "/onboard profile alex");
+        apply_llm_state(&mut store, saved_moonshot_state("alex"));
+        run_command(&mut store, edit);
+
+        let footer = menu_footer(&store);
+        assert!(
+            !footer.contains("validate the workspace"),
+            "staging `{edit}` must restore draft-first guidance; footer: {footer:?}"
+        );
+    }
+}
+
+#[test]
+fn saved_provider_without_key_keeps_draft_guidance() {
+    let mut store = first_launch_store();
+    run_command(&mut store, "/onboard profile alex");
+    apply_llm_state(&mut store, saved_moonshot_state_without_key("alex"));
+
+    let footer = menu_footer(&store);
+    assert!(
+        !footer.contains("validate the workspace"),
+        "a saved provider without a key cannot satisfy the connect step; footer: {footer:?}"
+    );
+}
+
+#[test]
+fn no_saved_provider_keeps_draft_guidance() {
+    let mut store = first_launch_store();
+    run_command(&mut store, "/onboard profile alex");
+    apply_llm_state(
+        &mut store,
+        serde_json::from_value(json!({ "profile_id": "alex" })).expect("empty state parses"),
+    );
+
+    let footer = menu_footer(&store);
+    assert!(
+        !footer.contains("validate the workspace"),
+        "without saved state the provider section still gates guidance; footer: {footer:?}"
+    );
+}
