@@ -276,6 +276,7 @@ where
                 &store.state,
                 palette,
                 height,
+                size.height,
                 update.lines_to_insert,
                 live_tail_finalization,
             )
@@ -286,6 +287,7 @@ where
             &store.state,
             palette,
             height,
+            size.height,
             update.lines_to_insert,
             live_tail_finalization,
         )
@@ -297,6 +299,7 @@ fn draw_inline_frame<B>(
     state: &crate::model::AppState,
     palette: Palette,
     height: u16,
+    terminal_height: u16,
     lines_to_insert: Vec<ratatui::text::Line<'static>>,
     live_tail_finalization: Option<app::LiveTurnFinalization>,
 ) -> Result<()>
@@ -313,6 +316,7 @@ where
             frame,
             state,
             palette,
+            terminal_height,
             live_tail_finalization.as_ref(),
         );
     })?;
@@ -720,6 +724,19 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         KeyCode::Up if store.state.transcript_pager_active => {
             store.state.scroll_transcript_up(1);
         }
+        // In the composer, Up/Down move the cursor between logical lines; at the
+        // first/last line they fall back to the existing transcript scroll so
+        // that affordance isn't lost.
+        KeyCode::Down if store.state.focus == FocusPane::Composer => {
+            if !store.state.move_composer_cursor_down() {
+                store.state.scroll_transcript_down(1);
+            }
+        }
+        KeyCode::Up if store.state.focus == FocusPane::Composer => {
+            if !store.state.move_composer_cursor_up() {
+                store.state.scroll_transcript_up(1);
+            }
+        }
         KeyCode::Down => {
             move_down(&mut store.state);
         }
@@ -866,8 +883,26 @@ fn handle_activity_navigator_key(store: &mut Store, key: KeyEvent) -> KeyAction 
 }
 
 fn handle_composer_modified_key(store: &mut Store, key: KeyEvent) -> bool {
+    // Shift+Enter is the primary, most intuitive newline key. It only reaches
+    // the app when the terminal reports the modifier (the Kitty keyboard
+    // protocol, or terminals like Warp that map it directly); otherwise plain
+    // Enter is indistinguishable and submits, which is why Ctrl+J is the
+    // portable fallback. Handled here, before the Enter→submit arm.
+    if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
+        store.state.insert_composer_text("\n");
+        return true;
+    }
+
     if key.modifiers.contains(KeyModifiers::ALT) {
         match key.code {
+            // Alt+Enter also inserts a newline where the terminal reports it as
+            // Enter+ALT (e.g. iTerm2). Some terminals (Warp) send Option+Enter
+            // as ESC+CR instead, where it can't be caught — use Shift+Enter or
+            // Ctrl+J there.
+            KeyCode::Enter => {
+                store.state.insert_composer_text("\n");
+                return true;
+            }
             KeyCode::Char('b') | KeyCode::Left => {
                 store.state.move_composer_cursor_prev_word();
                 return true;
@@ -890,6 +925,14 @@ fn handle_composer_modified_key(store: &mut Store, key: KeyEvent) -> bool {
 
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
+            // Ctrl+J is a literal line feed and works in every terminal (no
+            // Kitty/modifyOtherKeys needed), so it is the portable newline key
+            // alongside Alt+Enter. (Terminals that fold Ctrl+J into Enter will
+            // submit instead — Alt+Enter is the fallback there.)
+            KeyCode::Char('j') => {
+                store.state.insert_composer_text("\n");
+                return true;
+            }
             KeyCode::Char('a') | KeyCode::Home => {
                 store.state.move_composer_cursor_line_start();
                 return true;
