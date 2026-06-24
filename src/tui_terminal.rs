@@ -140,6 +140,14 @@ where
     pub last_known_screen_size: Size,
     /// Last cursor position we placed, so history insertion can restore it.
     pub last_known_cursor_pos: Position,
+    /// Count of visible history rows currently occupying the area above the
+    /// inline viewport. Rows above the viewport that have never held inserted
+    /// history are spare capacity, not blank transcript separators.
+    visible_history_rows: u16,
+    /// One-past-the-last row occupied by visible history above the viewport.
+    /// This lets history remain bottom-adjacent normally while still tracking
+    /// a blank gap if the live viewport later moves down.
+    visible_history_bottom: u16,
 }
 
 impl<B> Drop for Terminal<B>
@@ -172,6 +180,8 @@ where
             viewport_area: Rect::new(0, cursor_pos.y, 0, 0),
             last_known_screen_size: screen_size,
             last_known_cursor_pos: cursor_pos,
+            visible_history_rows: 0,
+            visible_history_bottom: 0,
         })
     }
 
@@ -201,6 +211,23 @@ where
         self.current_buffer_mut().resize(area);
         self.previous_buffer_mut().resize(area);
         self.viewport_area = area;
+        self.visible_history_rows = self.visible_history_rows.min(area.top());
+        self.visible_history_bottom = self.visible_history_bottom.min(area.top());
+        self.visible_history_rows = self.visible_history_rows.min(self.visible_history_bottom);
+    }
+
+    pub(crate) fn visible_history_rows(&self) -> u16 {
+        self.visible_history_rows
+    }
+
+    pub(crate) fn visible_history_bottom(&self) -> u16 {
+        self.visible_history_bottom
+    }
+
+    pub(crate) fn set_visible_history_extent(&mut self, rows: u16, bottom: u16) {
+        self.visible_history_bottom = bottom.min(self.viewport_area.top());
+        self.visible_history_rows = rows.min(self.viewport_area.top());
+        self.visible_history_rows = self.visible_history_rows.min(self.visible_history_bottom);
     }
 
     pub fn size(&self) -> io::Result<Size> {
@@ -244,6 +271,11 @@ where
                     old_area.top(),
                     old_bottom_with_new_height,
                 )?;
+                self.visible_history_bottom = self
+                    .visible_history_bottom
+                    .saturating_sub(old_bottom_with_new_height);
+                self.visible_history_rows =
+                    self.visible_history_rows.min(self.visible_history_bottom);
             }
 
             // A terminal shrink can leave `old_area.y` outside the new visible
@@ -384,6 +416,11 @@ where
     pub(crate) fn clear_after_position(&mut self, position: Position) -> io::Result<()> {
         self.backend.set_cursor_position(position)?;
         self.backend.clear_region(ClearType::AfterCursor)?;
+        if position.y <= self.viewport_area.top() {
+            self.visible_history_rows = self.visible_history_rows.min(position.y);
+            self.visible_history_bottom = self.visible_history_bottom.min(position.y);
+            self.visible_history_rows = self.visible_history_rows.min(self.visible_history_bottom);
+        }
         self.previous_buffer_mut().reset();
         Ok(())
     }
@@ -394,6 +431,8 @@ where
         self.backend.set_cursor_position(home)?;
         self.backend.clear_region(ClearType::All)?;
         self.backend.set_cursor_position(home)?;
+        self.visible_history_rows = 0;
+        self.visible_history_bottom = 0;
         self.previous_buffer_mut().reset();
         Ok(())
     }
@@ -771,5 +810,19 @@ mod tests {
         assert_eq!(terminal.viewport_area, Rect::new(0, 45, 130, 5));
         assert_eq!(terminal.backend().cursor, Position { x: 0, y: 45 });
         assert_eq!(terminal.backend().clears, vec![ClearType::AfterCursor]);
+    }
+
+    #[test]
+    fn viewport_growth_scrolls_visible_history_extent_up() {
+        let mut terminal = Terminal::new(RecordingBackend::new(10, 10)).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 8, 10, 2));
+        terminal.set_visible_history_extent(5, 6);
+        terminal.last_known_screen_size = Size::new(10, 10);
+
+        terminal.resize_viewport_to(4).expect("resize viewport");
+
+        assert_eq!(terminal.viewport_area, Rect::new(0, 6, 10, 4));
+        assert_eq!(terminal.visible_history_bottom(), 4);
+        assert_eq!(terminal.visible_history_rows(), 4);
     }
 }
