@@ -563,6 +563,8 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return KeyAction::Continue;
     }
 
+    store.state.status_error = None;
+
     if is_control_char(&key, 'q') {
         return KeyAction::Quit;
     }

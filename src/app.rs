@@ -6615,7 +6615,14 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
         Span::styled(context, palette.muted().bg(palette.surface_alt)),
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
-        Span::styled(app.status.clone(), palette.muted().bg(palette.surface_alt)),
+        if let Some(err) = &app.status_error {
+            Span::styled(
+                err.clone(),
+                Style::default().fg(palette.danger).bg(palette.surface_alt),
+            )
+        } else {
+            Span::styled(app.status.clone(), palette.muted().bg(palette.surface_alt))
+        },
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
         Span::styled(
             format!("{mode} {turn}"),

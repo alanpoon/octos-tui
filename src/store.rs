@@ -252,7 +252,7 @@ impl Store {
         }
 
         if self.state.readonly {
-            self.state.status = t!("status.readonly_turn_disabled").into_owned();
+            self.state.status_error = Some(t!("status.readonly_turn_disabled").into_owned());
             self.state.clear_current_composer_draft();
             return None;
         }
@@ -262,7 +262,7 @@ impl Store {
         }
 
         if self.active_session().is_none() {
-            self.state.status = t!("status.no_session_send_prompt").into_owned();
+            self.state.status_error = Some(t!("status.no_session_send_prompt").into_owned());
             self.state.focus = FocusPane::Composer;
             return None;
         }
