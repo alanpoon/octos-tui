@@ -262,7 +262,19 @@ impl Store {
         }
 
         if self.active_session().is_none() {
-            self.state.status_error = Some(t!("status.no_session_send_prompt").into_owned());
+            // Try to auto-open a session so the user doesn't have to type a
+            // separate /onboard command — stage the message first, then return
+            // the OpenSession command; submit_next_pending_if_idle drains it
+            // once SessionOpened arrives.
+            let command = self.onboarding_finish_command();
+            if command.is_some() {
+                self.state.clear_current_composer_draft();
+                self.state.pending_messages.push(prompt);
+                return command;
+            }
+            // onboarding_finish_command already set self.state.status with the
+            // reason it failed — promote it to danger styling so it's visible.
+            self.state.status_error = Some(self.state.status.clone());
             self.state.focus = FocusPane::Composer;
             return None;
         }
@@ -5705,7 +5717,9 @@ impl Store {
                         ));
                     }
                 }
-                None
+                // Drain any message the user staged before the session was
+                // open (typed and pressed Enter before onboarding finished).
+                self.submit_next_pending_if_idle()
             }
             UiNotification::TurnStarted(event) => {
                 // A new turn for the active session starts a fresh live_reply
@@ -8870,6 +8884,9 @@ mod tests {
 
     #[test]
     fn normal_prompt_without_open_session_is_preserved() {
+        // When there is no session and onboarding cannot open one (no profile
+        // resolved), the composer text is preserved and the reason is surfaced
+        // as status_error (danger-styled) so it's immediately visible.
         let mut store = protocol_store_without_sessions();
         store.state.composer = "please edit src/main.rs".into();
 
@@ -8878,8 +8895,8 @@ mod tests {
         assert!(command.is_none());
         assert_eq!(store.state.composer, "please edit src/main.rs");
         assert_eq!(
-            store.state.status,
-            "No coding session open. Run /onboard open-session before sending a prompt."
+            store.state.status_error.as_deref(),
+            Some("Cannot open session: profile unresolved. Use /onboard profile <profile_id>.")
         );
     }
 
