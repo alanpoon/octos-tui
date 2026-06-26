@@ -99,11 +99,13 @@ Add helper alongside `spinner_frame`:
 /// completes, and 0 before the first timestamp is recorded.
 fn banner_visible_rows(start: Option<std::time::Instant>) -> usize {
     const ROW_INTERVAL_MS: u128 = 120;
-    const TOTAL_ROWS: usize = 6;
+    // Derived from ONBOARDING_LOGO_ART at call time to stay in sync if the
+    // art is ever updated. Not const because str::lines() is not const-stable.
+    let total_rows = ONBOARDING_LOGO_ART.lines().count();
     match start {
         None => 0,
         Some(t) => ((t.elapsed().as_millis() / ROW_INTERVAL_MS) as usize + 1)
-            .min(TOTAL_ROWS),
+            .min(total_rows),
     }
 }
 ```
@@ -138,7 +140,8 @@ render_launch_banner
 ## Testing
 
 - Existing tests that assert the full wordmark renders should set `banner_reveal_start: Some(Instant::now() - Duration::from_secs(10))` to pre-complete the animation.
-- New unit test: `render_launch_banner_reveals_rows_progressively` — exercises `banner_visible_rows` at t=0, t=60ms, t=120ms, t=480ms, t=720ms and asserts correct row counts (0 or 1, 1, 2, 4, 6).
+- New unit test: `render_launch_banner_reveals_rows_progressively` — exercises `banner_visible_rows` at t=0, t=60ms, t=120ms, t=480ms, t=720ms and asserts correct row counts (1, 1, 2, 5, 6). Note: the formula `(elapsed_ms / 120) + 1` means t=0 already shows row 1 and t=480ms shows 5 rows.
+- Existing test `render_launch_banner_shows_box_logo_and_greeting_on_empty_session` (app.rs) must be updated: set `banner_reveal_start: Some(Instant::now() - Duration::from_secs(10))` so the animation is pre-completed and all 6 figlet rows render.
 - New unit test: `banner_reveal_start_cleared_when_banner_inactive` — verifies the timestamp is reset when a session gains a message.
 
 ---
@@ -148,3 +151,7 @@ render_launch_banner
 - Animating the onboarding header (`render_onboarding_header`) — separate decision.
 - Color-cycle or shimmer effects.
 - Character-by-character reveal within a row.
+
+## Known Limitations
+
+**Session-switch between two empty sessions:** `banner_reveal_start` is a single scalar on `AppState`, not keyed per session. Switching from one empty session to another does not reset it — the second session resumes the animation from wherever the first left off. Fixing this would require clearing `banner_reveal_start` in the session-selection handlers (`select_next_session` / `select_prev_session` in `src/model.rs`). This is out of scope for the initial implementation; the effect is minor (animation may be partially or fully skipped on the second session).
