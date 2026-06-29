@@ -4928,7 +4928,10 @@ impl Store {
     }
 
     fn maybe_open_onboarding_on_first_launch(&mut self) {
-        if !self.state.sessions.is_empty() || self.state.menu_stack.is_active() {
+        if !self.state.sessions.is_empty()
+            || self.state.menu_stack.is_active()
+            || self.state.onboarding_done
+        {
             return;
         }
 
@@ -9344,6 +9347,27 @@ mod tests {
             spec.items
                 .iter()
                 .any(|item| item.id == "onboard.local.create")
+        );
+    }
+
+    #[test]
+    fn second_launch_does_not_auto_open_onboarding_when_done_flag_set() {
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding_done = true;
+
+        store.apply_client_event(ClientEvent::Capabilities(CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+                    &[],
+                ),
+            },
+            message: "capabilities".into(),
+        }));
+
+        assert!(
+            store.state.active_menu.is_none(),
+            "onboarding must not auto-open when onboarding_done is true"
         );
     }
 
