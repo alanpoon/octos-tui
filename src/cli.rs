@@ -487,6 +487,41 @@ pub fn save_ui_settings(
         .wrap_err_with(|| format!("failed to write TUI config {}", path.display()))
 }
 
+/// Persist the `onboarding-done` flag into the config file, merging
+/// with any existing content exactly as `save_ui_settings` does.
+/// A missing file is created; all other existing keys are preserved.
+pub fn save_onboarding_done(path: &Path) -> Result<()> {
+    let mut root = match fs::read_to_string(path) {
+        Ok(contents) if contents.trim().is_empty() => {
+            serde_json::Value::Object(serde_json::Map::new())
+        }
+        Ok(contents) => serde_json::from_str::<serde_json::Value>(&contents)
+            .wrap_err_with(|| format!("failed to parse TUI config {}", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::Value::Object(serde_json::Map::new())
+        }
+        Err(error) => {
+            return Err(error)
+                .wrap_err_with(|| format!("failed to read TUI config {}", path.display()));
+        }
+    };
+    root.as_object_mut()
+        .ok_or_else(|| eyre!("TUI config {} is not a JSON object", path.display()))?
+        .insert("onboarding-done".into(), true.into());
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .wrap_err_with(|| format!("failed to create config dir {}", parent.display()))?;
+    }
+    let mut serialized =
+        serde_json::to_string_pretty(&root).wrap_err("failed to serialize TUI config")?;
+    serialized.push('\n');
+    fs::write(path, serialized)
+        .wrap_err_with(|| format!("failed to write TUI config {}", path.display()))
+}
+
 pub fn parse_websocket_url(value: &str) -> std::result::Result<String, String> {
     if is_websocket_url(value) {
         Ok(value.to_string())
@@ -899,5 +934,31 @@ mod tests {
         assert_eq!(cfg2.onboarding_done, Some(true));
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&path2);
+    }
+
+    #[test]
+    fn save_onboarding_done_writes_flag_and_load_reads_it_back() {
+        use super::{save_onboarding_done, load_config_file};
+        let path = write_config("save-onboarding-done", r#"{ "theme": "claude" }"#);
+        save_onboarding_done(&path).expect("save succeeds");
+        let cfg = load_config_file(&path).expect("reload succeeds");
+        assert_eq!(cfg.onboarding_done, Some(true), "onboarding-done must be persisted");
+        assert_eq!(cfg.theme, Some(ThemeName::Claude), "existing keys must survive");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_onboarding_done_creates_file_when_absent() {
+        use super::{save_onboarding_done, load_config_file};
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("octos-tui-absent-{nonce}.json"));
+        assert!(!path.exists(), "file must not exist yet");
+        save_onboarding_done(&path).expect("creates file on first save");
+        let cfg = load_config_file(&path).expect("reads back");
+        assert_eq!(cfg.onboarding_done, Some(true));
+        let _ = fs::remove_file(&path);
     }
 }
