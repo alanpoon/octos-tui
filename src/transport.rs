@@ -1056,6 +1056,7 @@ impl ProtocolAppUiBackend {
             AppUiCommand::OpenSession(SessionOpenParams {
                 session_id,
                 topic: None,
+                sandbox: None,
                 profile_id: self.launch.profile_id.clone(),
                 cwd: self.launch.cwd.clone(),
                 after: None,
@@ -1356,6 +1357,7 @@ impl AppUiBackend for ProtocolAppUiBackend {
                 octos_core::ui_protocol::SessionOpenParams {
                     session_id,
                     topic: None,
+                    sandbox: None,
                     profile_id: self.launch.profile_id.clone(),
                     cwd: self.launch.cwd.clone(),
                     after: None,

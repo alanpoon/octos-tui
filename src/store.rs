@@ -2451,6 +2451,7 @@ impl Store {
         Some(AppUiCommand::OpenSession(SessionOpenParams {
             session_id,
             topic: None,
+            sandbox: None,
             profile_id: Some(profile_id),
             cwd: onboarding_workspace_cwd(&self.state.workspace.root),
             after: None,
@@ -3478,6 +3479,7 @@ impl Store {
             topic: None,
             rewrite_for: None,
             reasoning_effort,
+            live_video: false,
         }))
     }
 
@@ -15717,7 +15719,10 @@ mod tests {
         assert!(command.is_none());
         assert!(store.state.sessions[0].messages.is_empty());
         assert!(store.state.composer.is_empty());
-        assert_eq!(store.state.status, "Read-only mode: turn/start disabled");
+        assert_eq!(
+            store.state.status_error.as_deref(),
+            Some("Read-only mode: turn/start disabled")
+        );
     }
 
     #[test]
