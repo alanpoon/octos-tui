@@ -2756,9 +2756,11 @@ impl Store {
     /// True while the first-launch onboarding wizard is still in progress: the
     /// wizard auto-opens only when there is no session yet, and finishing it
     /// opens a profile-scoped session. So "no session" == "onboarding not yet
-    /// complete" for the purpose of the Esc trap below.
+    /// complete" for the purpose of the Esc trap below. However, a user who has
+    /// already completed onboarding (onboarding_done=true) can manually re-open
+    /// the wizard, in which case the trap should not engage.
     fn onboarding_in_progress(&self) -> bool {
-        self.state.sessions.is_empty()
+        self.state.sessions.is_empty() && !self.state.onboarding_done
     }
 
     /// Handle Esc on the active menu. Mirrors `close_menu` for every menu EXCEPT
@@ -9405,6 +9407,25 @@ mod tests {
         assert!(
             store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD),
             "Esc on a child onboarding step should return to the root wizard"
+        );
+    }
+
+    #[test]
+    fn esc_on_root_onboarding_menu_allowed_when_onboarding_already_done() {
+        // A user who already completed onboarding can re-open the wizard manually
+        // (e.g. via /onboard). In that case onboarding_done is true, so the Esc
+        // trap must NOT engage — the user can dismiss the wizard normally.
+        let mut store = protocol_store_without_sessions();
+        store.state.onboarding_done = true;
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+
+        let closed = store.handle_menu_escape();
+
+        assert!(closed, "Esc must close the wizard when onboarding_done is true");
+        assert!(
+            !store.state.menu_stack.is_active(),
+            "root wizard must be gone after Esc when onboarding already completed"
         );
     }
 
