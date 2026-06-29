@@ -140,6 +140,8 @@ pub struct Cli {
     pub scroll_mode: ScrollMode,
     /// Vim modal editing for the composer (opt-in; default off).
     pub vim_mode: bool,
+    /// True when onboarding was already completed in a prior launch.
+    pub onboarding_done: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -256,6 +258,9 @@ pub struct CliFileConfig {
 
     #[serde(alias = "vim_mode")]
     pub vim_mode: Option<bool>,
+
+    #[serde(alias = "onboarding_done")]
+    pub onboarding_done: Option<bool>,
 }
 
 impl Cli {
@@ -355,6 +360,7 @@ impl Cli {
             // "false"), so the CLI flag only force-enables; the config provides
             // the default when the flag is absent.
             vim_mode: args.vim_mode || file_config.vim_mode.unwrap_or(false),
+            onboarding_done: file_config.onboarding_done.unwrap_or(false),
         })
     }
 }
@@ -879,5 +885,19 @@ mod tests {
 
         assert!(error.contains("unknown field"));
         assert!(error.contains("provider"));
+    }
+
+    #[test]
+    fn onboarding_done_round_trips_through_config_file() {
+        let path = write_config("onboarding-done", r#"{ "onboarding-done": true, "theme": "claude" }"#);
+        let cfg = super::load_config_file(&path).expect("valid config loads");
+        assert_eq!(cfg.onboarding_done, Some(true), "onboarding-done must be read back");
+        assert_eq!(cfg.theme, Some(ThemeName::Claude), "other keys must survive");
+        // snake_case alias also accepted
+        let path2 = write_config("onboarding-done-snake", r#"{ "onboarding_done": true }"#);
+        let cfg2 = super::load_config_file(&path2).expect("snake alias parses");
+        assert_eq!(cfg2.onboarding_done, Some(true));
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&path2);
     }
 }
