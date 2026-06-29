@@ -1125,6 +1125,18 @@ impl Store {
         }
     }
 
+    fn persist_onboarding_done(&mut self) {
+        self.state.onboarding_done = true;
+        let path = self
+            .state
+            .config_path
+            .clone()
+            .or_else(crate::cli::default_config_path);
+        if let Some(path) = path {
+            let _ = crate::cli::save_onboarding_done(&path);
+        }
+    }
+
     /// `/vimmode` — toggle Vim modal editing at runtime. Resets the composer to
     /// Insert so typing works immediately after enabling; clears any pending
     /// operator. Status-row only (persist with `/saveconfig`).
@@ -5691,6 +5703,7 @@ impl Store {
                 if self.active_menu_is_onboarding() {
                     self.close_all_menus();
                     self.state.focus = FocusPane::Composer;
+                    self.persist_onboarding_done();
                 }
                 self.state.status =
                     format!("Opened {} on {}", session_id.0, self.state.protocol_version);
@@ -10976,6 +10989,53 @@ mod tests {
             store.state.focus,
             FocusPane::Composer,
             "user lands focused on the composer, ready to code"
+        );
+    }
+
+    #[test]
+    fn session_opened_sets_onboarding_done_when_wizard_was_active() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::SessionOpened;
+
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+            crate::model::APPUI_METHOD_AUTH_STATUS,
+        ]);
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        assert!(!store.state.onboarding_done, "not done before session opens");
+
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": SessionKey("alice:local:tui#coding".into()),
+            "active_profile_id": "alice",
+        }))
+        .expect("payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+
+        assert!(
+            store.state.onboarding_done,
+            "onboarding_done must be true after the wizard's session opens"
+        );
+    }
+
+    #[test]
+    fn session_opened_does_not_set_onboarding_done_when_no_wizard_was_active() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::SessionOpened;
+
+        // Non-onboarding session open must not flip the flag.
+        let mut store = store_with_empty_session();
+        assert!(!store.state.onboarding_done);
+
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": SessionKey("alice:local:tui#coding".into()),
+            "active_profile_id": "alice",
+        }))
+        .expect("payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+
+        assert!(
+            !store.state.onboarding_done,
+            "onboarding_done must stay false when no wizard was active"
         );
     }
 
