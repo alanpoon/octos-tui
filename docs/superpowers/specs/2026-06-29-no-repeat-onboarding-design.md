@@ -145,8 +145,15 @@ if self.active_menu_is_onboarding() {
 ## Testing
 
 - **Unit test (store.rs):** `second_launch_does_not_auto_open_onboarding_when_done_flag_set` — build a `protocol_store_without_sessions()`, set `state.onboarding_done = true`, send a capabilities event with solo-profile-create support, assert no menu opens.
+- **Unit test (store.rs):** `esc_on_root_onboarding_menu_allowed_when_onboarding_already_done` — build a `protocol_store_without_sessions()`, set `state.onboarding_done = true`, manually open `MENU_ONBOARD`, call `handle_menu_escape()`, assert the menu closes (Esc trap does not engage).
 - **Unit test (cli.rs):** `save_onboarding_done_writes_flag_and_load_reads_it_back` — write to a temp path, reload, assert `onboarding_done == Some(true)` and other existing keys are preserved.
 - **Existing tests** must continue to pass (the guard is additive; `onboarding_done` defaults to `false`).
+
+---
+
+## Constraints
+
+- **`deny_unknown_fields` on `CliFileConfig`**: Once `"onboarding-done"` is written to a config file, an older app version that doesn't know this field will fail to parse it. For the **default config path** (`~/.config/octos-tui/config.json`), `load_config_file_if_present` is lenient — it warns and falls back to defaults, so startup is not blocked. For an explicit **`--config` path**, parsing is strict and the old app would error. This is an accepted downgrade limitation: users who downgrade while using an explicit `--config` may need to remove `"onboarding-done"` from that file manually.
 
 ---
 
@@ -155,3 +162,4 @@ if self.active_menu_is_onboarding() {
 - No CLI flag for `--onboarding-done` (no reason to expose this).
 - No status-bar notification when the flag is written (it is a silent background write, same as the flag-write behaviour used elsewhere).
 - If the config file is absent and `HOME` is unset, the flag cannot persist. This is the same known limitation as `/saveconfig` and is acceptable.
+- `persist_onboarding_done` is only called inside the `active_menu_is_onboarding()` branch of `SessionOpened`. This is intentional: the Esc trap keeps the root wizard open for first-launch onboarding (it is not closeable without completing it), so the only path that closes the wizard while it was auto-opened is a successful `SessionOpened`. There is no reachable code path where the auto-opened wizard closes before `SessionOpened` fires.
