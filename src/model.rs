@@ -3271,6 +3271,10 @@ pub struct AppState {
     pub active_menu: Option<MenuBuildResult>,
     pub capabilities: Option<CapabilitySet>,
     pub onboarding: OnboardingWizardState,
+    /// Set when the first-launch onboarding wizard completes successfully.
+    /// Persisted to the config file; read back at next launch so the wizard
+    /// does not auto-open again.
+    pub onboarding_done: bool,
     pub permission_profiles: Vec<SessionPermissionProfile>,
     pub session_runtime_statuses: Vec<SessionRuntimeStatus>,
     pub profile_llm_catalog: Option<ProfileLlmCatalogResult>,
@@ -4880,6 +4884,7 @@ impl AppState {
             active_menu: None,
             capabilities: None,
             onboarding: OnboardingWizardState::default(),
+            onboarding_done: false,
             permission_profiles: Vec::new(),
             session_runtime_statuses: Vec::new(),
             profile_llm_catalog: None,
