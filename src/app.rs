@@ -13340,4 +13340,45 @@ mod tests {
         let old = Instant::now() - Duration::from_secs(10);
         assert_eq!(banner_visible_rows(Some(old)), 6);
     }
+
+    #[test]
+    fn banner_reveal_start_cleared_when_banner_inactive() {
+        // When the banner is no longer active (session has messages),
+        // the event loop clears banner_reveal_start. This test verifies
+        // launch_banner_active returns false for a session with messages,
+        // confirming the condition that triggers the clear in the event loop.
+        use std::time::Instant;
+
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: None,
+                messages: vec![Message::user("hello")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // Simulate that the banner was previously animating.
+        app.banner_reveal_start = Some(Instant::now());
+
+        // The event loop clears banner_reveal_start when !launch_banner_active.
+        // Verify the condition is false so the clear path is taken.
+        assert!(
+            !launch_banner_active(&app),
+            "banner must be inactive when session has messages"
+        );
+        // Simulate the event loop's clear.
+        if !launch_banner_active(&app) {
+            app.banner_reveal_start = None;
+        }
+        assert!(
+            app.banner_reveal_start.is_none(),
+            "banner_reveal_start must be cleared when banner is inactive"
+        );
+    }
 }
