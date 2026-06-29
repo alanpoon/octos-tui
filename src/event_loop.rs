@@ -104,6 +104,9 @@ pub fn run(cli: Cli) -> Result<()> {
     // Seed Vim modal editing from the launch flag/config (default off). Runtime
     // `/vimmode` toggles it afterwards; the composer starts in Insert.
     store.state.vim_mode = cli.vim_mode;
+    // Seed the onboarding-done flag from the config file so the wizard does
+    // not auto-open again after a successful first-launch completion.
+    store.state.onboarding_done = cli.onboarding_done;
     // Seed the onboarding workspace candidate so the first-launch workspace
     // probe validates a real directory. The explicit `--cwd` wins; when it is
     // absent the store falls back to the process working directory (for

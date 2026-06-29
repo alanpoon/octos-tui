@@ -4664,6 +4664,7 @@ impl Store {
                 // (otherwise a reconnect drops you out of Vim mid-edit).
                 let vim_mode = self.state.vim_mode;
                 let composer_mode = self.state.composer_mode;
+                let onboarding_done = self.state.onboarding_done;
 
                 let mut state = AppState::from_snapshot(snapshot);
                 if state.capabilities.is_none() {
@@ -4695,6 +4696,7 @@ impl Store {
                 state.pinned_scroll = pinned_scroll;
                 state.vim_mode = vim_mode;
                 state.composer_mode = composer_mode;
+                state.onboarding_done = onboarding_done;
                 state.restore_optimistic_user_messages();
                 self.state = state;
                 None
