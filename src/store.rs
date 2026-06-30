@@ -240,6 +240,7 @@ impl Store {
 
     pub fn compose_command(&mut self) -> Option<AppUiCommand> {
         let prompt = self.state.composer.trim().to_string();
+        self.state.history_index = None;
         if prompt.starts_with('/') {
             return self.dispatch_slash_command(&prompt);
         }
@@ -268,6 +269,7 @@ impl Store {
             // once SessionOpened arrives.
             let command = self.onboarding_finish_command();
             if command.is_some() {
+                self.state.query_history.push(prompt.clone());
                 self.state.clear_current_composer_draft();
                 self.state.pending_messages.push(prompt);
                 return command;
@@ -281,12 +283,14 @@ impl Store {
 
         self.state.clear_current_composer_draft();
         if self.state.active_turn().is_some() {
+            self.state.query_history.push(prompt.clone());
             self.state.pending_messages.push(prompt);
             self.state.status = t!("status.message_staged").into_owned();
             self.state.scroll_transcript_to_latest();
             return None;
         }
 
+        self.state.query_history.push(prompt.clone());
         self.start_prompt_turn(prompt, t!("status.queued_turn_start").into_owned())
     }
 
@@ -18400,5 +18404,72 @@ mod tests {
             json.get("action").is_none(),
             "action must NOT appear on the wire: {json}"
         );
+    }
+
+    #[test]
+    fn compose_command_records_plain_prompt_in_history() {
+        let mut store = store_with_empty_session();
+        store.state.composer = "tell me a joke".into();
+        let _ = store.compose_command();
+        assert_eq!(store.state.query_history, vec!["tell me a joke"]);
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn compose_command_does_not_record_slash_command() {
+        let mut store = store_with_empty_session();
+        store.state.composer = "/help".into();
+        let _ = store.compose_command();
+        assert!(store.state.query_history.is_empty());
+    }
+
+    #[test]
+    fn compose_command_does_not_record_bang_command() {
+        let mut store = store_with_empty_session();
+        store.state.composer = "!ls".into();
+        let _ = store.compose_command();
+        assert!(store.state.query_history.is_empty());
+    }
+
+    #[test]
+    fn compose_command_resets_history_index_after_slash_when_index_was_some() {
+        let mut store = store_with_empty_session();
+        store.state.query_history.push("prior".into());
+        store.state.history_index = Some(0);
+        store.state.composer = "/help".into();
+        let _ = store.compose_command();
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn compose_command_resets_history_index_after_bang_when_index_was_some() {
+        let mut store = store_with_empty_session();
+        store.state.query_history.push("prior".into());
+        store.state.history_index = Some(0);
+        store.state.composer = "!ls".into();
+        let _ = store.compose_command();
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn compose_command_records_staged_prompt_when_turn_active() {
+        // Exercises the staged-message path (active turn → pending_messages).
+        let session = SessionView {
+            id: SessionKey("local:test".into()),
+            title: "test".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: Some(LiveReply {
+                turn_id: TurnId::new(),
+                text: "streaming…".into(),
+            }),
+        };
+        let mut store = Store {
+            state: AppState::new(vec![session], 0, "ready".into(), None, false),
+        };
+        store.state.composer = "follow up question".into();
+        let _ = store.compose_command();
+        assert_eq!(store.state.query_history, vec!["follow up question"]);
     }
 }

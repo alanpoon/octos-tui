@@ -3241,6 +3241,8 @@ pub struct AppState {
     pub composer: String,
     pub composer_cursor: Option<usize>,
     pub composer_drafts: Vec<ComposerDraft>,
+    pub query_history: Vec<String>,
+    pub history_index: Option<usize>,
     pub pending_messages: Vec<String>,
     pub optimistic_user_messages: Vec<OptimisticUserMessage>,
     pub status: String,
@@ -4854,6 +4856,8 @@ impl AppState {
             composer: String::new(),
             composer_cursor: None,
             composer_drafts: Vec::new(),
+            query_history: Vec::new(),
+            history_index: None,
             pending_messages: Vec::new(),
             optimistic_user_messages: Vec::new(),
             status,
@@ -5920,6 +5924,37 @@ impl AppState {
         self.composer_cursor = None;
     }
 
+    pub fn history_navigate_up(&mut self) {
+        if self.query_history.is_empty() {
+            return;
+        }
+        let next = match self.history_index {
+            None => self.query_history.len() - 1,
+            Some(0) => 0, // already at oldest — stay
+            Some(i) => i - 1,
+        };
+        self.history_index = Some(next);
+        let text = self.query_history[next].clone();
+        self.set_composer_text(text);
+    }
+
+    pub fn history_navigate_down(&mut self) {
+        let Some(i) = self.history_index else { return };
+        if i + 1 >= self.query_history.len() {
+            // past newest → back to new-input slot
+            self.history_index = None;
+            self.set_composer_text("");
+        } else {
+            self.history_index = Some(i + 1);
+            let text = self.query_history[i + 1].clone();
+            self.set_composer_text(text);
+        }
+    }
+
+    pub fn clear_history_index(&mut self) {
+        self.history_index = None;
+    }
+
     pub fn composer_cursor_index(&self) -> usize {
         self.clamp_composer_cursor(self.composer_cursor.unwrap_or(self.composer.len()))
     }
@@ -6773,6 +6808,85 @@ mod tests {
             None,
             false,
         )
+    }
+
+    #[test]
+    fn appstate_initial_query_history_is_empty() {
+        let state = AppState::new(vec![], 0, "ready".into(), None, false);
+        assert!(state.query_history.is_empty());
+        assert!(state.history_index.is_none());
+    }
+
+    fn state_with_history(entries: &[&str]) -> AppState {
+        let mut state = AppState::new(vec![], 0, "ready".into(), None, false);
+        for e in entries {
+            state.query_history.push(e.to_string());
+        }
+        state
+    }
+
+    #[test]
+    fn history_navigate_up_enters_most_recent_entry() {
+        let mut state = state_with_history(&["first", "second"]);
+        state.history_navigate_up();
+        assert_eq!(state.history_index, Some(1));
+        assert_eq!(state.composer, "second");
+    }
+
+    #[test]
+    fn history_navigate_up_stops_at_oldest_entry() {
+        let mut state = state_with_history(&["only"]);
+        state.history_navigate_up();
+        state.history_navigate_up(); // second press — should not go below 0
+        assert_eq!(state.history_index, Some(0));
+        assert_eq!(state.composer, "only");
+    }
+
+    #[test]
+    fn history_navigate_up_does_nothing_when_history_empty() {
+        let mut state = AppState::new(vec![], 0, "ready".into(), None, false);
+        state.history_navigate_up();
+        assert!(state.history_index.is_none());
+        assert!(state.composer.is_empty());
+    }
+
+    #[test]
+    fn history_navigate_down_moves_toward_newer_entry() {
+        let mut state = state_with_history(&["first", "second", "third"]);
+        state.history_navigate_up(); // index = Some(2) → "third"
+        state.history_navigate_up(); // index = Some(1) → "second"
+        state.history_navigate_down(); // index = Some(2) → "third"
+        assert_eq!(state.history_index, Some(2));
+        assert_eq!(state.composer, "third");
+    }
+
+    #[test]
+    fn history_navigate_down_from_newest_clears_composer() {
+        let mut state = state_with_history(&["first", "second"]);
+        state.history_navigate_up(); // index = Some(1) → "second"
+        state.history_navigate_down(); // past newest → None
+        assert!(state.history_index.is_none());
+        assert!(state.composer.is_empty());
+    }
+
+    #[test]
+    fn history_navigate_down_does_nothing_when_not_in_history_mode() {
+        let mut state = state_with_history(&["first"]);
+        state.set_composer_text("typing");
+        state.history_navigate_down(); // history_index is None — no-op
+        assert!(state.history_index.is_none());
+        assert_eq!(state.composer, "typing");
+    }
+
+    #[test]
+    fn clear_history_index_resets_to_none() {
+        let mut state = state_with_history(&["entry"]);
+        state.history_navigate_up();
+        assert!(state.history_index.is_some());
+        state.clear_history_index();
+        assert!(state.history_index.is_none());
+        // composer text is preserved — clear_history_index does not clear composer
+        assert_eq!(state.composer, "entry");
     }
 
     #[test]

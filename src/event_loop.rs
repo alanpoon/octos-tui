@@ -64,6 +64,10 @@ enum RenderMode {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return run_headless(cli);
+    }
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     // Inline-viewport model (codex-style): we do NOT enter the alternate screen
@@ -216,6 +220,39 @@ pub fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// Headless relay: when stdin is not a terminal (e.g. launched as an MCP stdio
+/// server by Claude Code or another host), skip the TUI entirely and exec the
+/// stdio-command with inherited stdio so the child process communicates directly
+/// with the host.
+fn run_headless(cli: Cli) -> Result<()> {
+    use eyre::eyre;
+    let command = cli.stdio_command.ok_or_else(|| {
+        eyre!(
+            "no terminal available and no --stdio-command given; \
+             run octos-tui directly in an interactive terminal"
+        )
+    })?;
+
+    #[cfg(windows)]
+    let mut child = std::process::Command::new("cmd")
+        .args(["/C", &command])
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()?;
+
+    #[cfg(not(windows))]
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", &command])
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()?;
+
+    let status = child.wait()?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
 /// Draw one frame. In `Inline` mode this flushes newly-finalized history into
 /// scrollback (so it becomes natively selectable) and renders only the live UI
 /// into the bottom inline viewport. For full-screen overlays it switches to the
@@ -258,6 +295,7 @@ where
     // screen switch so native selection works the instant the user is back on
     // scrollback; pinned scroll-mode keeps capture on so the next wheel-up can
     // re-enter the pager.
+    let leaving_alt_screen = guard.mode == RenderMode::AltScreen;
     guard.sync_mouse_capture(terminal, app::wants_mouse_capture(&store.state))?;
     guard.leave_alt_screen(terminal)?;
 
@@ -283,8 +321,10 @@ where
     // first, insert finalized history using that width/anchor, then draw. If a
     // resize/clear or history insertion is pending, batch those structural
     // writes with the frame inside DEC synchronized update so native selections
-    // are disturbed only when the terminal genuinely changes.
-    if needs_resize || needs_history_insert {
+    // are disturbed only when the terminal genuinely changes. Also batch the
+    // first inline draw after an alt-screen exit so the cleared viewport and
+    // the new frame appear atomically (no second-composer flash).
+    if needs_resize || needs_history_insert || leaving_alt_screen {
         synchronized_terminal_update(terminal, |terminal| {
             draw_inline_frame(
                 terminal,
@@ -511,6 +551,7 @@ fn handle_terminal_event_with_input_state(
         if is_plain_composer_enter(store, &key)
             && input_state.should_insert_unbracketed_paste_newline(now, next_event_waiting)
         {
+            store.state.clear_history_index();
             store.state.insert_composer_text("\n");
             store.state.focus = FocusPane::Composer;
             return KeyAction::Continue;
@@ -587,6 +628,7 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     }
 
     if is_control_char(&key, 'u') {
+        store.state.clear_history_index();
         store.clear_composer_or_staged_messages();
         return KeyAction::Continue;
     }
@@ -650,6 +692,7 @@ fn handle_paste(store: &mut Store, text: &str) -> KeyAction {
     }
 
     let opens_slash_popup = store.state.composer.is_empty() && text.starts_with('/');
+    store.state.clear_history_index();
     store.state.insert_composer_text(text);
     store.state.focus = FocusPane::Composer;
 
@@ -751,13 +794,21 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         // In the composer, Up/Down move the cursor between logical lines; at the
         // first/last line they fall back to the existing transcript scroll so
         // that affordance isn't lost.
+        // Up also enters history navigation when the composer is empty.
+        // Down only navigates history when already in history mode (history_index is Some).
         KeyCode::Down if store.state.focus == FocusPane::Composer => {
-            if !store.state.move_composer_cursor_down() {
+            if store.state.history_index.is_some() {
+                store.state.history_navigate_down();
+            } else if !store.state.move_composer_cursor_down() {
                 store.state.scroll_transcript_down(1);
             }
         }
         KeyCode::Up if store.state.focus == FocusPane::Composer => {
-            if !store.state.move_composer_cursor_up() {
+            if store.state.history_index.is_some()
+                || store.state.composer.trim().is_empty()
+            {
+                store.state.history_navigate_up();
+            } else if !store.state.move_composer_cursor_up() {
                 store.state.scroll_transcript_up(1);
             }
         }
@@ -803,9 +854,11 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             store.state.move_composer_cursor_right();
         }
         KeyCode::Delete if store.state.focus == FocusPane::Composer => {
+            store.state.clear_history_index();
             store.state.delete_composer_next_char();
         }
         KeyCode::Backspace if store.state.focus == FocusPane::Composer => {
+            store.state.clear_history_index();
             store.state.delete_composer_prev_char();
         }
         KeyCode::Enter if store.state.focus == FocusPane::Composer => {
@@ -839,6 +892,7 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         }
         KeyCode::Char(ch) => {
             let opens_slash_popup = ch == '/' && store.state.composer.is_empty();
+            store.state.clear_history_index();
             store.state.insert_composer_char(ch);
             store.state.focus = FocusPane::Composer;
             if opens_slash_popup {
@@ -913,6 +967,7 @@ fn handle_composer_modified_key(store: &mut Store, key: KeyEvent) -> bool {
     // Enter is indistinguishable and submits, which is why Ctrl+J is the
     // portable fallback. Handled here, before the Enter→submit arm.
     if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
+        store.state.clear_history_index();
         store.state.insert_composer_text("\n");
         return true;
     }
@@ -924,6 +979,7 @@ fn handle_composer_modified_key(store: &mut Store, key: KeyEvent) -> bool {
             // as ESC+CR instead, where it can't be caught — use Shift+Enter or
             // Ctrl+J there.
             KeyCode::Enter => {
+                store.state.clear_history_index();
                 store.state.insert_composer_text("\n");
                 return true;
             }
@@ -936,10 +992,12 @@ fn handle_composer_modified_key(store: &mut Store, key: KeyEvent) -> bool {
                 return true;
             }
             KeyCode::Char('d') => {
+                store.state.clear_history_index();
                 store.state.delete_composer_next_word();
                 return true;
             }
             KeyCode::Backspace => {
+                store.state.clear_history_index();
                 store.state.delete_composer_prev_word();
                 return true;
             }
@@ -954,6 +1012,7 @@ fn handle_composer_modified_key(store: &mut Store, key: KeyEvent) -> bool {
             // alongside Alt+Enter. (Terminals that fold Ctrl+J into Enter will
             // submit instead — Alt+Enter is the fallback there.)
             KeyCode::Char('j') => {
+                store.state.clear_history_index();
                 store.state.insert_composer_text("\n");
                 return true;
             }
@@ -974,18 +1033,22 @@ fn handle_composer_modified_key(store: &mut Store, key: KeyEvent) -> bool {
                 return true;
             }
             KeyCode::Char('w') => {
+                store.state.clear_history_index();
                 store.state.delete_composer_prev_word();
                 return true;
             }
             KeyCode::Char('d') | KeyCode::Delete => {
+                store.state.clear_history_index();
                 store.state.delete_composer_next_char();
                 return true;
             }
             KeyCode::Char('h') | KeyCode::Backspace => {
+                store.state.clear_history_index();
                 store.state.delete_composer_prev_char();
                 return true;
             }
             KeyCode::Char('k') => {
+                store.state.clear_history_index();
                 store.state.kill_composer_to_line_end();
                 return true;
             }
@@ -1038,9 +1101,16 @@ fn handle_composer_vim_key(store: &mut Store, key: &KeyEvent) -> Option<KeyActio
     if let Some(pending) = store.state.composer_vim_pending.take() {
         match (pending, c) {
             ('g', 'g') => store.state.move_composer_cursor_buffer_start(),
-            ('d', 'd') => store.state.delete_composer_line(),
-            ('d', 'w') => store.state.delete_composer_word_forward(),
+            ('d', 'd') => {
+                store.state.clear_history_index();
+                store.state.delete_composer_line();
+            }
+            ('d', 'w') => {
+                store.state.clear_history_index();
+                store.state.delete_composer_word_forward();
+            }
             ('c', 'c') => {
+                store.state.clear_history_index();
                 store.state.clear_composer_line();
                 store.state.composer_mode = ComposerMode::Insert;
             }
@@ -1067,7 +1137,10 @@ fn handle_composer_vim_key(store: &mut Store, key: &KeyEvent) -> Option<KeyActio
         'e' => store.state.move_composer_cursor_word_end(),
         'G' => store.state.move_composer_cursor_buffer_end(),
         // Edits.
-        'x' => store.state.delete_composer_next_char(),
+        'x' => {
+            store.state.clear_history_index();
+            store.state.delete_composer_next_char();
+        }
         // Operator/jump prefixes — wait for the second key.
         'g' | 'd' | 'c' => store.state.composer_vim_pending = Some(c),
         // Enter Insert mode (positioning variants).
@@ -1085,10 +1158,12 @@ fn handle_composer_vim_key(store: &mut Store, key: &KeyEvent) -> Option<KeyActio
             store.state.composer_mode = ComposerMode::Insert;
         }
         'o' => {
+            store.state.clear_history_index();
             store.state.open_composer_line_below();
             store.state.composer_mode = ComposerMode::Insert;
         }
         'O' => {
+            store.state.clear_history_index();
             store.state.open_composer_line_above();
             store.state.composer_mode = ComposerMode::Insert;
         }
@@ -1117,9 +1192,11 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
                 store.state.set_composer_text("");
             }
             KeyCode::Backspace => {
+                store.state.clear_history_index();
                 store.state.delete_composer_prev_char();
             }
             KeyCode::Delete => {
+                store.state.clear_history_index();
                 store.state.delete_composer_next_char();
             }
             KeyCode::Home => {
@@ -1138,6 +1215,7 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
                 return handle_composer_enter(store);
             }
             KeyCode::Char(ch) => {
+                store.state.clear_history_index();
                 store.state.insert_composer_char(ch);
             }
             _ => {}
@@ -1156,6 +1234,7 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             // Covers the bare `/` too (capture is active from the first char),
             // so Backspace can still delete an accidental slash — the
             // `menu_composer_edit_active` branch no longer handles it.
+            store.state.clear_history_index();
             store.state.delete_composer_prev_char();
             if store.state.composer.starts_with('/') {
                 sync_slash_help_search_query(store);
@@ -1170,6 +1249,7 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             delete_active_menu_search_prev_char(store);
         }
         KeyCode::Char(ch) if slash_help_should_capture_char(store, ch) => {
+            store.state.clear_history_index();
             store.state.insert_composer_char(ch);
             sync_slash_help_search_query(store);
         }
@@ -1718,9 +1798,16 @@ impl TerminalGuard {
             ratatui::layout::Rect::new(0, size.height.saturating_sub(1), size.width, 1)
         };
         let saved_visible_history_extent = self.saved_visible_history_extent.take();
-        terminal.set_viewport_area(self.saved_inline_viewport.take().unwrap_or(fallback));
+        let saved_viewport = self.saved_inline_viewport.take().unwrap_or(fallback);
+        terminal.set_viewport_area(saved_viewport);
         if let Some((rows, bottom)) = saved_visible_history_extent {
             terminal.set_visible_history_extent(rows, bottom);
+        }
+        // Clear the restored inline viewport immediately after leaving the
+        // alt-screen so any pre-overlay inline content cannot flash as a
+        // second composer before the next draw_inline_frame overwrites it.
+        if !saved_viewport.is_empty() {
+            terminal.clear_after_position(saved_viewport.as_position())?;
         }
         terminal.invalidate_viewport();
         self.mode = RenderMode::Inline;
@@ -2239,9 +2326,13 @@ mod tests {
             .expect("resize restored inline viewport");
         assert_eq!(terminal.viewport_area, Rect::new(0, 16, 60, 4));
         assert_eq!(terminal.backend().cursor, Position { x: 0, y: 16 });
+        // leave_alt_screen now clears the restored inline viewport immediately
+        // (first AfterCursor) to prevent the pre-overlay content from flashing;
+        // resize_viewport_to then clears again after moving the viewport on the
+        // shrunken screen (second AfterCursor).
         assert_eq!(
             terminal.backend().clears,
-            vec![ClearType::All, ClearType::AfterCursor]
+            vec![ClearType::All, ClearType::AfterCursor, ClearType::AfterCursor]
         );
 
         let written = String::from_utf8_lossy(&terminal.backend().buf);
@@ -3301,5 +3392,137 @@ mod tests {
             params.approval_scope.as_deref(),
             Some(approval_scopes::REQUEST)
         );
+    }
+
+    #[test]
+    fn up_on_empty_composer_enters_history() {
+        let mut store = store_with_sessions(1);
+        store.state.query_history.push("first query".into());
+        store.state.focus = FocusPane::Composer;
+        handle_key(&mut store, key(KeyCode::Up));
+        assert_eq!(store.state.composer, "first query");
+        assert_eq!(store.state.history_index, Some(0));
+    }
+
+    #[test]
+    fn up_on_nonempty_composer_does_not_enter_history() {
+        let mut store = store_with_sessions(1);
+        store.state.query_history.push("first query".into());
+        store.state.focus = FocusPane::Composer;
+        store.state.composer = "typing".into();
+        handle_key(&mut store, key(KeyCode::Up));
+        assert_eq!(store.state.composer, "typing");
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn up_does_nothing_when_history_empty_and_composer_empty() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        handle_key(&mut store, key(KeyCode::Up));
+        assert!(store.state.composer.is_empty());
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn down_exits_history_and_clears_composer() {
+        let mut store = store_with_sessions(1);
+        store.state.query_history.push("q1".into());
+        store.state.query_history.push("q2".into());
+        store.state.focus = FocusPane::Composer;
+        handle_key(&mut store, key(KeyCode::Up)); // → "q2", index=1
+        handle_key(&mut store, key(KeyCode::Up)); // → "q1", index=0
+        handle_key(&mut store, key(KeyCode::Down)); // → "q2", index=1
+        assert_eq!(store.state.composer, "q2");
+        assert_eq!(store.state.history_index, Some(1));
+        handle_key(&mut store, key(KeyCode::Down)); // → new-input slot
+        assert!(store.state.composer.is_empty());
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn down_with_no_history_index_does_not_panic() {
+        // When history_index is None and composer is empty, Down falls through
+        // to the existing transcript-scroll behavior (must not panic).
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        handle_key(&mut store, key(KeyCode::Down));
+    }
+
+    fn store_in_history_mode() -> Store {
+        let mut store = store_with_sessions(1);
+        store.state.query_history.push("recalled".into());
+        store.state.focus = FocusPane::Composer;
+        handle_key(&mut store, key(KeyCode::Up)); // enters history, composer = "recalled"
+        assert_eq!(store.state.history_index, Some(0));
+        store
+    }
+
+    #[test]
+    fn typing_char_resets_history_index() {
+        let mut store = store_in_history_mode();
+        handle_key(&mut store, key(KeyCode::Char('x')));
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn backspace_resets_history_index() {
+        let mut store = store_in_history_mode();
+        handle_key(&mut store, key(KeyCode::Backspace));
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn delete_key_resets_history_index() {
+        let mut store = store_in_history_mode();
+        handle_key(&mut store, key(KeyCode::Delete));
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn paste_resets_history_index() {
+        let mut store = store_in_history_mode();
+        // handle_paste is accessible via use super::* in this module
+        handle_paste(&mut store, "pasted text");
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn ctrl_u_resets_history_index() {
+        let mut store = store_in_history_mode();
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn shift_enter_resets_history_index() {
+        let mut store = store_in_history_mode();
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Enter, KeyModifiers::SHIFT),
+        );
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn ctrl_w_resets_history_index() {
+        let mut store = store_in_history_mode();
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        );
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn vim_x_resets_history_index() {
+        let mut store = store_in_history_mode();
+        store.state.vim_mode = true;
+        store.state.composer_mode = crate::model::ComposerMode::Normal;
+        handle_key(&mut store, key(KeyCode::Char('x')));
+        assert!(store.state.history_index.is_none());
     }
 }
