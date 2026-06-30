@@ -3241,6 +3241,8 @@ pub struct AppState {
     pub composer: String,
     pub composer_cursor: Option<usize>,
     pub composer_drafts: Vec<ComposerDraft>,
+    pub query_history: Vec<String>,
+    pub history_index: Option<usize>,
     pub pending_messages: Vec<String>,
     pub optimistic_user_messages: Vec<OptimisticUserMessage>,
     pub status: String,
@@ -4854,6 +4856,8 @@ impl AppState {
             composer: String::new(),
             composer_cursor: None,
             composer_drafts: Vec::new(),
+            query_history: Vec::new(),
+            history_index: None,
             pending_messages: Vec::new(),
             optimistic_user_messages: Vec::new(),
             status,
@@ -6773,6 +6777,13 @@ mod tests {
             None,
             false,
         )
+    }
+
+    #[test]
+    fn appstate_initial_query_history_is_empty() {
+        let state = AppState::new(vec![], 0, "ready".into(), None, false);
+        assert!(state.query_history.is_empty());
+        assert!(state.history_index.is_none());
     }
 
     #[test]
