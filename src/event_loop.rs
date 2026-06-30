@@ -791,12 +791,10 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         // In the composer, Up/Down move the cursor between logical lines; at the
         // first/last line they fall back to the existing transcript scroll so
         // that affordance isn't lost.
-        // When the composer is empty (or already in history navigation), Up/Down
-        // navigate query history instead.
+        // Up also enters history navigation when the composer is empty.
+        // Down only navigates history when already in history mode (history_index is Some).
         KeyCode::Down if store.state.focus == FocusPane::Composer => {
-            if store.state.history_index.is_some()
-                || store.state.composer.trim().is_empty()
-            {
+            if store.state.history_index.is_some() {
                 store.state.history_navigate_down();
             } else if !store.state.move_composer_cursor_down() {
                 store.state.scroll_transcript_down(1);
