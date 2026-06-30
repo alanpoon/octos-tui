@@ -627,6 +627,7 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     }
 
     if is_control_char(&key, 'u') {
+        store.state.clear_history_index();
         store.clear_composer_or_staged_messages();
         return KeyAction::Continue;
     }
@@ -690,6 +691,7 @@ fn handle_paste(store: &mut Store, text: &str) -> KeyAction {
     }
 
     let opens_slash_popup = store.state.composer.is_empty() && text.starts_with('/');
+    store.state.clear_history_index();
     store.state.insert_composer_text(text);
     store.state.focus = FocusPane::Composer;
 
@@ -851,9 +853,11 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             store.state.move_composer_cursor_right();
         }
         KeyCode::Delete if store.state.focus == FocusPane::Composer => {
+            store.state.clear_history_index();
             store.state.delete_composer_next_char();
         }
         KeyCode::Backspace if store.state.focus == FocusPane::Composer => {
+            store.state.clear_history_index();
             store.state.delete_composer_prev_char();
         }
         KeyCode::Enter if store.state.focus == FocusPane::Composer => {
@@ -887,6 +891,7 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         }
         KeyCode::Char(ch) => {
             let opens_slash_popup = ch == '/' && store.state.composer.is_empty();
+            store.state.clear_history_index();
             store.state.insert_composer_char(ch);
             store.state.focus = FocusPane::Composer;
             if opens_slash_popup {
@@ -961,6 +966,7 @@ fn handle_composer_modified_key(store: &mut Store, key: KeyEvent) -> bool {
     // Enter is indistinguishable and submits, which is why Ctrl+J is the
     // portable fallback. Handled here, before the Enter→submit arm.
     if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
+        store.state.clear_history_index();
         store.state.insert_composer_text("\n");
         return true;
     }
@@ -972,6 +978,7 @@ fn handle_composer_modified_key(store: &mut Store, key: KeyEvent) -> bool {
             // as ESC+CR instead, where it can't be caught — use Shift+Enter or
             // Ctrl+J there.
             KeyCode::Enter => {
+                store.state.clear_history_index();
                 store.state.insert_composer_text("\n");
                 return true;
             }
@@ -984,10 +991,12 @@ fn handle_composer_modified_key(store: &mut Store, key: KeyEvent) -> bool {
                 return true;
             }
             KeyCode::Char('d') => {
+                store.state.clear_history_index();
                 store.state.delete_composer_next_word();
                 return true;
             }
             KeyCode::Backspace => {
+                store.state.clear_history_index();
                 store.state.delete_composer_prev_word();
                 return true;
             }
@@ -1002,6 +1011,7 @@ fn handle_composer_modified_key(store: &mut Store, key: KeyEvent) -> bool {
             // alongside Alt+Enter. (Terminals that fold Ctrl+J into Enter will
             // submit instead — Alt+Enter is the fallback there.)
             KeyCode::Char('j') => {
+                store.state.clear_history_index();
                 store.state.insert_composer_text("\n");
                 return true;
             }
@@ -1022,18 +1032,22 @@ fn handle_composer_modified_key(store: &mut Store, key: KeyEvent) -> bool {
                 return true;
             }
             KeyCode::Char('w') => {
+                store.state.clear_history_index();
                 store.state.delete_composer_prev_word();
                 return true;
             }
             KeyCode::Char('d') | KeyCode::Delete => {
+                store.state.clear_history_index();
                 store.state.delete_composer_next_char();
                 return true;
             }
             KeyCode::Char('h') | KeyCode::Backspace => {
+                store.state.clear_history_index();
                 store.state.delete_composer_prev_char();
                 return true;
             }
             KeyCode::Char('k') => {
+                store.state.clear_history_index();
                 store.state.kill_composer_to_line_end();
                 return true;
             }
@@ -1086,9 +1100,16 @@ fn handle_composer_vim_key(store: &mut Store, key: &KeyEvent) -> Option<KeyActio
     if let Some(pending) = store.state.composer_vim_pending.take() {
         match (pending, c) {
             ('g', 'g') => store.state.move_composer_cursor_buffer_start(),
-            ('d', 'd') => store.state.delete_composer_line(),
-            ('d', 'w') => store.state.delete_composer_word_forward(),
+            ('d', 'd') => {
+                store.state.clear_history_index();
+                store.state.delete_composer_line();
+            }
+            ('d', 'w') => {
+                store.state.clear_history_index();
+                store.state.delete_composer_word_forward();
+            }
             ('c', 'c') => {
+                store.state.clear_history_index();
                 store.state.clear_composer_line();
                 store.state.composer_mode = ComposerMode::Insert;
             }
@@ -1115,7 +1136,10 @@ fn handle_composer_vim_key(store: &mut Store, key: &KeyEvent) -> Option<KeyActio
         'e' => store.state.move_composer_cursor_word_end(),
         'G' => store.state.move_composer_cursor_buffer_end(),
         // Edits.
-        'x' => store.state.delete_composer_next_char(),
+        'x' => {
+            store.state.clear_history_index();
+            store.state.delete_composer_next_char();
+        }
         // Operator/jump prefixes — wait for the second key.
         'g' | 'd' | 'c' => store.state.composer_vim_pending = Some(c),
         // Enter Insert mode (positioning variants).
@@ -1133,10 +1157,12 @@ fn handle_composer_vim_key(store: &mut Store, key: &KeyEvent) -> Option<KeyActio
             store.state.composer_mode = ComposerMode::Insert;
         }
         'o' => {
+            store.state.clear_history_index();
             store.state.open_composer_line_below();
             store.state.composer_mode = ComposerMode::Insert;
         }
         'O' => {
+            store.state.clear_history_index();
             store.state.open_composer_line_above();
             store.state.composer_mode = ComposerMode::Insert;
         }
@@ -3415,5 +3441,82 @@ mod tests {
         let mut store = store_with_sessions(1);
         store.state.focus = FocusPane::Composer;
         handle_key(&mut store, key(KeyCode::Down));
+    }
+
+    fn store_in_history_mode() -> Store {
+        let mut store = store_with_sessions(1);
+        store.state.query_history.push("recalled".into());
+        store.state.focus = FocusPane::Composer;
+        handle_key(&mut store, key(KeyCode::Up)); // enters history, composer = "recalled"
+        assert_eq!(store.state.history_index, Some(0));
+        store
+    }
+
+    #[test]
+    fn typing_char_resets_history_index() {
+        let mut store = store_in_history_mode();
+        handle_key(&mut store, key(KeyCode::Char('x')));
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn backspace_resets_history_index() {
+        let mut store = store_in_history_mode();
+        handle_key(&mut store, key(KeyCode::Backspace));
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn delete_key_resets_history_index() {
+        let mut store = store_in_history_mode();
+        handle_key(&mut store, key(KeyCode::Delete));
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn paste_resets_history_index() {
+        let mut store = store_in_history_mode();
+        // handle_paste is accessible via use super::* in this module
+        handle_paste(&mut store, "pasted text");
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn ctrl_u_resets_history_index() {
+        let mut store = store_in_history_mode();
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn shift_enter_resets_history_index() {
+        let mut store = store_in_history_mode();
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Enter, KeyModifiers::SHIFT),
+        );
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn ctrl_w_resets_history_index() {
+        let mut store = store_in_history_mode();
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        );
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn vim_x_resets_history_index() {
+        let mut store = store_in_history_mode();
+        store.state.vim_mode = true;
+        store.state.composer_mode = crate::model::ComposerMode::Normal;
+        handle_key(&mut store, key(KeyCode::Char('x')));
+        assert!(store.state.history_index.is_none());
     }
 }
