@@ -64,6 +64,10 @@ enum RenderMode {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return run_headless(cli);
+    }
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     // Inline-viewport model (codex-style): we do NOT enter the alternate screen
@@ -216,6 +220,39 @@ pub fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// Headless relay: when stdin is not a terminal (e.g. launched as an MCP stdio
+/// server by Claude Code or another host), skip the TUI entirely and exec the
+/// stdio-command with inherited stdio so the child process communicates directly
+/// with the host.
+fn run_headless(cli: Cli) -> Result<()> {
+    use eyre::eyre;
+    let command = cli.stdio_command.ok_or_else(|| {
+        eyre!(
+            "no terminal available and no --stdio-command given; \
+             run octos-tui directly in an interactive terminal"
+        )
+    })?;
+
+    #[cfg(windows)]
+    let mut child = std::process::Command::new("cmd")
+        .args(["/C", &command])
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()?;
+
+    #[cfg(not(windows))]
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", &command])
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()?;
+
+    let status = child.wait()?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
 /// Draw one frame. In `Inline` mode this flushes newly-finalized history into
 /// scrollback (so it becomes natively selectable) and renders only the live UI
 /// into the bottom inline viewport. For full-screen overlays it switches to the
@@ -258,6 +295,7 @@ where
     // screen switch so native selection works the instant the user is back on
     // scrollback; pinned scroll-mode keeps capture on so the next wheel-up can
     // re-enter the pager.
+    let leaving_alt_screen = guard.mode == RenderMode::AltScreen;
     guard.sync_mouse_capture(terminal, app::wants_mouse_capture(&store.state))?;
     guard.leave_alt_screen(terminal)?;
 
@@ -283,8 +321,10 @@ where
     // first, insert finalized history using that width/anchor, then draw. If a
     // resize/clear or history insertion is pending, batch those structural
     // writes with the frame inside DEC synchronized update so native selections
-    // are disturbed only when the terminal genuinely changes.
-    if needs_resize || needs_history_insert {
+    // are disturbed only when the terminal genuinely changes. Also batch the
+    // first inline draw after an alt-screen exit so the cleared viewport and
+    // the new frame appear atomically (no second-composer flash).
+    if needs_resize || needs_history_insert || leaving_alt_screen {
         synchronized_terminal_update(terminal, |terminal| {
             draw_inline_frame(
                 terminal,
@@ -751,13 +791,23 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         // In the composer, Up/Down move the cursor between logical lines; at the
         // first/last line they fall back to the existing transcript scroll so
         // that affordance isn't lost.
+        // When the composer is empty (or already in history navigation), Up/Down
+        // navigate query history instead.
         KeyCode::Down if store.state.focus == FocusPane::Composer => {
-            if !store.state.move_composer_cursor_down() {
+            if store.state.history_index.is_some()
+                || store.state.composer.trim().is_empty()
+            {
+                store.state.history_navigate_down();
+            } else if !store.state.move_composer_cursor_down() {
                 store.state.scroll_transcript_down(1);
             }
         }
         KeyCode::Up if store.state.focus == FocusPane::Composer => {
-            if !store.state.move_composer_cursor_up() {
+            if store.state.history_index.is_some()
+                || store.state.composer.trim().is_empty()
+            {
+                store.state.history_navigate_up();
+            } else if !store.state.move_composer_cursor_up() {
                 store.state.scroll_transcript_up(1);
             }
         }
@@ -1718,9 +1768,16 @@ impl TerminalGuard {
             ratatui::layout::Rect::new(0, size.height.saturating_sub(1), size.width, 1)
         };
         let saved_visible_history_extent = self.saved_visible_history_extent.take();
-        terminal.set_viewport_area(self.saved_inline_viewport.take().unwrap_or(fallback));
+        let saved_viewport = self.saved_inline_viewport.take().unwrap_or(fallback);
+        terminal.set_viewport_area(saved_viewport);
         if let Some((rows, bottom)) = saved_visible_history_extent {
             terminal.set_visible_history_extent(rows, bottom);
+        }
+        // Clear the restored inline viewport immediately after leaving the
+        // alt-screen so any pre-overlay inline content cannot flash as a
+        // second composer before the next draw_inline_frame overwrites it.
+        if !saved_viewport.is_empty() {
+            terminal.clear_after_position(saved_viewport.as_position())?;
         }
         terminal.invalidate_viewport();
         self.mode = RenderMode::Inline;
@@ -2239,9 +2296,13 @@ mod tests {
             .expect("resize restored inline viewport");
         assert_eq!(terminal.viewport_area, Rect::new(0, 16, 60, 4));
         assert_eq!(terminal.backend().cursor, Position { x: 0, y: 16 });
+        // leave_alt_screen now clears the restored inline viewport immediately
+        // (first AfterCursor) to prevent the pre-overlay content from flashing;
+        // resize_viewport_to then clears again after moving the viewport on the
+        // shrunken screen (second AfterCursor).
         assert_eq!(
             terminal.backend().clears,
-            vec![ClearType::All, ClearType::AfterCursor]
+            vec![ClearType::All, ClearType::AfterCursor, ClearType::AfterCursor]
         );
 
         let written = String::from_utf8_lossy(&terminal.backend().buf);
@@ -3301,5 +3362,60 @@ mod tests {
             params.approval_scope.as_deref(),
             Some(approval_scopes::REQUEST)
         );
+    }
+
+    #[test]
+    fn up_on_empty_composer_enters_history() {
+        let mut store = store_with_sessions(1);
+        store.state.query_history.push("first query".into());
+        store.state.focus = FocusPane::Composer;
+        handle_key(&mut store, key(KeyCode::Up));
+        assert_eq!(store.state.composer, "first query");
+        assert_eq!(store.state.history_index, Some(0));
+    }
+
+    #[test]
+    fn up_on_nonempty_composer_does_not_enter_history() {
+        let mut store = store_with_sessions(1);
+        store.state.query_history.push("first query".into());
+        store.state.focus = FocusPane::Composer;
+        store.state.composer = "typing".into();
+        handle_key(&mut store, key(KeyCode::Up));
+        assert_eq!(store.state.composer, "typing");
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn up_does_nothing_when_history_empty_and_composer_empty() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        handle_key(&mut store, key(KeyCode::Up));
+        assert!(store.state.composer.is_empty());
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn down_exits_history_and_clears_composer() {
+        let mut store = store_with_sessions(1);
+        store.state.query_history.push("q1".into());
+        store.state.query_history.push("q2".into());
+        store.state.focus = FocusPane::Composer;
+        handle_key(&mut store, key(KeyCode::Up)); // → "q2", index=1
+        handle_key(&mut store, key(KeyCode::Up)); // → "q1", index=0
+        handle_key(&mut store, key(KeyCode::Down)); // → "q2", index=1
+        assert_eq!(store.state.composer, "q2");
+        assert_eq!(store.state.history_index, Some(1));
+        handle_key(&mut store, key(KeyCode::Down)); // → new-input slot
+        assert!(store.state.composer.is_empty());
+        assert!(store.state.history_index.is_none());
+    }
+
+    #[test]
+    fn down_with_no_history_index_does_not_panic() {
+        // When history_index is None and composer is empty, Down falls through
+        // to the existing transcript-scroll behavior (must not panic).
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        handle_key(&mut store, key(KeyCode::Down));
     }
 }
