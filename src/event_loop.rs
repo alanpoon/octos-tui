@@ -551,6 +551,7 @@ fn handle_terminal_event_with_input_state(
         if is_plain_composer_enter(store, &key)
             && input_state.should_insert_unbracketed_paste_newline(now, next_event_waiting)
         {
+            store.state.clear_history_index();
             store.state.insert_composer_text("\n");
             store.state.focus = FocusPane::Composer;
             return KeyAction::Continue;
@@ -1191,9 +1192,11 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
                 store.state.set_composer_text("");
             }
             KeyCode::Backspace => {
+                store.state.clear_history_index();
                 store.state.delete_composer_prev_char();
             }
             KeyCode::Delete => {
+                store.state.clear_history_index();
                 store.state.delete_composer_next_char();
             }
             KeyCode::Home => {
@@ -1212,6 +1215,7 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
                 return handle_composer_enter(store);
             }
             KeyCode::Char(ch) => {
+                store.state.clear_history_index();
                 store.state.insert_composer_char(ch);
             }
             _ => {}
@@ -1230,6 +1234,7 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             // Covers the bare `/` too (capture is active from the first char),
             // so Backspace can still delete an accidental slash — the
             // `menu_composer_edit_active` branch no longer handles it.
+            store.state.clear_history_index();
             store.state.delete_composer_prev_char();
             if store.state.composer.starts_with('/') {
                 sync_slash_help_search_query(store);
@@ -1244,6 +1249,7 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             delete_active_menu_search_prev_char(store);
         }
         KeyCode::Char(ch) if slash_help_should_capture_char(store, ch) => {
+            store.state.clear_history_index();
             store.state.insert_composer_char(ch);
             sync_slash_help_search_query(store);
         }
