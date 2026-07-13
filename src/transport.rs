@@ -24,7 +24,7 @@ use octos_core::ui_protocol::{
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
     UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
     UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
-    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
+    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
     UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
     UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UI_PROTOCOL_V1,
 };
@@ -2361,7 +2361,7 @@ fn appui_feature_header_for(old_server: bool) -> String {
         );
     }
     format!(
-        "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}, {UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1}, {UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1}, {UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1}, {UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1}, {UI_PROTOCOL_FEATURE_USER_QUESTION_V1}, {UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1}, {UI_PROTOCOL_FEATURE_PLAN_TODOS_V1}"
+        "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}, {UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1}, {UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1}, {UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1}, {UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1}, {UI_PROTOCOL_FEATURE_USER_QUESTION_V1}, {UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1}, {}", crate::model::APPUI_FEATURE_PLAN_TODOS_V1
     )
 }
 
@@ -2807,8 +2807,8 @@ fn success_response_to_app_event(
                 )),
             }
         }
-        octos_core::ui_protocol::methods::SESSION_BTW => {
-            match serde_json::from_value::<octos_core::ui_protocol::SessionBtwResult>(result) {
+        crate::model::APPUI_METHOD_SESSION_BTW => {
+            match serde_json::from_value::<crate::model::SessionBtwResult>(result) {
                 Ok(result) => Ok(Some(ClientEvent::SessionBtw(SessionBtwClientEvent {
                     result,
                 }))),
@@ -2817,7 +2817,7 @@ fn success_response_to_app_event(
                         "invalid_result",
                         format!(
                             "failed to decode UI protocol result for {}: {err}",
-                            octos_core::ui_protocol::methods::SESSION_BTW
+                            crate::model::APPUI_METHOD_SESSION_BTW
                         ),
                     )
                     .into(),
@@ -4252,7 +4252,7 @@ impl AppUiBackend for MockAppUiBackend {
             AppUiCommand::SessionBtw(params) => {
                 self.queue
                     .push_back(ClientEvent::SessionBtw(SessionBtwClientEvent {
-                        result: octos_core::ui_protocol::SessionBtwResult {
+                        result: crate::model::SessionBtwResult {
                             session_id: params.session_id,
                             answer: "Mock aside answer — the prototype backend has no LLM, \
                                      but the /btw card, busy gate, and dismissal all work."
@@ -4724,7 +4724,6 @@ impl AppUiBackend for MockAppUiBackend {
                             },
                             context: None,
                             context_state: None,
-                            replayed_tool_envelopes: None,
                             messages: Some(vec![HydratedMessage {
                                 seq: 1,
                                 role: "user".into(),
@@ -4733,7 +4732,6 @@ impl AppUiBackend for MockAppUiBackend {
                                 thread_id: None,
                                 client_message_id: None,
                                 persisted_at: Utc::now(),
-                                reasoning_content: None,
                                 message_id: None,
                                 source: None,
                                 media: Vec::new(),
@@ -5351,8 +5349,8 @@ mod tests {
         assert!(modern.contains(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
         // Modern advertises the plan/todo checklist so the server streams
         // `plan/updated`; old-server mode drops it.
-        assert!(modern.contains(UI_PROTOCOL_FEATURE_PLAN_TODOS_V1));
-        assert!(!appui_feature_header_for(true).contains(UI_PROTOCOL_FEATURE_PLAN_TODOS_V1));
+        assert!(modern.contains(crate::model::APPUI_FEATURE_PLAN_TODOS_V1));
+        assert!(!appui_feature_header_for(true).contains(crate::model::APPUI_FEATURE_PLAN_TODOS_V1));
 
         // Old-server mode drops autonomy/agent-control/goal/loop/task-control
         // so the backend behaves as a pre-autonomy server and the TUI hides

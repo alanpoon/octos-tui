@@ -215,6 +215,59 @@ pub const APPUI_METHOD_LOOP_UPDATED: &str = "loop/updated";
 pub const APPUI_METHOD_LOOP_FIRED: &str = "loop/fired";
 pub const APPUI_METHOD_LOOP_COMPLETED: &str = "loop/completed";
 
+/// Feature token for the plan/todo checklist. Previously in octos-core as
+/// `UI_PROTOCOL_FEATURE_PLAN_TODOS_V1`; now owned locally since the server
+/// no longer ships a matching `UiPlanRecord` type.
+pub const APPUI_FEATURE_PLAN_TODOS_V1: &str = "coding.plan_todos.v1";
+
+/// Local type replacing the removed `octos_core::ui_protocol::SessionBtwParams`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionBtwParams {
+    pub session_id: octos_core::SessionKey,
+    pub topic: Option<String>,
+    pub question: String,
+}
+
+/// Local type replacing the removed `octos_core::ui_protocol::SessionBtwResult`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionBtwResult {
+    pub session_id: octos_core::SessionKey,
+    pub answer: String,
+    pub model: Option<String>,
+}
+
+/// Method string for `session/btw`. Previously in `octos_core::ui_protocol::methods::SESSION_BTW`.
+pub const APPUI_METHOD_SESSION_BTW: &str = "session/btw";
+
+/// Status of a single plan item. Replacing the removed `octos_core::ui_protocol::PlanItemStatus`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum PlanItemStatus {
+    #[default]
+    Pending,
+    InProgress,
+    Completed,
+    Skipped,
+}
+
+/// A single item in the plan checklist. Replacing the removed `octos_core::ui_protocol::UiPlanItem`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct UiPlanItem {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    pub title: String,
+    pub status: PlanItemStatus,
+    pub priority: Option<String>,
+}
+
+/// Model-authored plan/todo checklist. Replacing the removed `octos_core::ui_protocol::UiPlanRecord`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct UiPlanRecord {
+    pub items: Vec<UiPlanItem>,
+    pub title: Option<String>,
+    #[serde(default)]
+    pub updated_at_ms: i64,
+}
+
 // ---------- M15-E Octos UI param + result types ----------
 //
 // These params types model the request side of the autonomy surface
@@ -523,7 +576,7 @@ pub struct SessionAutonomyState {
     pub loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
     /// Latest model-authored plan/todo checklist (`plan/updated`). `None` until
     /// the agent calls `update_plan` this session.
-    pub plan: Option<octos_core::ui_protocol::UiPlanRecord>,
+    pub plan: Option<crate::model::UiPlanRecord>,
     /// Turn that authored the current `plan`, when known. The plan is per-turn
     /// working state, so it is cleared when this turn completes.
     pub plan_turn_id: Option<TurnId>,
@@ -633,7 +686,7 @@ pub enum AppUiCommand {
     StartReview(ReviewStartParams),
     ListConfigCapabilities(ConfigCapabilitiesListParams),
     ReadSessionStatus(SessionStatusReadParams),
-    SessionBtw(octos_core::ui_protocol::SessionBtwParams),
+    SessionBtw(crate::model::SessionBtwParams),
     ListModels(ModelListParams),
     SelectModel(ModelSelectParams),
     ListPermissionProfiles(PermissionProfileListParams),
@@ -722,7 +775,7 @@ impl AppUiCommand {
             Self::StartReview(_) => APPUI_METHOD_REVIEW_START,
             Self::ListConfigCapabilities(_) => APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
             Self::ReadSessionStatus(_) => APPUI_METHOD_SESSION_STATUS_READ,
-            Self::SessionBtw(_) => octos_core::ui_protocol::methods::SESSION_BTW,
+            Self::SessionBtw(_) => APPUI_METHOD_SESSION_BTW,
             Self::ListModels(_) | Self::ProfileLlmList(_) => APPUI_METHOD_MODEL_LIST,
             Self::SelectModel(_) | Self::ProfileLlmSelect(_) => APPUI_METHOD_MODEL_SELECT,
             Self::ListPermissionProfiles(_) => {
@@ -5613,7 +5666,7 @@ impl AppState {
     pub fn set_session_plan(
         &mut self,
         session_id: &SessionKey,
-        plan: Option<octos_core::ui_protocol::UiPlanRecord>,
+        plan: Option<crate::model::UiPlanRecord>,
         turn_id: Option<TurnId>,
     ) {
         let entry = self.session_autonomy_mut(session_id);
