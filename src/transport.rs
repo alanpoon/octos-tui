@@ -4735,12 +4735,14 @@ impl AppUiBackend for MockAppUiBackend {
                                 message_id: None,
                                 source: None,
                                 media: Vec::new(),
+                                reasoning_content: None,
                             }]),
                             threads: None,
                             turns: None,
                             pending_approvals: None,
                             pending_questions: None,
                             replayed_envelopes: None,
+                            replayed_tool_envelopes: None,
                         },
                     }));
                 Ok(())

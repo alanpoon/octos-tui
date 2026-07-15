@@ -1277,7 +1277,7 @@ impl Store {
                     // and fetch the session list; the `SessionList` result
                     // refreshes the open menu into `Ready` rows.
                     self.open_menu(MenuId::from(crate::menu::registry::MENU_RESUME));
-                    Some(AppUiCommand::ListSessions(SessionListParams {}))
+                    Some(AppUiCommand::ListSessions(SessionListParams { cwd: None }))
                 } else if !self.state.resume_list_loaded {
                     // `/resume <query>` before the list ever loaded: the local
                     // resolve below would ALWAYS fail (`resume_sessions` is only
@@ -1290,7 +1290,7 @@ impl Store {
                         frame.search_query = arg.to_owned();
                     }
                     self.refresh_active_menu();
-                    Some(AppUiCommand::ListSessions(SessionListParams {}))
+                    Some(AppUiCommand::ListSessions(SessionListParams { cwd: None }))
                 } else {
                     // `/resume <query>` shortcut: resolve to a session id
                     // (exact / prefix / substring) and switch directly, reusing
@@ -7952,6 +7952,7 @@ impl Store {
             // octos-core is ahead of this crate and added `VoiceExit`; handling
             // it here keeps the match exhaustive so the workspace compiles.)
             UiNotification::VoiceExit(_) => None,
+            UiNotification::PlanUpdated(_) | UiNotification::VoiceAudioChunk(_) => None,
         }
     }
 
@@ -8016,6 +8017,7 @@ impl Store {
             Payload::ToolStart {
                 tool_call_id,
                 name,
+                arguments_preview: _,
             } => {
                 let item = ActivityItem::new(ActivityKind::Tool, name.clone(), "running")
                     .with_tool_call(tool_call_id.clone())
@@ -8056,6 +8058,8 @@ impl Store {
                 status,
                 error,
                 reason,
+                output_preview: _,
+                duration_ms: _,
             } => {
                 let (label, success) = match status {
                     EnvelopeToolEndStatus::Complete => ("complete", Some(true)),
