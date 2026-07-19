@@ -7653,7 +7653,13 @@ impl Store {
                 .is_some_and(|approval| &approval.session_id == session_id)
             {
                 self.state.approval = None;
-                self.state.set_run_state_idle();
+                if self.event_targets_active_session(session_id) {
+                    if self.state.active_turn().is_some() {
+                        self.state.set_run_state_in_progress();
+                    } else if self.state.run_state.is_active() {
+                        self.state.set_run_state_idle();
+                    }
+                }
             }
             return;
         };
@@ -7664,14 +7670,17 @@ impl Store {
                 t!("status.activity_pending_approvals").into_owned(),
                 t!("status.pending_approval_count", count = count).into_owned(),
             )
+            .with_session(session_id.clone())
             .with_turn(event.turn_id.clone())
             .with_detail(title.clone()),
         );
         let mut approval = ApprovalModalState::from_event(event);
         approval.visible = self.state.approval_auto_open;
         self.state.approval = Some(approval);
-        self.state.focus = FocusPane::Composer;
-        self.state.set_run_state_blocked(title);
+        if self.event_targets_active_session(session_id) {
+            self.state.focus = FocusPane::Composer;
+            self.state.set_run_state_blocked(title);
+        }
     }
 
     /// UPCR-2026-023 reconnect path: re-render a still-pending AskUserQuestion
@@ -7689,7 +7698,13 @@ impl Store {
                 .is_some_and(|picker| &picker.session_id == session_id)
             {
                 self.state.user_question = None;
-                self.state.set_run_state_idle();
+                if self.event_targets_active_session(session_id) {
+                    if self.state.active_turn().is_some() {
+                        self.state.set_run_state_in_progress();
+                    } else if self.state.run_state.is_active() {
+                        self.state.set_run_state_idle();
+                    }
+                }
             }
             return;
         };
@@ -7700,13 +7715,16 @@ impl Store {
                 t!("status.activity_pending_question").into_owned(),
                 title.clone(),
             )
+            .with_session(session_id.clone())
             .with_turn(event.turn_id.clone()),
         );
         let mut picker = UserQuestionPickerState::from_event(event);
         picker.visible = self.state.user_question_auto_open;
         self.state.user_question = Some(picker);
-        self.state.focus = FocusPane::Composer;
-        self.state.set_run_state_blocked(title);
+        if self.event_targets_active_session(session_id) {
+            self.state.focus = FocusPane::Composer;
+            self.state.set_run_state_blocked(title);
+        }
     }
 
     fn apply_profile_llm_catalog_event(&mut self, event: ProfileLlmCatalogClientEvent) {
@@ -8523,6 +8541,7 @@ impl Store {
                         event.tool_name.clone(),
                         title.clone(),
                     )
+                    .with_session(session_id.clone())
                     .with_turn(event.turn_id.clone())
                     .with_detail(
                         event
@@ -8536,10 +8555,14 @@ impl Store {
                 let diff_preview_id = approval.diff_preview_id();
                 let diff_preview_turn_id = approval.turn_id.clone();
                 self.state.approval = Some(approval);
-                self.state.focus = FocusPane::Composer;
-                self.state.set_run_state_blocked(title.clone());
+                if self.event_targets_active_session(&session_id) {
+                    self.state.focus = FocusPane::Composer;
+                    self.state.set_run_state_blocked(title.clone());
+                }
                 self.state.status = t!("status.approval_requested", title = title).into_owned();
-                if let Some(preview_id) = diff_preview_id {
+                if let Some(preview_id) = diff_preview_id
+                    && self.event_targets_active_session(&session_id)
+                {
                     let request_already_in_flight = self.state.diff_preview.loading
                         && self.state.diff_preview.requested_preview_id.as_ref()
                             == Some(&preview_id);
@@ -9460,8 +9483,10 @@ impl Store {
         } else {
             format!("{} question(s)", event.questions.len())
         };
+        let session_id = event.session_id.clone();
         self.state.push_activity(
             ActivityItem::new(ActivityKind::Approval, "ask_user_question", title.clone())
+                .with_session(session_id.clone())
                 .with_turn(event.turn_id.clone())
                 .with_detail(detail),
         );
@@ -9477,14 +9502,16 @@ impl Store {
         picker.visible = true;
         self.state.user_question_auto_open = true;
         self.state.user_question = Some(picker);
-        // A mid-turn question must interrupt whatever the main pane is showing:
-        // exit any sub-agent peek so the picker owns the screen and its keys
-        // reach `handle_user_question_key`, not `handle_agent_peek_key`.
-        if matches!(self.state.chat_view, crate::model::ChatViewTarget::Agent(_)) {
-            self.state.set_chat_view(crate::model::ChatViewTarget::Main);
+        if self.event_targets_active_session(&session_id) {
+            // A mid-turn question must interrupt whatever the main pane is showing:
+            // exit any sub-agent peek so the picker owns the screen and its keys
+            // reach `handle_user_question_key`, not `handle_agent_peek_key`.
+            if matches!(self.state.chat_view, crate::model::ChatViewTarget::Agent(_)) {
+                self.state.set_chat_view(crate::model::ChatViewTarget::Main);
+            }
+            self.state.focus = FocusPane::Composer;
+            self.state.set_run_state_blocked(title.clone());
         }
-        self.state.focus = FocusPane::Composer;
-        self.state.set_run_state_blocked(title.clone());
         self.state.status = t!("status.question_asked", title = title).into_owned();
         None
     }
