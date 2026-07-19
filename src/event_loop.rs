@@ -1177,6 +1177,13 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             store.state.focus = FocusPane::Composer;
         }
         KeyCode::Esc => {
+            // Clear a residual diff-preview panel that has no owning modal to
+            // forward the Esc — approval/question/task_output/etc. each handle
+            // their own Esc via their dedicated key handlers above.
+            if store.state.diff_preview.active {
+                store.close_modal();
+                return KeyAction::Continue;
+            }
             if store.state.active_turn().is_some() {
                 let command = if store.state.has_pending_messages() {
                     store.interrupt_staged_command()
@@ -2017,7 +2024,9 @@ fn handle_user_question_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             store.user_question_advance();
         }
         KeyCode::BackTab => store.user_question_back(),
-        KeyCode::Backspace => store.user_question_pop_free_text(),
+        KeyCode::Backspace if store.user_question_editing_free_text() => {
+            store.user_question_pop_free_text()
+        }
         KeyCode::Enter => {
             // Navigate + Enter must CHOOSE the highlighted option (only Space
             // toggled before, so an arrow-key highlight + Enter submitted an
