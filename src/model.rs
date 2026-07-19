@@ -7371,27 +7371,57 @@ impl AppState {
     }
 
     pub fn select_next_task(&mut self) {
-        let Some(session) = self.active_session() else {
-            return;
+        let (total, task_ids) = {
+            let Some(session) = self.active_session() else { return; };
+            if session.tasks.is_empty() { return; }
+            let ids = session.tasks.iter().map(|t| t.id.0.to_string()).collect::<Vec<_>>();
+            (session.tasks.len(), ids)
         };
-        if session.tasks.is_empty() {
-            return;
+        let roster_ids: std::collections::HashSet<String> = self
+            .active_session_agents()
+            .iter()
+            .filter_map(|a| a.task_id.clone())
+            .collect();
+        for step in 1..=total {
+            let candidate = (self.selected_task + step) % total;
+            if !roster_ids.contains(&task_ids[candidate]) {
+                self.selected_task = candidate;
+                return;
+            }
         }
-        self.selected_task = (self.selected_task + 1) % session.tasks.len();
+        // All tasks are roster-deduped — advance anyway so wrapping stays predictable.
+        self.selected_task = (self.selected_task + 1) % total;
     }
 
     pub fn select_prev_task(&mut self) {
-        let Some(session) = self.active_session() else {
-            return;
+        let (total, task_ids) = {
+            let Some(session) = self.active_session() else { return; };
+            if session.tasks.is_empty() { return; }
+            let ids = session.tasks.iter().map(|t| t.id.0.to_string()).collect::<Vec<_>>();
+            (session.tasks.len(), ids)
         };
-        if session.tasks.is_empty() {
-            return;
+        let roster_ids: std::collections::HashSet<String> = self
+            .active_session_agents()
+            .iter()
+            .filter_map(|a| a.task_id.clone())
+            .collect();
+        for step in 1..=total {
+            let candidate = if self.selected_task < step {
+                total - (step - self.selected_task)
+            } else {
+                self.selected_task - step
+            };
+            if !roster_ids.contains(&task_ids[candidate]) {
+                self.selected_task = candidate;
+                return;
+            }
         }
-        if self.selected_task == 0 {
-            self.selected_task = session.tasks.len() - 1;
+        // All tasks are roster-deduped — retreat anyway.
+        self.selected_task = if self.selected_task == 0 {
+            total - 1
         } else {
-            self.selected_task -= 1;
-        }
+            self.selected_task - 1
+        };
     }
 
     /// Sub-agents of the active session, in display order (stable by
