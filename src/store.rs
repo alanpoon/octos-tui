@@ -5224,7 +5224,7 @@ impl Store {
                 .is_some_and(|approval| &approval.session_id == session_id)
             {
                 self.state.approval = None;
-                // Only go idle if no user question is still blocking this session.
+                // Only go idle if no user question is still blocking this session. ##Z
                 let question_pending = self
                     .state
                     .user_question
