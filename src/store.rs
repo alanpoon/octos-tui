@@ -5224,7 +5224,15 @@ impl Store {
                 .is_some_and(|approval| &approval.session_id == session_id)
             {
                 self.state.approval = None;
-                self.state.set_run_state_idle();
+                // Only go idle if no user question is still blocking this session.
+                let question_pending = self
+                    .state
+                    .user_question
+                    .as_ref()
+                    .is_some_and(|q| &q.session_id == session_id);
+                if !question_pending {
+                    self.state.set_run_state_idle();
+                }
             }
             return;
         };
@@ -5260,7 +5268,15 @@ impl Store {
                 .is_some_and(|picker| &picker.session_id == session_id)
             {
                 self.state.user_question = None;
-                self.state.set_run_state_idle();
+                // Only go idle if no approval is still blocking this session.
+                let approval_pending = self
+                    .state
+                    .approval
+                    .as_ref()
+                    .is_some_and(|a| &a.session_id == session_id);
+                if !approval_pending {
+                    self.state.set_run_state_idle();
+                }
             }
             return;
         };
