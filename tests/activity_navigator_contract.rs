@@ -385,3 +385,51 @@ fn activity_navigator_escape_closes_without_touching_pager_state() {
     assert!(!store.state.activity_navigator.active);
     assert_eq!(store.state.transcript_scroll, 7);
 }
+
+/// Cross-session bleed (the navigator half of #461): an activity item STAMPED
+/// with a session belongs to that session and nowhere else. Before the fix
+/// `activity_belongs_to_session` returned early only on a *match*, so a
+/// mismatched stamp fell through to the "…or the session is the focused one"
+/// fallback and the peer's row was listed a second time under the focused
+/// session — the same chip twice, attributed to the wrong session.
+#[test]
+fn activity_navigator_does_not_list_another_sessions_stamped_item() {
+    let mut store = store_with_tasks(vec![]);
+    let background = SessionKey("local:background".into());
+    store.state.sessions.push(SessionView {
+        id: background.clone(),
+        title: "background".into(),
+        profile_id: None,
+        messages: Vec::new(),
+        tasks: Vec::new(),
+        live_reply: None,
+    });
+    // Focus stays on session 0; the chip belongs to the background session.
+    assert_eq!(store.state.selected_session, 0);
+    store.state.push_activity(
+        ActivityItem::new(ActivityKind::Progress, "peer-only-chip", "running")
+            .with_session(background.clone()),
+    );
+
+    let model = app::activity_navigator_model(&store.state);
+    let listed: Vec<_> = model
+        .rows
+        .iter()
+        .filter(|row| row.title == "peer-only-chip")
+        .collect();
+
+    assert_eq!(
+        listed.len(),
+        1,
+        "a stamped chip is listed once, under its own session; got {:?}",
+        listed
+            .iter()
+            .map(|row| row.session_id.as_ref().map(|id| id.0.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        listed[0].session_id.as_ref(),
+        Some(&background),
+        "and it is attributed to the session that produced it"
+    );
+}

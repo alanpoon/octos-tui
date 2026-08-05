@@ -438,8 +438,14 @@ pub(super) fn activity_belongs_to_session(
     item: &ActivityItem,
     session_id: &SessionKey,
 ) -> bool {
-    if item.session_id.as_ref() == Some(session_id) {
-        return true;
+    // A STAMPED item is owned outright: it belongs to that session and to no
+    // other. Returning early only on a match let a mismatched stamp fall
+    // through to the turn/active-session fallbacks below, and the "…or this is
+    // the focused session" clause then claimed it a second time — the peer's
+    // chip listed twice, once under the wrong session. Same ownership rule the
+    // transcript flow uses (`flow_activity_items`).
+    if let Some(item_session) = item.session_id.as_ref() {
+        return item_session == session_id;
     }
     if let Some(turn_id) = item.turn_id.as_ref() {
         return app
