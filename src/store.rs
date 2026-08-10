@@ -340,6 +340,46 @@ impl SlashDispatchOutcome {
 /// until it is explicitly classified safe. Resolution is alias-aware, which is
 /// exactly what the earlier raw-token denylist missed (`/auth`=`/login`,
 /// `/setup`=`/onboard`).
+/// Parsed quota-exhaustion details (spec task-quota-exhausted-card).
+struct QuotaFailure {
+    /// `provider@route/model` chip parsed from the message's `(…)` segment.
+    provider_model: Option<String>,
+    /// First `http(s)://…` URL in the message (the provider's top-up link).
+    link: Option<String>,
+}
+
+/// Classify a turn failure as quota exhaustion: terminal code `rate_limited`
+/// or `quota`, or a message carrying "quota exhausted" (case-insensitive).
+/// Everything else keeps the legacy error rendering.
+fn classify_quota_failure(code: &str, message: &str) -> Option<QuotaFailure> {
+    let is_quota = matches!(code, "rate_limited" | "quota")
+        || message.to_lowercase().contains("quota exhausted");
+    if !is_quota {
+        return None;
+    }
+    let provider_model = message.split_once('(').and_then(|(_, rest)| {
+        let inner = rest.split_once(')')?.0;
+        // Only accept a provider-ish chip (has @ or /), never arbitrary text.
+        (inner.contains('@') || inner.contains('/')).then(|| inner.to_string())
+    });
+    let link = message
+        .find("http://")
+        .or_else(|| message.find("https://"))
+        .map(|start| {
+            message[start..]
+                .split(|ch: char| ch.is_whitespace() || ch == '"' || ch == '}' || ch == ')')
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(['.', ','])
+                .to_string()
+        })
+        .filter(|url| !url.is_empty());
+    Some(QuotaFailure {
+        provider_model,
+        link,
+    })
+}
+
 fn should_record_in_history(prompt: &str) -> bool {
     if prompt.is_empty() || prompt.starts_with('!') {
         return false;
@@ -387,7 +427,7 @@ impl Store {
     /// a later explicit `/onboard workspace <path>` authoritative.
     ///
     /// UX2 (#1377 follow-up): when no `--cwd` is supplied the candidate now
-    /// falls back to the process working directory (the `octos-tui --cwd`
+    /// falls back to the process working directory (the `octoscode --cwd`
     /// default the help text already documents), so the documented launch
     /// `octos serve --stdio --solo` — which carries NO `--cwd` and whose
     /// transport label resolves to `"stdio"`/empty — still validates a genuine
@@ -416,7 +456,13 @@ impl Store {
 
     pub fn compose_command(&mut self) -> Option<AppUiCommand> {
         let prompt = self.state.composer.trim().to_string();
-        if prompt.starts_with('/') {
+        // `looks_like_slash_command`, not `starts_with('/')`: a prompt that
+        // merely BEGINS with a path (`/Users/me/Downloads/notes.md is broken,
+        // fix it`) parsed as the command `Users/me/Downloads/notes.md`,
+        // resolved to Unknown, and was Rejected — and Rejected yields no
+        // command, so the prompt was silently DISCARDED. Falling through here
+        // sends it as ordinary prose, which is what the user meant.
+        if crate::menu::registry::looks_like_slash_command(&prompt) {
             // Record a history-safe, no-arg slash command ONLY after the
             // dispatcher ACCEPTS (ran) it. Acceptance is the Outcome — a known
             // history-safe verb can still be rejected at dispatch time
@@ -621,9 +667,11 @@ impl Store {
     }
 
     /// Mid-turn staging chokepoint for every prompt submission (composer,
-    /// menu `SubmitPrompt`, `PromptTemplate`): an active turn STEERS the
-    /// prompt into the live turn when the server supports `turn/steer`
-    /// (octos#1807) and otherwise stages it onto the session's queue —
+    /// menu `SubmitPrompt`, `PromptTemplate`): an active turn stages the
+    /// prompt FIFO onto the session's queue (each staged prompt drains as
+    /// its OWN turn at turn-end, preserving order), unless steering is
+    /// opted in (`steer_mid_turn`) AND the server supports `turn/steer`
+    /// (octos#1807) — then the prompt is injected into the live turn —
     /// starting a SECOND `turn/start` concurrently with the live turn
     /// corrupts run-state bookkeeping and races the server — while an idle
     /// session starts the turn. Slash/bang inputs never reach here: the
@@ -673,6 +721,17 @@ impl Store {
     /// prompt is stashed FIFO in `pending_turn_steers` so an attributed
     /// steer failure can re-stage it (the text must never be lost).
     fn try_steer_live_turn(&mut self, prompt: &str) -> Option<AppUiCommand> {
+        // Steering is OPT-IN (`steer_mid_turn` config / --steer-mid-turn).
+        // The default answers "what does Enter mean while the agent works?"
+        // with FIFO: stage the prompt and run it as its OWN turn after the
+        // current one finishes, in the order typed. A steer is delivered as
+        // a bare user message into the RUNNING loop, and the model treats
+        // the newest instruction as superseding the work in progress — an
+        // effective interrupt-and-pivot. Right tool for a course
+        // correction; wrong default for "also do this next".
+        if !self.state.steer_mid_turn {
+            return None;
+        }
         if self.state.readonly {
             return None;
         }
@@ -865,6 +924,9 @@ impl Store {
             }
             CommandResolution::Unknown { invocation } => {
                 self.show_unknown_slash_command(&format!("/{}", invocation.name), draft);
+                // Keep the draft: a typo ("/heelp") should be correctable in
+                // place, not silently discarded along with the warning.
+                self.state.set_composer_text(draft);
                 SlashDispatchOutcome::Rejected
             }
             CommandResolution::NotCommand => SlashDispatchOutcome::Rejected,
@@ -1566,6 +1628,8 @@ impl Store {
         let slug = Self::peer_slug_for_key(&session_id);
         self.state.status = t!("status.peer_started", slug = slug).into_owned();
         Some(AppUiCommand::SubmitPrompt(TurnStartParams {
+            // Ordinary chat turn: context-scoped tools stay unadvertised.
+            tool_context: None,
             session_id,
             turn_id,
             input: vec![InputItem::Text { text: prompt }],
@@ -2115,6 +2179,20 @@ impl Store {
                     agent_id,
                 }))
             }
+            AgentsCommand::Spawn { count, prompt } => {
+                if self.state.active_turn().is_some() {
+                    self.state.status = t!("status.cannot_spawn_active_turn").into_owned();
+                    return None;
+                }
+                if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_AGENT_LIST) {
+                    return None;
+                }
+                let text =
+                    t!("status.spawn_agents_turn", count = count, prompt = prompt).into_owned();
+                let status =
+                    t!("status.spawning_agents", count = count, prompt = prompt).into_owned();
+                self.start_prompt_turn(text, status)
+            }
         }
     }
 
@@ -2204,18 +2282,38 @@ impl Store {
 
     fn dispatch_loop_command(&mut self, cmd: crate::autonomy::LoopCommand) -> Option<AppUiCommand> {
         use crate::autonomy::{LoopCadence, LoopCommand};
+
+        // `/loop list` 是全局查询，不需要绑定到当前 session。
+        // 如果没有活跃 session，session_id 为 None，服务端会返回所有 loop。
+        if matches!(cmd, LoopCommand::List) {
+            if !self.require_appui_method(crate::model::APPUI_METHOD_LOOP_LIST) {
+                return None;
+            }
+            self.state.status = t!("status.listing_loops").into_owned();
+            // Only a USER-dispatched list may pop the loops menu when its
+            // result lands — hydration fires the same RPC silently.
+            self.state.pending_loop_list_menu = true;
+            let session_id = self.active_session().map(|session| session.id.clone());
+            // Without a session there is no session profile to read, and the
+            // server would fall back to the `main` profile — filtering out
+            // every loop under the user's actual profile. Fall back to the
+            // launch profile instead (spec task-loop-list-global-decode).
+            let profile_id = self
+                .active_session_profile_id()
+                .or_else(|| self.state.onboarding.launch_profile_id.clone());
+            return Some(AppUiCommand::ListLoops(crate::model::LoopListParams {
+                session_id,
+                profile_id,
+            }));
+        }
+
+        // 其他 loop 命令（create/delete/pause/resume/fire-now）需要活跃 session。
         let session_id = self.active_autonomy_session_id()?;
         let profile_id = self.active_session_profile_id();
         match cmd {
             LoopCommand::List => {
-                if !self.require_appui_method(crate::model::APPUI_METHOD_LOOP_LIST) {
-                    return None;
-                }
-                self.state.status = t!("status.listing_loops").into_owned();
-                Some(AppUiCommand::ListLoops(crate::model::LoopListParams {
-                    session_id,
-                    profile_id,
-                }))
+                // 已在上方处理，此处不会到达
+                None
             }
             LoopCommand::Create { prompt, cadence } => {
                 if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_LOOP_CREATE) {
@@ -2547,6 +2645,32 @@ impl Store {
                     t!("status.inserted_at_cursor", text = text.trim_end()).into_owned();
                 None
             }
+            LocalAction::OpenLoopActions(loop_id) => {
+                self.state.loop_actions_target = Some(loop_id);
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_LOOP_ACTIONS));
+                None
+            }
+            LocalAction::QuickLoopToggle(loop_id) => {
+                // Status is read at KEYPRESS time from the mirror: active
+                // pauses, paused resumes, anything else no-ops. The menu is
+                // deliberately left open — the mutation result refreshes the
+                // mirror and the row flips in place.
+                let status = self
+                    .state
+                    .active_session_loops()
+                    .iter()
+                    .find(|record| record.loop_id == loop_id)
+                    .map(|record| record.status.clone());
+                match status.as_deref() {
+                    Some("active") => {
+                        self.dispatch_loop_command(crate::autonomy::LoopCommand::Pause(loop_id))
+                    }
+                    Some("paused") => {
+                        self.dispatch_loop_command(crate::autonomy::LoopCommand::Resume(loop_id))
+                    }
+                    _ => None,
+                }
+            }
             LocalAction::RunSlashCommand(draft) => {
                 // Codex Enter semantics: run the highlighted command NOW.
                 // Close the popup first so a command that opens its own menu
@@ -2631,6 +2755,11 @@ impl Store {
             }
             LocalAction::ToggleVimMode => {
                 self.dispatch_toggle_vim_mode();
+                self.close_all_menus();
+                None
+            }
+            LocalAction::SetSteerMidTurn => {
+                self.dispatch_set_steer_mid_turn(inline_args.unwrap_or_default());
                 self.close_all_menus();
                 None
             }
@@ -3219,6 +3348,7 @@ impl Store {
             lang,
             scroll_mode,
             self.state.vim_mode,
+            self.state.steer_mid_turn,
         ) {
             Ok(()) => {
                 self.state.status =
@@ -3241,6 +3371,45 @@ impl Store {
             t!("vimmode.enabled").into_owned()
         } else {
             t!("vimmode.disabled").into_owned()
+        };
+    }
+
+    /// `/steer` — runtime switch for what Enter means while a turn is
+    /// running. Bare command toggles; `on`/`off` set explicitly. On: a
+    /// mid-turn prompt is INJECTED into the running turn (`turn/steer`) and
+    /// the model pivots to it. Off (the default): mid-turn prompts queue
+    /// FIFO and each runs as its OWN turn, in the order typed. Status-row
+    /// only (persist with `/saveconfig`).
+    fn dispatch_set_steer_mid_turn(&mut self, inline_args: &str) {
+        let arg = inline_args.trim().to_ascii_lowercase();
+        let steer = match arg.as_str() {
+            "" => !self.state.steer_mid_turn,
+            "on" | "true" | "enable" | "enabled" => true,
+            "off" | "false" | "disable" | "disabled" => false,
+            other => {
+                self.state.status = t!("steer.unknown", value = other.to_string()).into_owned();
+                return;
+            }
+        };
+        self.state.steer_mid_turn = steer;
+        self.state.status = if steer {
+            let supported = self
+                .state
+                .capabilities
+                .as_ref()
+                .is_some_and(|capabilities| {
+                    capabilities.supports_method(crate::model::APPUI_METHOD_TURN_STEER)
+                });
+            if supported {
+                t!("steer.enabled").into_owned()
+            } else {
+                // Honest status: the flag is set, but THIS server cannot
+                // steer — prompts keep queueing until a capable server is
+                // connected (the flag then engages without re-toggling).
+                t!("steer.enabled_unsupported").into_owned()
+            }
+        } else {
+            t!("steer.disabled").into_owned()
         };
     }
 
@@ -5712,6 +5881,22 @@ impl Store {
             || self.select_active_menu_item_by_id("provider.current")
     }
 
+    /// RIGHT-arrow secondary action: dispatch the selected row's
+    /// `right_action` if it declares one. Unlike Enter's accept path this
+    /// never closes the menu — quick verbs act in place.
+    pub fn trigger_menu_right_action(&mut self) -> Option<AppUiCommand> {
+        let action = match self.state.active_menu.as_ref() {
+            Some(crate::menu::MenuBuildResult::Ready(spec)) => self
+                .state
+                .menu_stack
+                .active()
+                .and_then(|frame| spec.items.get(frame.selected_index))
+                .and_then(|item| item.right_action.clone()),
+            _ => None,
+        }?;
+        self.dispatch_menu_action(action)
+    }
+
     pub fn accept_active_menu_item(&mut self) -> Option<AppUiCommand> {
         let selected_index = self
             .state
@@ -6022,6 +6207,15 @@ impl Store {
             context_window_usage: selected_session
                 .and_then(|session| crate::app::context_window_usage(&self.state, &session.id)),
             agents: self.state.active_session_agents(),
+            loops: self.state.active_session_loops(),
+            loop_actions_target: self.state.loop_actions_target.as_deref(),
+            now_ms: i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or_default(),
+            )
+            .ok(),
             unseen_agent_ids: self.state.active_session_unseen_agents(),
             chat_view_agent_id: match &self.state.chat_view {
                 crate::model::ChatViewTarget::Agent(id) => Some(id.as_str()),
@@ -6147,7 +6341,7 @@ impl Store {
     /// the transport runs locally off the render loop. An empty `!` is a usage
     /// warning with no exec.
     ///
-    /// The command runs on the machine octos-tui runs on, NOT the agent's
+    /// The command runs on the machine octoscode runs on, NOT the agent's
     /// sandboxed server `shell` tool, and its output is ephemeral — shown in
     /// the chip only, never injected into the next turn's context.
     fn dispatch_bang_command(&mut self, cmd: &str) -> Option<AppUiCommand> {
@@ -6172,13 +6366,36 @@ impl Store {
         // Label the card with the cwd the command runs in (#364): the child
         // inherits THIS process's working directory (see the transport's
         // `spawn_local_shell`), so the running chip can already say where.
-        let detail = local_shell_card_detail(cmd, local_shell_cwd_display().as_deref());
-        self.state.push_activity(
-            ActivityItem::new(ActivityKind::Tool, "!", running.clone())
-                .with_detail(detail)
-                .with_tool_call(local_id.clone()),
-        );
-        self.state.focus = FocusPane::Tasks;
+        // `cmd`/cwd are terminal-tainted input for the transcript — sanitize
+        // at composition (codex on #513: output was sanitized, labels not).
+        let clean_cmd = crate::sanitize::strip_terminal_controls(cmd).into_owned();
+        let detail = local_shell_card_detail(&clean_cmd, local_shell_cwd_display().as_deref());
+        let clean_detail = crate::sanitize::strip_terminal_controls(&detail).into_owned();
+        // The bang is a REPORT for its WHOLE lifecycle (running → settled),
+        // not a Tool chip (codex round on #513). Reports are the
+        // turn-independent client-local output surface: they render idle AND
+        // mid-turn unconditionally, and they are excluded from turn-flow
+        // activity, turn archival, and agent-task action counts — a Tool
+        // chip was invisible idle (turn flow never shows), and attaching it
+        // to the live turn corrupted turn-terminal capture in both orderings
+        // (running chip archived as "interrupted" with the result orphaned;
+        // settled report swept out of live activity by terminal capture).
+        let mut chip = ActivityItem::new(ActivityKind::Report, format!("! {clean_cmd}"), running)
+            .with_detail(clean_detail)
+            .with_tool_call(local_id.clone())
+            // Sticky: a busy turn's tool flood must not evict the chip before
+            // its result lands (same rationale as the compaction notice).
+            .with_sticky();
+        // Stamp the session so the report stays out of OTHER sessions'
+        // transcripts; deliberately NO turn attachment (see above).
+        if let Some(session) = self.active_session() {
+            chip = chip.with_session(session.id.clone());
+        }
+        self.state.push_activity(chip);
+        // Keep the composer focused: the old dispatch parked focus on the
+        // Tasks dock, which shows "No tasks yet" for a bang (it is an
+        // activity chip, not a task) — an empty pane where the user expected
+        // output.
         self.state.status = format!("! {cmd}");
         self.state.scroll_transcript_to_latest();
 
@@ -6203,17 +6420,178 @@ impl Store {
         // transport ACTUALLY ran in (carried on the event); fall back to this
         // process's cwd — same process, so the same directory — when unset.
         let cwd = event.cwd.clone().or_else(local_shell_cwd_display);
-        let detail = local_shell_card_detail(&event.cmdline, cwd.as_deref());
-        self.state.update_tool_activity(
-            &event.local_id,
-            status.clone(),
-            Some(detail),
-            Some(output),
-            Some(success),
-            Some(event.duration_ms),
-        );
-        self.state.status = format!("! {} ({status})", event.cmdline);
+        // cmdline/cwd are terminal-tainted; sanitize at composition like the
+        // output (codex on #513).
+        let clean_cmd = crate::sanitize::strip_terminal_controls(&event.cmdline).into_owned();
+        let detail = local_shell_card_detail(&clean_cmd, cwd.as_deref());
+        let clean_detail = crate::sanitize::strip_terminal_controls(&detail).into_owned();
+        let sanitized_output = crate::sanitize::strip_terminal_controls(&output).into_owned();
+        let report_title = format!("! {clean_cmd}");
+        let report_detail = format!("{clean_detail}\n{sanitized_output}");
+
+        // Settle the running report IN PLACE — or, when its chip is gone
+        // (evicted by the activity cap, or dropped by a snapshot rebuild
+        // mid-run — codex on #513), push a FALLBACK report so the output is
+        // never silently lost.
+        let settled_session = if let Some(item) = self
+            .state
+            .activity
+            .iter_mut()
+            .rev()
+            .find(|item| item.tool_call_id.as_deref() == Some(event.local_id.as_str()))
+        {
+            item.status = status.clone();
+            item.success = Some(success);
+            item.duration_ms = Some(event.duration_ms);
+            item.title = report_title;
+            item.detail = Some(report_detail);
+            item.output_preview = Some(sanitized_output);
+            item.session_id.clone()
+        } else {
+            let mut fallback =
+                ActivityItem::new(ActivityKind::Report, report_title, status.clone())
+                    .with_detail(report_detail)
+                    .with_tool_call(event.local_id.clone())
+                    .with_sticky();
+            let session_id = self.active_session().map(|session| session.id.clone());
+            if let Some(session_id) = session_id.clone() {
+                fallback = fallback.with_session(session_id);
+            }
+            fallback.success = Some(success);
+            fallback.duration_ms = Some(event.duration_ms);
+            self.state.push_activity(fallback);
+            session_id
+        };
+
+        // Retention: keep only the LATEST SETTLED bang report PER SESSION so
+        // repeated commands don't pin an unbounded stack of output blocks
+        // into the live tail. Codex on #513 refuted the first cut here:
+        // pruning ran BEFORE the completing chip was located (a late result
+        // for an evicted chip deleted another bang's report and produced
+        // nothing), it was global (a background session's completion deleted
+        // the FOCUSED session's report), and it matched on kind alone.
+        // Now: runs after settle, scoped to the completing report's session,
+        // and spares in-flight reports structurally (`success.is_none()` —
+        // never a localized status-string match).
+        self.state.activity.retain(|item| {
+            let is_other_settled_bang_report = item.kind == ActivityKind::Report
+                && item.success.is_some()
+                && item
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("local-shell:"))
+                && item.tool_call_id.as_deref() != Some(event.local_id.as_str());
+            !(is_other_settled_bang_report && item.session_id == settled_session)
+        });
+        self.state.status = format!("! {clean_cmd} ({status})");
         self.state.scroll_transcript_to_latest();
+    }
+
+    /// Detect image-file references in a submitted prompt and stage them as
+    /// turn media. Terminals cannot deliver pasted image BYTES (bracketed
+    /// paste is text-only), so the PATH is the paste surface: drag-drop into
+    /// the terminal, a pasted path, and the `@` file picker all leave an
+    /// image path in the prompt text. The server's vision pipeline consumes
+    /// these directly — a plain filesystem path passes
+    /// `materialize_turn_uploads` unchanged (Passthrough), lands on
+    /// `Message.media`, and the provider encoders turn it into image parts.
+    ///
+    /// Extension set mirrors the server's `vision::is_image` — attaching
+    /// anything else would be silently dropped by the vision filter.
+    fn image_media_from_prompt(prompt: &str) -> Vec<octos_core::ui_protocol::FileRef> {
+        /// Bound the attach count so a payload cannot balloon.
+        const MAX_TURN_IMAGES: usize = 4;
+        /// Bound the candidate scan independently of successes: a prompt with
+        /// thousands of `@…png` tokens must not run thousands of stat syscalls
+        /// on the UI thread.
+        const MAX_CANDIDATES: usize = 32;
+        /// Per-file byte ceiling. The server reads+base64s the whole file
+        /// synchronously in `vision::encode_image`; a multi-hundred-MB file
+        /// would block the executor and blow the wire payload. 20 MB comfortably
+        /// covers real screenshots/photos.
+        const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+        fn image_mime(path: &str) -> Option<&'static str> {
+            let lower = path.to_ascii_lowercase();
+            if lower.ends_with(".png") {
+                Some("image/png")
+            } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+                Some("image/jpeg")
+            } else if lower.ends_with(".gif") {
+                Some("image/gif")
+            } else if lower.ends_with(".webp") {
+                Some("image/webp")
+            } else {
+                None
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut media = Vec::new();
+        let mut candidates = 0usize;
+        for raw in prompt.split_whitespace() {
+            // INTENT SIGNAL (codex security review): only an EXPLICIT `@path`
+            // attaches — a bare filename that merely happens to exist in cwd
+            // stays text. Without this, `rename foo.png to bar.png` would ship
+            // both files, a `@`-less peer result routed through `/gather` could
+            // egress a client-local file with no user action, and a symlink
+            // named `x.png` could exfiltrate its target. The `@` picker inserts
+            // exactly this form; a user typing `@` is asserting intent.
+            let trimmed = raw.trim_matches(|c| {
+                matches!(c, '"' | '\'' | '`' | ',' | ';' | '(' | ')' | '[' | ']')
+            });
+            let Some(token) = trimmed.strip_prefix('@') else {
+                continue;
+            };
+            if token.is_empty() {
+                continue;
+            }
+            let Some(mime) = image_mime(token) else {
+                continue;
+            };
+            candidates += 1;
+            if candidates > MAX_CANDIDATES {
+                break;
+            }
+            let path = std::path::Path::new(token);
+            let abs = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                // The TUI process cwd — the directory `!`-bang commands run in
+                // and, for a local `--stdio --solo` serve, the same filesystem
+                // the server reads. (Remote/hosted serves cannot read a
+                // client-local path; upload support is a follow-up.)
+                match std::env::current_dir() {
+                    Ok(cwd) => cwd.join(path),
+                    Err(_) => continue,
+                }
+            };
+            // NO-FOLLOW: reject a symlink outright rather than reading its
+            // target. `@screenshot.png` pointing at `~/.ssh/id_ed25519` must
+            // not egress the key to the model (codex security review).
+            let Ok(meta) = std::fs::symlink_metadata(&abs) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                continue;
+            }
+            if meta.len() == 0 || meta.len() > MAX_IMAGE_BYTES {
+                continue;
+            }
+            // Dedupe on the CANONICAL path so `@a.png` and `@./a.png` are one.
+            let canonical = std::fs::canonicalize(&abs).unwrap_or(abs);
+            let abs_str = canonical.to_string_lossy().into_owned();
+            if !seen.insert(abs_str.clone()) {
+                continue;
+            }
+            media.push(octos_core::ui_protocol::FileRef {
+                path: abs_str,
+                mime: mime.to_owned(),
+                size_bytes: meta.len(),
+            });
+            if media.len() >= MAX_TURN_IMAGES {
+                break;
+            }
+        }
+        media
     }
 
     fn start_prompt_turn(
@@ -6254,11 +6632,20 @@ impl Store {
             .session_reasoning_effort
             .get(&session_id)
             .copied();
+        // Route-1 image attach: existing image paths in the prompt (pasted,
+        // drag-dropped, or `@`-picked) ride the turn as media so the vision
+        // pipeline sees them. Text keeps the reference readable either way.
+        let media = Self::image_media_from_prompt(&prompt);
+        if !media.is_empty() {
+            self.state.status = t!("status.images_attached", count = media.len()).into_owned();
+        }
         Some(AppUiCommand::SubmitPrompt(TurnStartParams {
+            // Ordinary chat turn: context-scoped tools stay unadvertised.
+            tool_context: None,
             session_id,
             turn_id,
             input: vec![InputItem::Text { text: prompt }],
-            media: Vec::new(),
+            media,
             topic: None,
             rewrite_for: None,
             reasoning_effort,
@@ -7054,6 +7441,11 @@ impl Store {
         };
 
         self.state.diff_preview.open_loading(preview_id.clone());
+        // Move focus out of the composer so the diff-view keys
+        // (`[`/`]`/`c`/`v`) become active — they are gated on
+        // `focus != FocusPane::Composer` to preserve text input.
+        // Esc (close_modal) restores focus to Composer.
+        self.state.focus = FocusPane::Transcript;
         self.state.status = t!("status.requested_diff_preview").into_owned();
         Some(AppUiCommand::GetDiffPreview(DiffPreviewGetParams {
             session_id,
@@ -7498,7 +7890,6 @@ impl Store {
         use crate::client_event::AutonomyResult;
         match event.result {
             AutonomyResult::AgentList(result) => {
-                let count = result.agents.len();
                 // Stuck-chip reconnect safety net: on session reopen the
                 // `agent/list` snapshot carries the authoritative terminal
                 // status for each background agent. Reconcile any stale
@@ -7509,6 +7900,24 @@ impl Store {
                 for agent in &result.agents {
                     self.reconcile_task_from_agent_record(&result.session_id, agent);
                 }
+                // Count only non-terminal agents so the reported count goes to
+                // 0 once all spawned agents complete (rather than staying at N
+                // forever because terminal agents are still in the list).
+                //
+                // NOTE: deliberately NO per-agent activity chip here. `agent/list`
+                // is auto-fired by `hydrate_autonomy_state_commands` on every
+                // session open/reconnect, and `push_activity` is an append with
+                // no dedup behind an 80-item cap — so pushing one chip per agent
+                // per result floods the feed and evicts meaningful rows. The
+                // `AgentUpdated` arm already emits exactly this chip as each
+                // agent reports in; that is the single producer.
+                let count = result
+                    .agents
+                    .iter()
+                    .filter(|a| {
+                        crate::model::terminal_task_state_from_agent_status(&a.status).is_none()
+                    })
+                    .count();
                 self.state
                     .set_session_agents(&result.session_id, result.agents);
                 self.state.status = t!("status.agent_list_refreshed", count = count).into_owned();
@@ -7680,10 +8089,102 @@ impl Store {
                 // `set_session_loops`), not the raw response length —
                 // otherwise the acknowledgment can claim "N loop(s)"
                 // while the indicator shows fewer (codex P2).
-                let count = self
-                    .state
-                    .set_session_loops(&result.session_id, result.loops);
+                // Spec task-loop-list-transcript: render the list INTO the
+                // transcript — a bare status-bar count left loop ids
+                // unobtainable, so every id-taking verb was unusable.
+                let block =
+                    crate::app::format_loop_list_block(&result.loops, result.session_id.is_none());
+                let report_session_id = result.session_id.clone();
+                // Spec task-loop-list-global-decode: a SCOPED query is
+                // authoritative for its one session (replace wholesale); a
+                // GLOBAL query returns loops from many sessions, so each
+                // record lands in ITS OWN session's mirror. Sessions absent
+                // from a global response keep their loops — the response is
+                // profile-filtered and therefore not authoritative for them.
+                let scoped = result.session_id.is_some();
+                let count = match result.session_id.as_ref() {
+                    Some(session_id) => self.state.set_session_loops(session_id, result.loops),
+                    None => {
+                        // A global response is authoritative for the profile
+                        // the server RESOLVED — and only that profile. Clear
+                        // those mirrors first so deletions/expiries actually
+                        // disappear; without this the indicator row kept
+                        // showing loops the server no longer reports, while
+                        // the status bar claimed "0 loop(s)".
+                        if let Some(scope) = result.profile_id.as_deref() {
+                            for entry in self.state.session_autonomy.iter_mut() {
+                                if entry.session_id.profile_id() == Some(scope) {
+                                    entry.loops.clear();
+                                }
+                            }
+                        }
+                        let mut grouped: std::collections::HashMap<
+                            SessionKey,
+                            Vec<octos_core::ui_protocol::UiLoopRecord>,
+                        > = std::collections::HashMap::new();
+                        for record in result.loops {
+                            grouped
+                                .entry(record.session_id.clone())
+                                .or_default()
+                                .push(record);
+                        }
+                        grouped
+                            .into_iter()
+                            .map(|(session_id, loops)| {
+                                self.state.set_session_loops(&session_id, loops)
+                            })
+                            .sum()
+                    }
+                };
+                // Upstream main opens the loops menu here so each loop's
+                // actions (pause/resume/delete/fire) are directly reachable.
+                // Keep that for SCOPED queries — the menu reads the ACTIVE
+                // session's mirror, which is exactly what a scoped query
+                // refreshed. A GLOBAL (no-session) query has no active
+                // session to read, so the menu would come up unavailable
+                // and stomp the status; the transcript block below is the
+                // global surface. Status is set AFTER opening: `open_menu`
+                // overwrites `state.status` with the menu label.
+                // Consume the flag unconditionally: a global result must not
+                // leave it armed for a later hydration result to trip over.
+                let user_requested = std::mem::take(&mut self.state.pending_loop_list_menu);
+                // Menu-first (user feedback 2026-08-08): the menu is LIVE
+                // (rebuilt from the mirror on every refresh) while a transcript
+                // report is a frozen snapshot — showing both lets them drift
+                // apart after any mutation. A scoped user query gets ONLY the
+                // menu (its Unavailable card covers the empty case); the
+                // transcript report below is reserved for GLOBAL (no-session)
+                // queries, which the menu cannot serve — it reads the active
+                // session's mirror. Hydration (user_requested=false) stays
+                // silent either way.
+                if scoped && user_requested {
+                    self.open_menu(MenuId::from(crate::menu::registry::MENU_LOOPS));
+                }
                 self.state.status = t!("status.loop_list_refreshed", count = count).into_owned();
+                // A loop list is a local transcript REPORT, not runtime/tool
+                // activity. Report rendering bypasses agent-task grouping,
+                // settled collapse, and Tool preview limits so every id remains
+                // visible in the default UI.
+                if scoped {
+                    return None;
+                }
+                let title = t!("status.loop_list_title").into_owned();
+                // A list is a snapshot of CURRENT state, not a log: drop any
+                // earlier loop-list report (scoped or global) so exactly one —
+                // the latest — remains pinned in the transcript.
+                self.state
+                    .activity
+                    .retain(|item| !(item.kind == ActivityKind::Report && item.title == title));
+                let mut report = ActivityItem::new(
+                    ActivityKind::Report,
+                    title,
+                    t!("status.loop_list_refreshed", count = count).into_owned(),
+                )
+                .with_detail(block);
+                if let Some(session_id) = report_session_id {
+                    report = report.with_session(session_id);
+                }
+                self.state.push_activity(report);
             }
             AutonomyResult::LoopMutation { method, result } => {
                 let loop_id = result.loop_id.clone();
@@ -7847,7 +8348,7 @@ impl Store {
         }
         if capabilities.supports_method(crate::model::APPUI_METHOD_LOOP_LIST) {
             commands.push(AppUiCommand::ListLoops(crate::model::LoopListParams {
-                session_id: session_id.clone(),
+                session_id: Some(session_id.clone()),
                 profile_id,
             }));
         }
@@ -9598,12 +10099,27 @@ impl Store {
                 lane_save_completed = true;
             }
         }
+        // A persisted lane is NOT live until the server restarts, and the
+        // wizard path is the only one that said so (`status.research_lane_saved`
+        // carries "restart to apply"). An inline `/research add` fell through to
+        // the bare server message, so the lane looked active while
+        // deep_research kept resolving `cheap`/`strong` to the coding provider.
+        // Say it on every applied mutation the wizard did not already announce.
+        let message = if event.result.restart_required && !lane_save_completed {
+            t!(
+                "status.sub_provider_restart_required",
+                message = event.message
+            )
+            .into_owned()
+        } else {
+            event.message.clone()
+        };
         self.state.push_activity(ActivityItem::new(
             ActivityKind::Progress,
             "research",
-            event.message.clone(),
+            message.clone(),
         ));
-        self.state.status = event.message;
+        self.state.status = message;
         if lane_save_completed {
             self.refresh_active_menu_if_open();
             self.focus_provider_start_row();
@@ -9920,10 +10436,16 @@ impl Store {
                 .map(|live_reply| live_reply.turn_id.clone());
             if let (Some(turn_id), Some(current_turn)) = (event.turn_id.clone(), current_turn) {
                 if turn_id == current_turn {
+                    // The word normally arrives in `label` (the pinned
+                    // server's rotator shape); accept `message` as fallback
+                    // so a message-only status_word is stored rather than
+                    // silently dropped (codex on #512: with the status-line
+                    // gate, a message-only word had NO surface at all).
                     match event
                         .metadata
                         .label
                         .as_deref()
+                        .or(event.metadata.message.as_deref())
                         .map(str::trim)
                         .filter(|word| !word.is_empty())
                     {
@@ -9961,7 +10483,16 @@ impl Store {
             return None;
         }
 
-        if !is_noisy_progress_status(&status) {
+        // The persona status word's home is the HARNESS line (stored in
+        // `session_status_word` above, where it replaces the Working phase).
+        // It carries its word in `label`, so it is not bare-kind — exclude it
+        // here explicitly or the same word renders on two lines at once.
+        let is_status_word =
+            event.metadata.kind == octos_core::ui_protocol::progress_kinds::STATUS_WORD;
+        if !is_status_word
+            && !is_noisy_progress_status(&status)
+            && !progress_metadata_is_bare_kind(&event.metadata)
+        {
             self.state.status = status;
         }
         None
@@ -9969,7 +10500,7 @@ impl Store {
 
     fn apply_notification(&mut self, notification: UiNotification) -> Option<AppUiCommand> {
         match notification {
-            // #1477 voice rich-output visual lifecycle. octos-tui does not yet
+            // #1477 voice rich-output visual lifecycle. octoscode does not yet
             // render generated visuals (a separate feature); ignore gracefully
             // so newer servers that emit these don't wedge the client.
             UiNotification::VisualGenerating(_)
@@ -9993,6 +10524,17 @@ impl Store {
                     brief_path: event.brief_path,
                     cwd: event.cwd,
                     worktree_branch: event.worktree_branch,
+                    profile_id: event.profile_id,
+                })
+            }
+            // Core 34d971d7: `peer/closed` decodes to this typed variant on
+            // newer cores. Route to the same handler the raw-frame intercept
+            // uses (mirror of the PeerStaged dual path above).
+            UiNotification::PeerClosed(event) => {
+                self.apply_peer_closed_event(crate::model::PeerClosedParams {
+                    session_id: event.session_id,
+                    topic: event.topic,
+                    slug: event.slug,
                     profile_id: event.profile_id,
                 })
             }
@@ -10199,6 +10741,17 @@ impl Store {
                 // on turn so a stale/continuation TurnStarted for a DIFFERENT
                 // turn cannot drop a newer staged submit's gate.
                 self.release_staged_gate_for_turn(&event.session_id, &event.turn_id);
+                // Spec task-loop-liveness-indicator: an armed loop fire claims
+                // THIS turn, so its activity group renders the ↻ attribution.
+                if self
+                    .state
+                    .pending_loop_attribution
+                    .remove(&event.session_id)
+                {
+                    self.state
+                        .loop_attributed_turns
+                        .insert((event.session_id.clone(), event.turn_id.clone()));
+                }
                 // The pre-first-token window is over for this session — the
                 // live_reply bound below carries the in-progress signal now.
                 self.state.pre_token_turns.remove(&event.session_id);
@@ -10420,6 +10973,9 @@ impl Store {
                 let diff_preview_id = approval.diff_preview_id();
                 let diff_preview_turn_id = approval.turn_id.clone();
                 self.state.approval = Some(approval);
+                // Salience (spec task-approval-ux-salience): a live decision
+                // arrival rings the terminal bell once via the event loop.
+                self.state.pending_decision_bell = true;
                 self.state.focus = FocusPane::Composer;
                 self.state.set_run_state_blocked(title.clone());
                 self.state.status = t!("status.approval_requested", title = title).into_owned();
@@ -10489,6 +11045,10 @@ impl Store {
             // but v2-only servers never emit it and the TUI intentionally does
             // not render it.
             UiNotification::Envelope(_) => None,
+            // Added by octos-core v2.0.3-rc.1; no client surface yet, so
+            // drop it rather than guess at a rendering. (PeerClosed, added in
+            // the same core rev, IS handled above by the peer console.)
+            UiNotification::SkillActionJobUpdated(_) => None,
             UiNotification::EnvelopeV2(event) => self.apply_envelope_v2(event),
             UiNotification::SessionEventBridged(event) => self.apply_session_event_bridged(event),
             UiNotification::RouterStatus(event) => {
@@ -10543,9 +11103,13 @@ impl Store {
                 // statuses flip the task — a "running" record must never
                 // resurrect a task the client already saw go terminal.
                 self.reconcile_task_from_agent_record(&event.session_id, &event.agent);
+                // Stamp the OWNING session: `agent/updated` arrives for
+                // background sessions too, and an unstamped chip renders in
+                // whichever session is focused.
                 self.state.push_activity(
                     ActivityItem::new(ActivityKind::Progress, title, status_label)
-                        .with_detail(detail),
+                        .with_detail(detail)
+                        .with_session(event.session_id.clone()),
                 );
                 // Don't churn the status bar with "Agent status refreshed: …" on
                 // every agent-status event — during a multi-agent turn that floods
@@ -10710,6 +11274,17 @@ impl Store {
                     self.state
                         .upsert_session_loop(&event.session_id, loop_state);
                 }
+                // Spec task-loop-liveness-indicator: count the fire (the
+                // server keeps no such counter) and arm attribution so the
+                // turn this fire starts is marked as loop-driven.
+                *self
+                    .state
+                    .loop_fire_counts
+                    .entry((event.session_id.clone(), event.loop_id.clone()))
+                    .or_insert(0) += 1;
+                self.state
+                    .pending_loop_attribution
+                    .insert(event.session_id.clone());
                 self.state.push_activity(ActivityItem::new(
                     ActivityKind::Progress,
                     event.loop_id,
@@ -11228,6 +11803,46 @@ impl Store {
                     .find(|segment| segment.id == assistant_segment_id)
                     .cloned()
             });
+        // Containment guard (#471): a canonical row replayed AFTER the whole
+        // turn already streamed over the legacy lane, whose text the live
+        // buffer already contains verbatim. Keep the buffer and record the
+        // segment as satisfied — do NOT clear + re-seed.
+        //
+        // The rebuild is not harmless even when the content is identical: a
+        // tool-using turn persists multiple segments (preamble, final answer)
+        // and re-seeding joins them WITHOUT the glue the legacy stream carried
+        // ("…first:\n\nHere…" became "…first:Here…"). That is a NON-PREFIX
+        // rewrite of a buffer whose stable prefix the inline viewport may have
+        // already flushed into immutable native scrollback. The flush
+        // watermark then (correctly) freezes, commit-time coverage (correctly)
+        // fails to match the committed message against the flushed text, and
+        // the committed block re-renders everything the user already read —
+        // the answer on screen twice. The store cannot see the watermark
+        // (viewport-owned), but containment makes that unnecessary: keeping
+        // the buffer byte-identical is prefix-safe by construction, and the
+        // canonical content is verbatim on screen already. The next hydrate
+        // still replaces committed history with the server projection.
+        if known_segment.is_none() {
+            let sanitized = crate::sanitize::strip_terminal_controls(&text);
+            if !sanitized.trim().is_empty()
+                && let Some(start_offset) = self
+                    .find_session(session_id)
+                    .and_then(|session| session.live_reply.as_ref())
+                    .filter(|live_reply| &live_reply.turn_id == turn_id)
+                    .and_then(|live_reply| live_reply.text.find(sanitized.as_ref()))
+            {
+                self.state
+                    .v2_live_assistant_segments
+                    .entry(key.clone())
+                    .or_default()
+                    .push(V2AssistantSegment {
+                        id: assistant_segment_id,
+                        start_offset,
+                        finalized: true,
+                    });
+                return;
+            }
+        }
         // Double-render fix (#379 review F1): on stdio the turn streams over
         // the LEGACY lane, so the live reply already holds this very text but
         // NO v2 segment was ever recorded. This persisted row is the CANONICAL
@@ -11493,11 +12108,19 @@ impl Store {
                             session_result: None,
                         })
                     }
-                    TurnTerminalOutcome::Errored | TurnTerminalOutcome::Interrupted => {
+                    // RateLimited (octos-core v2.0.3-rc.1) is a terminal
+                    // FAILURE: the turn ended with no answer, so it must
+                    // settle the live reply like Errored — never be left
+                    // unhandled, which would pin "Working" forever.
+                    TurnTerminalOutcome::Errored
+                    | TurnTerminalOutcome::RateLimited
+                    | TurnTerminalOutcome::Interrupted => {
                         let is_interrupted = outcome == TurnTerminalOutcome::Interrupted;
                         let error = error.unwrap_or_else(|| {
                             let (code, message) = if is_interrupted {
                                 ("interrupted", "Turn interrupted.")
+                            } else if outcome == TurnTerminalOutcome::RateLimited {
+                                ("rate_limited", "Provider rate limited the turn.")
                             } else {
                                 ("turn_errored", "Turn errored.")
                             };
@@ -11742,6 +12365,9 @@ impl Store {
         picker.visible = true;
         self.state.user_question_auto_open = true;
         self.state.user_question = Some(picker);
+        // Salience (spec task-approval-ux-salience): a live decision arrival
+        // rings the terminal bell once via the event loop.
+        self.state.pending_decision_bell = true;
         // A mid-turn question must interrupt whatever the main pane is showing:
         // exit any sub-agent peek so the picker owns the screen and its keys
         // reach `handle_user_question_key`, not `handle_agent_peek_key`.
@@ -11804,6 +12430,14 @@ impl Store {
     }
 
     fn apply_task_update(&mut self, event: TaskUpdatedEvent) {
+        // First-seen clock for the sub-agent chip's elapsed display (spec
+        // task-approval-ux-salience). Recorded before the session borrow.
+        if matches!(task_state_label(event.state), "pending" | "running") {
+            self.state
+                .task_first_seen
+                .entry(event.task_id.clone())
+                .or_insert_with(std::time::Instant::now);
+        }
         let Some(session) = self.find_session_mut(&event.session_id) else {
             return;
         };
@@ -12147,6 +12781,11 @@ impl Store {
     }
 
     fn fail_live_reply(&mut self, event: TurnErrorEvent) -> Option<AppUiCommand> {
+        // Spec task-quota-exhausted-card: mark quota terminals so the status
+        // bar renders the amber Quota state instead of the generic Error.
+        if classify_quota_failure(&event.code, &event.message).is_some() {
+            self.state.quota_exhausted = true;
+        }
         self.state.pre_token_turns.remove(&event.session_id);
         // The interrupt landed (this IS its terminal), so the withheld-output
         // flag has done its job — drop it so it can never outlive the turn. No
@@ -13055,6 +13694,16 @@ impl Store {
     }
 
     fn turn_error_fallback_message(&self, turn_id: &TurnId, code: &str, message: &str) -> String {
+        // Spec task-quota-exhausted-card: quota exhaustion is an expected
+        // resource state, not a crash — render the friendly card (provider
+        // chip + top-up link + next actions) instead of the raw error dump.
+        if let Some(quota) = classify_quota_failure(code, message) {
+            let provider = quota
+                .provider_model
+                .unwrap_or_else(|| t!("status.quota_card_provider_unknown").into_owned());
+            let link = quota.link.map(|url| format!("  {url}")).unwrap_or_default();
+            return t!("status.quota_card", provider = provider, link = link).into_owned();
+        }
         let summary = self.summarize_turn_activity(turn_id);
         let failed = format_limited_list(&summary.failures, &t!("status.summary_none_recorded"));
         t!(
@@ -13119,7 +13768,10 @@ impl Store {
                         );
                     }
                 }
-                ActivityKind::Approval | ActivityKind::Warning | ActivityKind::Error => {}
+                ActivityKind::Report
+                | ActivityKind::Approval
+                | ActivityKind::Warning
+                | ActivityKind::Error => {}
             }
         }
         summary
@@ -13139,7 +13791,10 @@ impl Store {
                                 .as_deref()
                                 .is_some_and(|detail| detail.contains("diff preview ready"))
                     }
-                    ActivityKind::Approval | ActivityKind::Warning | ActivityKind::Error => false,
+                    ActivityKind::Report
+                    | ActivityKind::Approval
+                    | ActivityKind::Warning
+                    | ActivityKind::Error => false,
                 }
         })
     }
@@ -14104,6 +14759,21 @@ fn progress_status(event: &UiProgressEvent) -> String {
     }
 
     format!("Progress: {}", metadata.kind)
+}
+
+/// True when a progress event's metadata carries nothing but its `kind` —
+/// i.e. `progress_status` would hit its `Progress: {kind}` fallback. The
+/// status LINE only shows progress with user-facing content: a bare kind echo
+/// ("Progress: thinking") next to the Working spinner is double narration.
+/// The fallback string still titles activity-log rows for kinds that record
+/// activity, so this gates only the status-line assignment. Mirrors the
+/// branch order of [`progress_status`].
+fn progress_metadata_is_bare_kind(metadata: &octos_core::ui_protocol::UiProgressMetadata) -> bool {
+    metadata.message.as_deref().is_none_or(str::is_empty)
+        && metadata.retry.is_none()
+        && metadata.file_mutation.is_none()
+        && metadata.token_cost.is_none()
+        && metadata.label.as_deref().is_none_or(str::is_empty)
 }
 
 fn is_noisy_progress_status(status: &str) -> bool {
@@ -16160,6 +16830,7 @@ mod tests {
 
     fn steer_capable_store() -> Store {
         let mut store = store_with_empty_session();
+        store.state.steer_mid_turn = true;
         store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
             crate::model::APPUI_METHOD_TURN_STEER,
         ]));
@@ -16183,6 +16854,126 @@ mod tests {
             },
         )));
         params.turn_id
+    }
+
+    /// The DEFAULT for a prompt typed while the agent is working: stage FIFO
+    /// and run it as its OWN turn after the current one finishes — even when
+    /// the server advertises `turn/steer`. A steer is delivered as a bare
+    /// user message into the RUNNING loop, where the model treats the newest
+    /// instruction as superseding the work in progress — an effective
+    /// interrupt-and-pivot. That redirection is opt-in (`steer_mid_turn`);
+    /// plain Enter means "next, in order", and every prompt gets processed.
+    #[test]
+    fn mid_turn_prompts_stage_fifo_by_default_even_when_steer_capable() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_TURN_STEER,
+        ]));
+        assert!(
+            !store.state.steer_mid_turn,
+            "precondition: steering is opt-in, off by default"
+        );
+        let session_id = store.state.sessions[0].id.clone();
+        let first_turn = start_live_turn(&mut store, "review the design");
+
+        // Two prompts typed while the turn streams: neither may steer or
+        // start a concurrent turn.
+        assert!(
+            store
+                .queue_or_start_prompt_turn("also update the docs".into(), "sent".into())
+                .is_none(),
+            "a mid-turn prompt must stage, not emit a command"
+        );
+        assert!(
+            store
+                .queue_or_start_prompt_turn("then cut a release".into(), "sent".into())
+                .is_none(),
+            "the second mid-turn prompt must stage behind the first"
+        );
+        assert!(
+            store.state.pending_turn_steers.is_empty(),
+            "nothing may enter the steer stash by default"
+        );
+        assert_eq!(
+            store.state.pending_messages,
+            vec![
+                "also update the docs".to_string(),
+                "then cut a release".to_string()
+            ],
+            "both prompts stage FIFO in the order typed"
+        );
+
+        // The running turn finishes → the terminal itself drains ONE prompt,
+        // oldest first (the #233 FIFO gate), returned as the next command.
+        let drained = store
+            .apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+                TurnCompletedEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: first_turn,
+                    cursor: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    session_result: None,
+                },
+            )))
+            .expect("the first staged prompt drains at turn end");
+        assert!(
+            format!("{drained:?}").contains("also update the docs"),
+            "the OLDEST staged prompt runs first, got {drained:?}"
+        );
+        assert_eq!(
+            store.state.pending_messages,
+            vec!["then cut a release".to_string()],
+            "the newer prompt stays queued until the next turn ends"
+        );
+    }
+
+    /// `/steer` — bare toggles, `on`/`off` set, unknown values report usage
+    /// and change nothing. Runtime counterpart of `--steer-mid-turn`.
+    #[test]
+    fn slash_steer_toggles_and_sets_explicitly() {
+        let mut store = steer_capable_store();
+        store.state.steer_mid_turn = false;
+
+        store.dispatch_set_steer_mid_turn("");
+        assert!(store.state.steer_mid_turn, "bare /steer toggles on");
+        assert_eq!(store.state.status, t!("steer.enabled"));
+
+        store.dispatch_set_steer_mid_turn("");
+        assert!(!store.state.steer_mid_turn, "bare /steer toggles back off");
+        assert_eq!(store.state.status, t!("steer.disabled"));
+
+        store.dispatch_set_steer_mid_turn("on");
+        assert!(store.state.steer_mid_turn);
+        store.dispatch_set_steer_mid_turn("off");
+        assert!(!store.state.steer_mid_turn);
+
+        store.dispatch_set_steer_mid_turn("sideways");
+        assert!(
+            !store.state.steer_mid_turn,
+            "an unknown value must not change the mode"
+        );
+        assert!(
+            store.state.status.contains("sideways"),
+            "usage status names the rejected value: {}",
+            store.state.status
+        );
+    }
+
+    /// Turning steer ON against a server without `turn/steer` must say so —
+    /// the flag is set (it engages after reconnecting to a capable server)
+    /// but prompts keep queueing, and a plain "on" status would read as the
+    /// steer silently not working.
+    #[test]
+    fn slash_steer_on_reports_missing_server_capability() {
+        let mut store = store_with_empty_session();
+        assert!(store.state.capabilities.is_none());
+
+        store.dispatch_set_steer_mid_turn("on");
+
+        assert!(store.state.steer_mid_turn, "the flag is still set");
+        assert_eq!(store.state.status, t!("steer.enabled_unsupported"));
     }
 
     /// Live turn + capability → the typed prompt STEERS (expected_turn_id =
@@ -24925,7 +25716,9 @@ now analyzing the bus module"
         let command = store.compose_command();
 
         assert!(command.is_none());
-        assert!(store.state.composer.is_empty());
+        // Draft-kept contract (2026-08-02): the typo stays in the composer for
+        // in-place correction instead of being discarded with the warning.
+        assert_eq!(store.state.composer, "/wat");
         assert!(store.state.pending_messages.is_empty());
         assert!(store.state.sessions[0].messages.is_empty());
         assert_eq!(
@@ -24935,6 +25728,470 @@ now analyzing the bus module"
         let activity = store.state.activity.last().expect("local warning activity");
         assert_eq!(activity.kind, ActivityKind::Warning);
         assert_eq!(activity.title, "local slash command");
+    }
+
+    fn list_loop_record(
+        loop_id: &str,
+        prompt: &str,
+        status: &str,
+    ) -> octos_core::ui_protocol::UiLoopRecord {
+        let now = chrono::Utc::now().timestamp_millis();
+        octos_core::ui_protocol::UiLoopRecord {
+            loop_id: loop_id.into(),
+            session_id: SessionKey("local:test".into()),
+            profile_id: Some("kimi".into()),
+            prompt: prompt.into(),
+            mode: "self_paced".into(),
+            interval_seconds: None,
+            status: status.into(),
+            next_run_at_ms: Some(now + 90_000),
+            last_run_at_ms: None,
+            expires_at_ms: now + 3_600_000,
+            created_at_ms: now,
+            updated_at_ms: now,
+        }
+    }
+
+    fn apply_loop_list(store: &mut Store, loops: Vec<octos_core::ui_protocol::UiLoopRecord>) {
+        apply_loop_list_for_scope(store, Some(SessionKey("local:test".into())), loops);
+    }
+
+    fn apply_loop_list_for_scope(
+        store: &mut Store,
+        session_id: Option<SessionKey>,
+        loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
+    ) {
+        store.apply_autonomy_result(crate::client_event::AutonomyClientEvent {
+            result: crate::client_event::AutonomyResult::LoopList(crate::model::LoopListResult {
+                session_id,
+                profile_id: Some("kimi".into()),
+                loops,
+            }),
+        });
+    }
+
+    #[test]
+    fn loop_list_pushes_transcript_entry_with_ids() {
+        // Spec task-loop-list-transcript: `/loop list` used to store the
+        // result and print a bare count, so loop ids were unobtainable and
+        // /loop pause|resume|delete|fire-now were unusable.
+        let mut store = store_with_empty_session();
+        apply_loop_list_for_scope(
+            &mut store,
+            None,
+            vec![
+                list_loop_record("loop-aaa", "写书", "active"),
+                list_loop_record("loop-bbb", "查 CI", "paused"),
+            ],
+        );
+
+        // Assert the RENDERED transcript, not a data field: an earlier version
+        // stored the list in `detail`, which renders nothing at all.
+        let text = crate::app::debug_render_text(&store.state);
+        assert!(text.contains("loop-aaa"), "first id listed: {text}");
+        assert!(text.contains("loop-bbb"), "second id listed: {text}");
+        assert!(
+            text.contains("active") && text.contains("paused"),
+            "statuses listed: {text}"
+        );
+        let first_row = text
+            .lines()
+            .position(|row| row.contains("loop-aaa"))
+            .expect("first loop has a rendered row");
+        let second_row = text
+            .lines()
+            .position(|row| row.contains("loop-bbb"))
+            .expect("second loop has a rendered row");
+        assert_ne!(first_row, second_row, "each loop gets its own row: {text}");
+        assert!(
+            !text.contains("Agent task completed"),
+            "a local report must not masquerade as an agent task: {text}"
+        );
+        assert_eq!(store.state.status, "Loop list refreshed: 2 loop(s)");
+    }
+
+    #[test]
+    fn loop_list_entry_shows_cadence_and_prompt() {
+        let mut store = store_with_empty_session();
+        apply_loop_list_for_scope(
+            &mut store,
+            None,
+            vec![list_loop_record("loop-aaa", "请你完成这本书", "active")],
+        );
+
+        let text = crate::app::debug_render_text(&store.state);
+        assert!(text.contains("self-paced"), "cadence shown: {text}");
+        // Ratatui's TestBackend stores an empty/space continuation cell after
+        // each double-width CJK glyph. Remove those buffer-only placeholders
+        // before comparing the logical prompt text.
+        let logical_text = text.replace(' ', "");
+        assert!(
+            logical_text.contains("请你完成这本书"),
+            "prompt summary shown: {text}"
+        );
+    }
+
+    #[test]
+    fn loop_list_report_wraps_without_hiding_ids() {
+        let mut store = store_with_empty_session();
+        assert!(!store.state.expanded_tool_outputs, "default collapse state");
+        apply_loop_list_for_scope(
+            &mut store,
+            None,
+            vec![
+                list_loop_record("loop-narrow-a", "整理所有发布说明", "active"),
+                list_loop_record("loop-narrow-b", "检查所有持续集成任务", "paused"),
+            ],
+        );
+
+        let text = crate::app::debug_render_text_with_size(&store.state, 52, 42);
+        assert!(text.contains("loop-narrow-a"), "first id survives: {text}");
+        assert!(text.contains("loop-narrow-b"), "second id survives: {text}");
+        assert!(
+            !text.contains("more line(s) hidden") && !text.contains("行已隐藏"),
+            "reports never use the collapsed Tool preview: {text}"
+        );
+    }
+
+    #[test]
+    fn empty_loop_list_still_explains_how_to_create() {
+        let mut store = store_with_empty_session();
+        apply_loop_list_for_scope(&mut store, None, vec![]);
+
+        let text = crate::app::debug_render_text(&store.state);
+        assert!(
+            text.contains("/loop"),
+            "empty list explains creation: {text}"
+        );
+    }
+
+    #[test]
+    fn repeated_loop_list_keeps_only_latest_report() {
+        // The list is a snapshot of CURRENT state, not a log — stacking stale
+        // snapshots below the fresh one misleads (spec: only the latest
+        // report survives, including across scoped/global queries).
+        let mut store = store_with_empty_session();
+        apply_loop_list_for_scope(
+            &mut store,
+            None,
+            vec![list_loop_record("loop-aaa", "写书", "active")],
+        );
+        apply_loop_list_for_scope(
+            &mut store,
+            None,
+            vec![list_loop_record("loop-aaa", "写书", "paused")],
+        );
+        assert!(
+            store.state.active_menu.is_none(),
+            "a global /loop list must NOT pop a menu"
+        );
+
+        let reports = store
+            .state
+            .activity
+            .iter()
+            .filter(|item| item.kind == ActivityKind::Report)
+            .count();
+        assert_eq!(reports, 1, "exactly one loop-list report survives");
+
+        let text = crate::app::debug_render_text(&store.state);
+        let rows = text.lines().filter(|row| row.contains("loop-aaa")).count();
+        assert_eq!(rows, 1, "the id renders on exactly one row: {text}");
+        assert!(
+            text.contains("paused"),
+            "the surviving report reflects the LATEST result: {text}"
+        );
+    }
+
+    #[test]
+    fn scoped_user_loop_list_opens_menu_without_report() {
+        // Menu-first: the menu is live, a report is a frozen snapshot —
+        // showing both drifts apart after any mutation (user report
+        // 2026-08-08: menu said paused while the report still said active).
+        let mut store = store_with_empty_session();
+        store.state.pending_loop_list_menu = true;
+        apply_loop_list(
+            &mut store,
+            vec![list_loop_record("loop-aaa", "写书", "active")],
+        );
+        assert!(store.state.active_menu.is_some(), "menu opens");
+        let reports = store
+            .state
+            .activity
+            .iter()
+            .filter(|item| item.kind == ActivityKind::Report)
+            .count();
+        assert_eq!(reports, 0, "a scoped query pushes NO transcript report");
+    }
+
+    #[test]
+    fn empty_scoped_loop_list_opens_usable_menu() {
+        // An empty list still answers with a REAL menu (creation hint as a
+        // read-only row), not an Unavailable card (user request 2026-08-08).
+        let mut store = store_with_empty_session();
+        store.state.pending_loop_list_menu = true;
+        apply_loop_list(&mut store, vec![]);
+        match store.state.active_menu.as_ref() {
+            Some(crate::menu::MenuBuildResult::Ready(spec)) => {
+                assert!(
+                    spec.items.iter().any(|item| item.label.contains("/loop")),
+                    "the empty menu carries the creation hint"
+                );
+            }
+            other => panic!("expected a Ready menu, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn right_arrow_on_active_loop_dispatches_pause() {
+        // Spec task-loops-menu-rows: Right on a loop row quick-toggles
+        // WITHOUT closing the menu.
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [
+                crate::model::APPUI_METHOD_LOOP_PAUSE,
+                crate::model::APPUI_METHOD_LOOP_RESUME,
+            ],
+            [crate::model::APPUI_FEATURE_CODING_AUTONOMY_V1],
+        ));
+        store.state.pending_loop_list_menu = true;
+        apply_loop_list(
+            &mut store,
+            vec![list_loop_record("loop-aaa", "写书", "active")],
+        );
+
+        let command = store.trigger_menu_right_action();
+
+        match command {
+            Some(AppUiCommand::PauseLoop(params)) => {
+                assert_eq!(params.loop_id, "loop-aaa");
+            }
+            other => panic!("expected PauseLoop, got {other:?}"),
+        }
+        assert!(store.state.active_menu.is_some(), "menu stays open");
+    }
+
+    #[test]
+    fn right_arrow_on_paused_loop_dispatches_resume() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [
+                crate::model::APPUI_METHOD_LOOP_PAUSE,
+                crate::model::APPUI_METHOD_LOOP_RESUME,
+            ],
+            [crate::model::APPUI_FEATURE_CODING_AUTONOMY_V1],
+        ));
+        store.state.pending_loop_list_menu = true;
+        apply_loop_list(
+            &mut store,
+            vec![list_loop_record("loop-aaa", "写书", "paused")],
+        );
+
+        match store.trigger_menu_right_action() {
+            Some(AppUiCommand::ResumeLoop(params)) => {
+                assert_eq!(params.loop_id, "loop-aaa");
+            }
+            other => panic!("expected ResumeLoop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn right_arrow_without_right_action_is_noop() {
+        // The empty loops menu's hint row declares no right_action — Right
+        // must dispatch nothing and leave the menu open.
+        let mut store = store_with_empty_session();
+        store.state.pending_loop_list_menu = true;
+        apply_loop_list(&mut store, vec![]);
+
+        assert!(store.trigger_menu_right_action().is_none());
+        assert!(store.state.active_menu.is_some(), "menu stays open");
+    }
+
+    #[test]
+    fn activating_loop_row_opens_action_submenu() {
+        // Spec task-loops-menu-rows: a loops-list row activation records the
+        // target and pushes the per-loop action submenu onto the stack.
+        let mut store = store_with_empty_session();
+        store.state.pending_loop_list_menu = true;
+        apply_loop_list(
+            &mut store,
+            vec![list_loop_record("loop-aaa", "写书", "active")],
+        );
+        assert!(store.state.active_menu.is_some(), "loops menu open");
+
+        store.dispatch_menu_action(crate::menu::MenuAction::Local(
+            crate::menu::LocalAction::OpenLoopActions("loop-aaa".into()),
+        ));
+
+        assert_eq!(store.state.loop_actions_target.as_deref(), Some("loop-aaa"));
+        match store.state.active_menu.as_ref() {
+            Some(crate::menu::MenuBuildResult::Ready(spec)) => {
+                assert_eq!(
+                    spec.id.as_str(),
+                    crate::menu::registry::MENU_LOOP_ACTIONS,
+                    "action submenu is on top"
+                );
+                assert!(
+                    spec.items
+                        .iter()
+                        .any(|item| item.id == "loop_actions.pause"),
+                    "verbs are offered"
+                );
+            }
+            other => panic!("expected Ready action submenu, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_loop_list_opens_menu_but_hydration_does_not() {
+        // Session-open hydration fires loop/list silently; found live
+        // 2026-08-08: the unconditional open popped the menu on session open,
+        // swallowed subsequent typing into its search box, and a stray Enter
+        // pause-toggled a loop the user never selected.
+        let mut store = store_with_empty_session();
+
+        // Hydration result: flag unset — no menu.
+        apply_loop_list(
+            &mut store,
+            vec![list_loop_record("loop-aaa", "写书", "active")],
+        );
+        assert!(
+            store.state.active_menu.is_none(),
+            "hydration must never pop the loops menu"
+        );
+
+        // User-dispatched: flag armed — menu opens.
+        store.state.pending_loop_list_menu = true;
+        apply_loop_list(
+            &mut store,
+            vec![list_loop_record("loop-aaa", "写书", "active")],
+        );
+        assert!(
+            store.state.active_menu.is_some(),
+            "an explicit /loop list opens the menu"
+        );
+        assert!(
+            !store.state.pending_loop_list_menu,
+            "the flag is consumed by the result"
+        );
+    }
+
+    #[test]
+    fn loop_list_report_renders_without_active_session() {
+        let mut store = Store {
+            state: AppState::new(vec![], 0, "ready".into(), None, false),
+        };
+        apply_loop_list_for_scope(
+            &mut store,
+            None,
+            vec![list_loop_record(
+                "loop-global-only",
+                "跨会话清理缓存",
+                "active",
+            )],
+        );
+
+        let text = crate::app::debug_render_text(&store.state);
+        assert!(
+            text.contains("loop-global-only"),
+            "global report visible without a session: {text}"
+        );
+        assert!(
+            !text.contains("Agent task completed"),
+            "global report is not an agent task: {text}"
+        );
+    }
+
+    #[test]
+    fn quota_error_renders_friendly_card_without_raw_json() {
+        // Spec task-quota-exhausted-card: quota exhaustion is an expected
+        // resource state, not a crash — no truncated raw JSON, and the card
+        // must carry the provider chip, the top-up link, and next actions.
+        let store = store_with_empty_session();
+        let text = store.turn_error_fallback_message(
+            &TurnId::new(),
+            "quota",
+            "Provider quota exhausted (moonshot@api/k3) — top up or switch provider \
+             (HTTP 403 - {\"error\":{\"message\":\"You've reached your usage limit for this \
+             billing cycle. To continue now, purchase extra usage or upgrade your plan: \
+             https://www.kimi.com/code/console\"}})",
+        );
+
+        assert!(text.contains("⏳"), "quota card glyph: {text}");
+        assert!(text.contains("moonshot@api/k3"), "provider chip: {text}");
+        assert!(
+            text.contains("https://www.kimi.com/code/console"),
+            "extracted top-up link: {text}"
+        );
+        assert!(text.contains("/model"), "switch-model action: {text}");
+        assert!(
+            !text.contains("HTTP 403") && !text.contains("{\"error\""),
+            "raw JSON tail must be dropped: {text}"
+        );
+    }
+
+    #[test]
+    fn rate_limited_code_renders_friendly_card() {
+        let store = store_with_empty_session();
+        let text = store.turn_error_fallback_message(
+            &TurnId::new(),
+            "rate_limited",
+            "Provider rate limited the turn.",
+        );
+        assert!(
+            text.contains("⏳"),
+            "rate_limited also gets the card: {text}"
+        );
+    }
+
+    #[test]
+    fn generic_error_keeps_legacy_summary() {
+        let store = store_with_empty_session();
+        let text =
+            store.turn_error_fallback_message(&TurnId::new(), "runtime_error", "something broke");
+        assert!(text.contains("Session Summary"), "legacy shape: {text}");
+        assert!(
+            !text.contains("⏳"),
+            "no quota card for generic errors: {text}"
+        );
+    }
+
+    #[test]
+    fn pathlike_slash_prompt_is_sent_as_plain_message_not_swallowed() {
+        // Observed live (2026-08-02): typing a filesystem path ("/Users/…")
+        // resolved as an unknown slash command and was swallowed — the user
+        // saw no reaction at all. A command token containing another '/' can
+        // never be a registered command name, so it is message text.
+        let mut store = store_with_empty_session();
+        store.state.composer = "/Users/zhangalex/Work/Projects 看看这个目录".into();
+
+        let command = store.compose_command();
+
+        assert!(
+            command.is_some(),
+            "a path-like draft must submit as a plain prompt"
+        );
+        assert!(store.state.composer.is_empty());
+        assert!(
+            !store.state.status.contains("Unknown slash"),
+            "no unknown-command warning for message text: {}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn unknown_slash_command_keeps_the_draft_for_correction() {
+        let mut store = store_with_empty_session();
+        store.state.composer = "/heelp".into();
+
+        let command = store.compose_command();
+
+        assert!(command.is_none());
+        assert_eq!(
+            store.state.composer, "/heelp",
+            "the typo draft must survive the warning so it can be corrected, not retyped"
+        );
+        assert!(store.state.status.contains("Unknown slash command"));
     }
 
     #[test]
@@ -24959,11 +26216,13 @@ now analyzing the bus module"
         assert!(store.state.sessions[0].messages.is_empty());
         assert!(store.state.optimistic_user_messages.is_empty());
         assert!(store.state.pending_messages.is_empty());
-        // A "running" Tool chip stamped with the local id, labeled with the
-        // cwd the command runs in (#364 — the TUI process cwd).
+        // A "running" REPORT stamped with the local id, labeled with the
+        // cwd the command runs in (#364 — the TUI process cwd). Report, not
+        // Tool: reports are the only surface that renders idle AND mid-turn
+        // without turn attachment (codex on #513).
         let chip = store.state.activity.last().expect("running activity chip");
-        assert_eq!(chip.kind, ActivityKind::Tool);
-        assert_eq!(chip.title, "!");
+        assert_eq!(chip.kind, ActivityKind::Report);
+        assert_eq!(chip.title, "! echo hi");
         assert_eq!(chip.status, "running");
         let detail = chip.detail.as_deref().expect("running chip detail");
         assert!(detail.starts_with("echo hi"), "detail: {detail}");
@@ -25076,12 +26335,58 @@ now analyzing the bus module"
         assert_eq!(chip.success, Some(true));
         assert_eq!(chip.duration_ms, Some(12));
         assert_eq!(chip.output_preview.as_deref(), Some("hi\n"));
-        // The completed card is labeled with the cwd the transport ran in.
+        // The settled result converts to a turn-independent REPORT (the
+        // `/loop list` precedent): activity chips render only inside the
+        // turn flow, which an idle session never shows — pre-fix the output
+        // rendered NOWHERE ("! could not execute" field report).
+        assert_eq!(chip.kind, ActivityKind::Report);
+        assert_eq!(chip.title, "! echo hi");
         assert_eq!(
             chip.detail.as_deref(),
-            Some("echo hi · cwd: /tmp/workdir"),
-            "completed card labels the transport-reported cwd"
+            Some("echo hi · cwd: /tmp/workdir\nhi\n"),
+            "the report carries the cwd label AND the output"
         );
+    }
+
+    #[test]
+    fn repeated_bangs_retain_only_the_latest_report() {
+        // Reports pin into the live tail; an unbounded stack of bang outputs
+        // would bloat the viewport, so only the LATEST result is retained
+        // (running chips are untouched — this prunes settled reports only).
+        let mut store = store_with_empty_session();
+        for (i, cmd) in ["!echo one", "!echo two"].iter().enumerate() {
+            store.state.set_composer_text(*cmd);
+            let local_id = match store.compose_command().expect("dispatch") {
+                AppUiCommand::LocalShellExec { local_id, .. } => local_id,
+                other => panic!("expected LocalShellExec, got {other:?}"),
+            };
+            store.apply_client_event(ClientEvent::LocalShellResult(
+                crate::client_event::LocalShellResultEvent {
+                    local_id,
+                    cmdline: cmd.trim_start_matches('!').to_string(),
+                    cwd: None,
+                    stdout: format!("out-{i}\n"),
+                    stderr: String::new(),
+                    exit_code: Some(0),
+                    duration_ms: 1,
+                    truncated: false,
+                },
+            ));
+        }
+        let bang_reports: Vec<_> = store
+            .state
+            .activity
+            .iter()
+            .filter(|item| {
+                item.kind == ActivityKind::Report
+                    && item
+                        .tool_call_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with("local-shell:"))
+            })
+            .collect();
+        assert_eq!(bang_reports.len(), 1, "only the latest bang report stays");
+        assert_eq!(bang_reports[0].title, "! echo two");
     }
 
     #[test]
@@ -25215,7 +26520,7 @@ now analyzing the bus module"
         fn new(tag: &str) -> Self {
             let mut dir = std::env::temp_dir();
             dir.push(format!(
-                "octos-tui-store-picker-{tag}-{}-{}",
+                "octoscode-store-picker-{tag}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -30622,6 +31927,7 @@ now analyzing the bus module"
     fn mid_turn_prompt_steers_into_a_live_turn_that_was_not_interrupted() {
         let turn_id = TurnId::new();
         let mut store = store_with_live_reply(turn_id, "streaming");
+        store.state.steer_mid_turn = true;
         store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
             crate::model::APPUI_METHOD_TURN_STEER,
         ]));
@@ -30650,6 +31956,7 @@ now analyzing the bus module"
         let turn_id = TurnId::new();
         let mut store = store_with_live_reply(turn_id.clone(), "streaming");
         let session_id = store.state.sessions[0].id.clone();
+        store.state.steer_mid_turn = true;
         store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
             crate::model::APPUI_METHOD_TURN_STEER,
         ]));
@@ -31855,6 +33162,365 @@ now analyzing the bus module"
     }
 
     #[test]
+    fn submitted_prompt_attaches_existing_image_paths_as_media() {
+        // Route-1 image support: terminals cannot deliver pasted image BYTES
+        // (bracketed paste is text-only), so the path IS the paste surface —
+        // drag-drop, a pasted path, or the `@` picker all put an image PATH in
+        // the prompt. An existing image file must ride the turn as media so
+        // the server's vision path (materialize passthrough → Message.media →
+        // provider image parts) can see it.
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("shot.png");
+        std::fs::write(&img, b"\x89PNG fake").unwrap();
+        let txt = dir.path().join("notes.txt");
+        std::fs::write(&txt, b"not an image").unwrap();
+
+        let mut store = store_with_empty_session();
+        store.state.set_composer_text(format!(
+            "what is wrong in @{} (see also {} and ./missing.png)",
+            img.display(),
+            txt.display()
+        ));
+        let cmd = store.compose_command().expect("prompt turn dispatches");
+        let AppUiCommand::SubmitPrompt(params) = cmd else {
+            panic!("expected SubmitPrompt, got {cmd:?}");
+        };
+        // Only the `@`-referenced existing image attaches; the bare `.txt`
+        // and the `@`-less `./missing.png` do not.
+        assert_eq!(
+            params.media.len(),
+            1,
+            "only the @-referenced image attaches"
+        );
+        assert!(params.media[0].path.ends_with("shot.png"));
+        assert_eq!(params.media[0].mime, "image/png");
+        assert!(params.media[0].size_bytes > 0);
+        // The prompt text keeps the reference readable for the model.
+        let InputItem::Text { text } = &params.input[0] else {
+            panic!("text input expected");
+        };
+        assert!(text.contains("shot.png"));
+    }
+
+    #[test]
+    fn bare_filename_never_attaches_only_at_reference_does() {
+        // codex security P1: `rename foo.png to bar.png` with both files real
+        // must attach NOTHING — bare filenames stay text. This also protects
+        // the `/gather` path, where peer/server prose flows through the same
+        // detection: a peer result merely naming a client-local file cannot
+        // egress it without an explicit `@`.
+        let dir = tempfile::tempdir().unwrap();
+        let foo = dir.path().join("foo.png");
+        let bar = dir.path().join("bar.png");
+        std::fs::write(&foo, b"png").unwrap();
+        std::fs::write(&bar, b"png").unwrap();
+        let bare = format!("rename {} to {}", foo.display(), bar.display());
+        assert!(
+            Store::image_media_from_prompt(&bare).is_empty(),
+            "bare filenames must never auto-attach"
+        );
+        let atref = format!("compare @{} and @{}", foo.display(), bar.display());
+        assert_eq!(
+            Store::image_media_from_prompt(&atref).len(),
+            2,
+            "explicit @refs do attach"
+        );
+    }
+
+    #[test]
+    fn symlinked_image_is_rejected_no_target_egress() {
+        // codex security P1: `ln -s secret diagram.png` then `@diagram.png`
+        // must NOT read the symlink target (a private key, say). No-follow.
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, b"PRIVATE KEY BYTES").unwrap();
+        let link = dir.path().join("diagram.png");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&secret, &link).unwrap();
+            let prompt = format!("look at @{}", link.display());
+            assert!(
+                Store::image_media_from_prompt(&prompt).is_empty(),
+                "a symlinked image must be rejected, not followed to its target"
+            );
+        }
+        let _ = link;
+    }
+
+    #[test]
+    fn oversized_image_is_skipped() {
+        // codex security P1: a huge file must not reach the unbounded
+        // server-side read+base64; size is checked client-side.
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("huge.png");
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(64 * 1024 * 1024).unwrap(); // 64 MB sparse, over the 20 MB cap
+        drop(f);
+        let prompt = format!("@{}", big.display());
+        assert!(
+            Store::image_media_from_prompt(&prompt).is_empty(),
+            "a file over the byte cap must be skipped"
+        );
+    }
+
+    #[test]
+    fn image_media_detection_dedups_caps_and_ignores_nonfiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for i in 0..6 {
+            let p = dir.path().join(format!("img-{i}.jpg"));
+            std::fs::write(&p, b"jpg").unwrap();
+            paths.push(p.display().to_string());
+        }
+        // duplicate of the first + a directory named like an image. Every
+        // candidate is `@`-prefixed (intent signal); dup + directory +
+        // quoted-nonexistent are rejected/deduped; cap holds at 4.
+        let dup = paths[0].clone();
+        let dir_as_img = dir.path().join("folder.png");
+        std::fs::create_dir(&dir_as_img).unwrap();
+        let ats: Vec<String> = paths.iter().map(|p| format!("@{p}")).collect();
+        let prompt = format!(
+            "{} @{} @{} @{}",
+            ats.join(" "),
+            dup,
+            dir_as_img.display(),
+            "\"trailing.png\"" // quoted nonexistent
+        );
+        let media = Store::image_media_from_prompt(&prompt);
+        assert_eq!(media.len(), 4, "capped at MAX_TURN_IMAGES and deduped");
+        assert!(media.iter().all(|m| m.mime == "image/jpeg"));
+    }
+
+    #[test]
+    fn bang_chip_is_stamped_and_visible_where_the_user_looks() {
+        // Field report 2026-08-08 ("! could not execute"): the command RAN,
+        // but the running/complete chip was pushed session-unstamped and
+        // turn-unattached, so the transcript's activity filter hid it in
+        // exactly the situations bangs get used — mid-turn (only the live
+        // turn's items render) and fresh sessions (welcome screen). The user
+        // saw a cleared composer and no output: indistinguishable from "did
+        // not execute". The chip must carry the active session and, when a
+        // turn is live, that turn — the same attachment the compaction
+        // notice uses for the same reason.
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        let turn = TurnId::new();
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: turn.clone(),
+            text: String::new(),
+        });
+
+        store.state.set_composer_text("!echo hi");
+        let cmd = store.compose_command();
+        assert!(matches!(cmd, Some(AppUiCommand::LocalShellExec { .. })));
+
+        let chip = store
+            .state
+            .activity
+            .last()
+            .expect("bang dispatch pushes a running report");
+        assert_eq!(
+            chip.kind,
+            ActivityKind::Report,
+            "the bang is a REPORT for its whole lifecycle: reports render \
+             idle AND mid-turn unconditionally, and stay out of turn \
+             archival and agent-task action counts (codex on #513)"
+        );
+        assert_eq!(
+            chip.session_id.as_ref(),
+            Some(&session_id),
+            "the report must be stamped with the session it ran from"
+        );
+        assert_eq!(
+            chip.turn_id, None,
+            "deliberately NO turn attachment — attaching local work to a \
+             real agent turn corrupted turn-terminal capture in both \
+             orderings (codex on #513)"
+        );
+        assert!(chip.sticky, "must survive a busy turn's activity eviction");
+        let _ = turn;
+    }
+
+    #[test]
+    fn completing_bang_never_prunes_a_running_or_foreign_report() {
+        // codex on #513: retention was global and kind-only — a background
+        // session's completion deleted the FOCUSED session's report, and a
+        // late completion could prune reports before its own chip was found.
+        // Retention is now session-scoped and spares in-flight reports
+        // structurally (success.is_none()).
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let session_a = store.state.sessions[0].id.clone();
+        let session_b = store.state.sessions[1].id.clone();
+
+        // A settled report in session B (as if a bang completed there).
+        let mut foreign = ActivityItem::new(ActivityKind::Report, "! b-cmd", "complete")
+            .with_tool_call("local-shell:b-1")
+            .with_session(session_b.clone());
+        foreign.success = Some(true);
+        store.state.push_activity(foreign);
+
+        // A RUNNING bang report in session A.
+        let running = ActivityItem::new(ActivityKind::Report, "! slow", "running")
+            .with_tool_call("local-shell:a-slow")
+            .with_session(session_a.clone());
+        store.state.push_activity(running);
+
+        // A second bang in session A completes.
+        let quick = ActivityItem::new(ActivityKind::Report, "! quick", "running")
+            .with_tool_call("local-shell:a-quick")
+            .with_session(session_a.clone());
+        store.state.push_activity(quick);
+        store.apply_client_event(ClientEvent::LocalShellResult(
+            crate::client_event::LocalShellResultEvent {
+                local_id: "local-shell:a-quick".into(),
+                cmdline: "quick".into(),
+                cwd: None,
+                stdout: "done\n".into(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                duration_ms: 1,
+                truncated: false,
+            },
+        ));
+
+        let ids: Vec<_> = store
+            .state
+            .activity
+            .iter()
+            .filter_map(|item| item.tool_call_id.as_deref())
+            .collect();
+        assert!(
+            ids.contains(&"local-shell:b-1"),
+            "another session's report must survive a completion elsewhere"
+        );
+        assert!(
+            ids.contains(&"local-shell:a-slow"),
+            "a RUNNING report must never be pruned by a completing sibling"
+        );
+        assert!(ids.contains(&"local-shell:a-quick"));
+    }
+
+    #[test]
+    fn late_result_for_a_missing_chip_lands_as_a_fallback_report() {
+        // codex on #513: an evicted chip's late result deleted another
+        // bang's report and produced NOTHING. Now the result finds no chip
+        // and pushes a fallback report instead of pruning blind.
+        let mut store = store_with_empty_session();
+        store.apply_client_event(ClientEvent::LocalShellResult(
+            crate::client_event::LocalShellResultEvent {
+                local_id: "local-shell:evicted".into(),
+                cmdline: "echo late".into(),
+                cwd: None,
+                stdout: "late-output\n".into(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                duration_ms: 7,
+                truncated: false,
+            },
+        ));
+        let report = store
+            .state
+            .activity
+            .iter()
+            .rev()
+            .find(|item| item.tool_call_id.as_deref() == Some("local-shell:evicted"))
+            .expect("a fallback report must be pushed for a missing chip");
+        assert_eq!(report.kind, ActivityKind::Report);
+        assert_eq!(report.title, "! echo late");
+        assert!(
+            report
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("late-output"),
+            "the fallback must carry the output"
+        );
+        assert_eq!(report.success, Some(true));
+    }
+
+    #[test]
+    fn bang_dispatch_keeps_the_composer_focused() {
+        // The old dispatch parked focus on the Tasks dock — which shows "No
+        // tasks yet" for a bang (it is an activity chip, not a task), so the
+        // user stared at an empty pane while the output rendered elsewhere.
+        let mut store = store_with_empty_session();
+        store.state.focus = FocusPane::Composer;
+
+        store.state.set_composer_text("!pwd");
+        let cmd = store.compose_command();
+        assert!(matches!(cmd, Some(AppUiCommand::LocalShellExec { .. })));
+        assert_eq!(
+            store.state.focus,
+            FocusPane::Composer,
+            "a bang must not steal focus to a pane that cannot show its result"
+        );
+    }
+
+    #[test]
+    fn status_word_progress_does_not_clobber_the_status_line() {
+        // `state ✧ Working (…) | dev | 整活中 | …` (user feedback 2026-08-08):
+        // the persona word's home is the HARNESS line (via
+        // `session_status_word`, where it replaces the Working phase). A
+        // status_word event carries the word in `label`, so it is NOT
+        // bare-kind — it must still never land in `state.status`, or the same
+        // word renders on two lines at once.
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        let turn = TurnId::new();
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: turn.clone(),
+            text: String::new(),
+        });
+        store.state.status = "ready".into();
+
+        let mut meta = UiProgressMetadata::new(progress_kinds::STATUS_WORD);
+        meta.label = Some("整活中".into());
+        store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
+            session_id.clone(),
+            Some(turn.clone()),
+            meta,
+        )));
+
+        assert_eq!(
+            store
+                .state
+                .session_status_word
+                .get(&session_id)
+                .map(|(_, w)| w.as_str()),
+            Some("整活中"),
+            "the word must still reach its harness-line home"
+        );
+        assert_eq!(
+            store.state.status, "ready",
+            "a status_word event must not overwrite the status line"
+        );
+    }
+
+    #[test]
+    fn bare_kind_progress_does_not_clobber_the_status_line() {
+        // `Progress: thinking` next to the Working spinner is double
+        // narration (user feedback 2026-08-08): a progress event whose
+        // metadata carries nothing but its kind has no user-facing content —
+        // the spinner/phase already say the turn is running. It must not
+        // overwrite the status line (the bare-kind string still titles
+        // activity-log rows for kinds that record activity).
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.status = "ready".into();
+
+        store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
+            session_id,
+            None,
+            UiProgressMetadata::new(progress_kinds::THINKING),
+        )));
+
+        assert_eq!(
+            store.state.status, "ready",
+            "a bare-kind progress event must not become the status line"
+        );
+    }
+
+    #[test]
     fn progress_event_prefers_user_facing_message() {
         let mut store = store_with_empty_session();
         let session_id = store.state.sessions[0].id.clone();
@@ -31965,19 +33631,27 @@ now analyzing the bus module"
     }
 
     #[test]
-    fn status_word_persona_spinner_updates_status_without_activity() {
+    fn status_word_persona_spinner_touches_neither_status_nor_activity() {
         let mut store = store_with_empty_session();
         let session_id = store.state.sessions[0].id.clone();
-        // Persona spinner: kind="status_word", dynamic label (LLM-generated). It
-        // must update the status line but NOT pile up as counted activity actions
-        // (otherwise the agent-task chip shows "N active" with no real work).
+        store.state.status = "ready".into();
+        // Persona spinner: kind="status_word", dynamic word (LLM-generated).
+        // Its home is the HARNESS line via `session_status_word`; it must not
+        // pile up as counted activity actions (fake "N active" chips) AND —
+        // superseding this test's original contract (user feedback
+        // 2026-08-08) — it must not overwrite the status line either, or the
+        // word renders on two lines at once. This holds whether the word
+        // arrives in `label` or `message`.
         store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
             session_id,
             Some(TurnId::new()),
             UiProgressMetadata::new(progress_kinds::STATUS_WORD).with_message("Composing"),
         )));
 
-        assert_eq!(store.state.status, "Composing");
+        assert_eq!(
+            store.state.status, "ready",
+            "status_word must not overwrite the status line"
+        );
         assert!(
             store.state.activity.is_empty(),
             "status_word spinner must not be recorded as activity"
@@ -33196,6 +34870,117 @@ now analyzing the bus module"
     }
 
     #[test]
+    fn spawn_dispatches_submit_prompt_with_formatted_text() {
+        let mut store = protocol_store_with_autonomy();
+        store
+            .state
+            .set_composer_text("/agents spawn 3 run integration tests");
+        let command = store.compose_command().expect("spawn emits a command");
+        match command {
+            AppUiCommand::SubmitPrompt(params) => {
+                let text = match params.input.first().expect("input has text") {
+                    octos_core::ui_protocol::InputItem::Text { text } => text.clone(),
+                    other => panic!("expected Text input item, got {other:?}"),
+                };
+                assert!(
+                    text.contains('3'),
+                    "turn text must contain the count, got: {text}"
+                );
+                assert!(
+                    text.contains("run integration tests"),
+                    "turn text must contain the prompt, got: {text}"
+                );
+            }
+            other => panic!("expected SubmitPrompt, got {other:?}"),
+        }
+    }
+
+    /// Slash dispatch runs BEFORE the plain-prompt staging path, so without this
+    /// guard `/agents spawn` during a live turn would double-submit `turn/start`
+    /// and bypass the staged-drain FIFO. Mirrors `review_start_command`.
+    #[test]
+    fn spawn_rejected_with_active_turn() {
+        let mut store = protocol_store_with_autonomy();
+        let turn_id = TurnId::new();
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id,
+            text: "streaming".into(),
+        });
+        store.state.set_composer_text("/agents spawn 2 do work");
+        let command = store.compose_command();
+        assert!(
+            command.is_none(),
+            "spawn must be rejected while a turn is active"
+        );
+        assert!(
+            store.state.status.contains("active"),
+            "status must mention the active turn, got: {:?}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn spawn_rejected_when_agent_list_not_advertised() {
+        use crate::menu::CapabilitySet;
+        let session = crate::model::SessionView {
+            id: octos_core::SessionKey("local:test".into()),
+            title: "test".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        let mut store = Store {
+            state: crate::model::AppState::new(
+                vec![session],
+                0,
+                "ready".into(),
+                Some("ws://example.test/ui-protocol".into()),
+                false,
+            ),
+        };
+        store.state.capabilities = Some(CapabilitySet::from_methods_and_features(
+            [] as [&str; 0],
+            [crate::model::APPUI_FEATURE_CODING_AUTONOMY_V1],
+        ));
+        store.state.set_composer_text("/agents spawn 2 do work");
+        let command = store.compose_command();
+        assert!(
+            command.is_none(),
+            "spawn must be rejected when agent/list is not advertised"
+        );
+        assert!(
+            store.state.status.contains("agent/list"),
+            "status must name the missing method, got: {:?}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn spawn_not_recorded_in_history() {
+        assert!(
+            !should_record_in_history("/agents spawn 3 run tests"),
+            "/agents spawn has non-empty args so it must never be recorded"
+        );
+        assert!(
+            !should_record_in_history("/agents spawn 1 fix lint errors"),
+            "single-agent spawn with a long prompt must not be recorded"
+        );
+    }
+
+    #[test]
+    fn spawn_rejected_in_readonly_mode() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.readonly = true;
+        store.state.set_composer_text("/agents spawn 2 do work");
+        let command = store.compose_command();
+        assert!(
+            command.is_none(),
+            "spawn must be rejected in readonly mode, got {command:?}"
+        );
+    }
+
+    #[test]
     fn agents_list_subcommand_also_dispatches() {
         let mut store = protocol_store_with_autonomy();
         store.state.composer = "/agents list".into();
@@ -34217,6 +36002,274 @@ now analyzing the bus module"
     }
 
     #[test]
+    fn global_loop_list_block_labels_each_session() {
+        // Spec task-loop-list-global-decode: a global list spans sessions, so
+        // bare ids leave the reader unable to tell which session each loop
+        // belongs to.
+        let block = crate::app::format_loop_list_block(
+            &[
+                loop_for_session("loop_a", "kimi:local:tui#coding"),
+                loop_for_session("loop_b", "kimi:local:tui#notes"),
+            ],
+            true,
+        );
+
+        assert!(
+            block.contains("local:tui#coding"),
+            "first session shown: {block}"
+        );
+        assert!(
+            block.contains("local:tui#notes"),
+            "second session shown: {block}"
+        );
+    }
+
+    #[test]
+    fn scoped_loop_list_block_omits_session_column() {
+        // Every loop in a scoped list shares the one known session — repeating
+        // it on each row is noise.
+        let block = crate::app::format_loop_list_block(
+            &[loop_for_session("loop_a", "kimi:local:tui#coding")],
+            false,
+        );
+
+        assert!(
+            !block.contains("local:tui#coding"),
+            "scoped list omits the session column: {block}"
+        );
+        assert!(block.contains("loop_a"), "id still present: {block}");
+    }
+
+    #[test]
+    fn loop_list_result_decodes_null_session_id() {
+        // Spec task-loop-list-global-decode: the server echoes the request's
+        // session_id, so a global query comes back as `"session_id": null`.
+        // A non-Option field made the whole response undecodable — the list
+        // was permanently empty (same class as the 2026-08-03 hydrate break).
+        let wire = serde_json::json!({
+            "session_id": serde_json::Value::Null,
+            "profile_id": "kimi",
+            "loops": []
+        });
+
+        let decoded: crate::model::LoopListResult =
+            serde_json::from_value(wire).expect("global-query response must decode");
+
+        assert!(decoded.session_id.is_none(), "null decodes to None");
+    }
+
+    fn loop_for_session(loop_id: &str, session: &str) -> octos_core::ui_protocol::UiLoopRecord {
+        let now = chrono::Utc::now().timestamp_millis();
+        octos_core::ui_protocol::UiLoopRecord {
+            loop_id: loop_id.into(),
+            session_id: SessionKey(session.into()),
+            profile_id: Some("kimi".into()),
+            prompt: "写书".into(),
+            mode: "self_paced".into(),
+            interval_seconds: None,
+            status: "active".into(),
+            next_run_at_ms: Some(now + 60_000),
+            last_run_at_ms: None,
+            expires_at_ms: now + 3_600_000,
+            created_at_ms: now,
+            updated_at_ms: now,
+        }
+    }
+
+    fn apply_list_result(
+        store: &mut Store,
+        session_id: Option<&str>,
+        loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
+    ) {
+        store.apply_autonomy_result(crate::client_event::AutonomyClientEvent {
+            result: crate::client_event::AutonomyResult::LoopList(crate::model::LoopListResult {
+                session_id: session_id.map(|id| SessionKey(id.into())),
+                profile_id: Some("kimi".into()),
+                loops,
+            }),
+        });
+    }
+
+    #[test]
+    fn global_loop_list_distributes_by_record_session() {
+        // A global query returns loops from MANY sessions; writing them all
+        // into one mirror would misattribute them.
+        let mut store = store_with_empty_session();
+        apply_list_result(
+            &mut store,
+            None,
+            vec![
+                loop_for_session("loop_a", "kimi:local:tui#coding"),
+                loop_for_session("loop_b", "kimi:local:tui#notes"),
+            ],
+        );
+
+        let coding = store
+            .state
+            .session_autonomy_for(&SessionKey("kimi:local:tui#coding".into()))
+            .expect("coding mirror");
+        let notes = store
+            .state
+            .session_autonomy_for(&SessionKey("kimi:local:tui#notes".into()))
+            .expect("notes mirror");
+        assert_eq!(coding.loops.len(), 1, "each loop lands in its own session");
+        assert_eq!(notes.loops.len(), 1);
+        assert_eq!(coding.loops[0].loop_id, "loop_a");
+        assert_eq!(notes.loops[0].loop_id, "loop_b");
+    }
+
+    #[test]
+    fn scoped_loop_list_replaces_that_session_set() {
+        let mut store = store_with_empty_session();
+        apply_list_result(
+            &mut store,
+            Some("kimi:local:tui#coding"),
+            vec![loop_for_session("loop_a", "kimi:local:tui#coding")],
+        );
+
+        let mirror = store
+            .state
+            .session_autonomy_for(&SessionKey("kimi:local:tui#coding".into()))
+            .expect("mirror");
+        assert_eq!(mirror.loops.len(), 1, "scoped set is replaced wholesale");
+    }
+
+    fn mirror_len(store: &Store, session: &str) -> usize {
+        store
+            .state
+            .session_autonomy_for(&SessionKey(session.into()))
+            .map(|entry| entry.loops.len())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn global_loop_list_clears_vanished_loops_in_scope() {
+        // A global response IS authoritative for the profile the server
+        // resolved. Keeping unlisted sessions produced a contradictory UI:
+        // status bar "0 loop(s)" while the indicator row still showed one.
+        let mut store = store_with_empty_session();
+        store.state.upsert_session_loop(
+            &SessionKey("kimi:local:tui#coding".into()),
+            loop_for_session("loop_a", "kimi:local:tui#coding"),
+        );
+
+        apply_list_result(
+            &mut store,
+            None,
+            vec![loop_for_session("loop_b", "kimi:local:tui#notes")],
+        );
+
+        assert_eq!(
+            mirror_len(&store, "kimi:local:tui#coding"),
+            0,
+            "a loop the server no longer reports must disappear"
+        );
+        assert_eq!(mirror_len(&store, "kimi:local:tui#notes"), 1);
+    }
+
+    #[test]
+    fn global_loop_list_leaves_other_profiles_untouched() {
+        // The response's profile_id bounds its authority — another profile's
+        // sessions must survive untouched.
+        let mut store = store_with_empty_session();
+        store.state.upsert_session_loop(
+            &SessionKey("other:local:tui#coding".into()),
+            loop_for_session("loop_x", "other:local:tui#coding"),
+        );
+
+        apply_list_result(
+            &mut store,
+            None,
+            vec![loop_for_session("loop_b", "kimi:local:tui#notes")],
+        );
+
+        assert_eq!(
+            mirror_len(&store, "other:local:tui#coding"),
+            1,
+            "out-of-scope profile keeps its loops"
+        );
+    }
+
+    #[test]
+    fn empty_global_response_clears_scope_so_ui_agrees() {
+        // The exact contradiction found while self-reviewing: an empty global
+        // response left the mirror populated, so the status bar said
+        // "0 loop(s)" while the autonomy row still showed a live loop.
+        let mut store = store_with_empty_session();
+        store.state.upsert_session_loop(
+            &SessionKey("kimi:local:tui#coding".into()),
+            loop_for_session("loop_a", "kimi:local:tui#coding"),
+        );
+
+        apply_list_result(&mut store, None, vec![]);
+
+        assert_eq!(
+            mirror_len(&store, "kimi:local:tui#coding"),
+            0,
+            "mirror must agree with the reported count"
+        );
+        assert!(
+            store.state.status.contains('0'),
+            "status reports zero: {}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn loop_list_falls_back_to_launch_profile_without_session() {
+        // Without a session `active_session_profile_id()` is None, so the
+        // server would resolve the profile to `main` and filter out every
+        // loop that lives under the user's real profile.
+        let mut store = protocol_store_with_autonomy();
+        store.state.sessions.clear();
+        store.state.selected_session = 0;
+        store.state.onboarding.launch_profile_id = Some("kimi".into());
+        store.state.composer = "/loop list".into();
+
+        let command = store.compose_command();
+
+        let Some(AppUiCommand::ListLoops(params)) = command else {
+            panic!("expected ListLoops");
+        };
+        assert!(params.session_id.is_none(), "global query omits session_id");
+        assert_eq!(
+            params.profile_id.as_deref(),
+            Some("kimi"),
+            "falls back to the launch profile instead of letting the server pick main"
+        );
+    }
+
+    #[test]
+    fn loop_list_works_without_active_session() {
+        // Bug: `/loop list` used to require an active session because it called
+        // `active_autonomy_session_id()?` before dispatching. When no session was
+        // open, the command silently failed and the user saw nothing.
+        //
+        // Fix: `/loop list` is a global query that works with or without an
+        // active session — session_id is None when no session is open, which
+        // tells the server to return all loops (not filtered by session).
+        let mut store = protocol_store_with_autonomy();
+        // Clear the active session to simulate the no-session state
+        store.state.sessions.clear();
+        store.state.selected_session = 0; // Reset selection index
+        store.state.composer = "/loop list".into();
+
+        // The command should still be sent (with session_id = None)
+        let command = store.compose_command();
+        assert!(matches!(command, Some(AppUiCommand::ListLoops(_))));
+
+        // Verify the payload shape: session_id should be None (not empty string)
+        if let Some(AppUiCommand::ListLoops(params)) = command {
+            assert!(
+                params.session_id.is_none(),
+                "session_id should be None for global query, got {:?}",
+                params.session_id
+            );
+            // profile_id can be None or Some, but session_id must be None
+        }
+    }
+
+    #[test]
     fn loop_with_self_paced_prompt_dispatches_create_self_paced() {
         let mut store = protocol_store_with_autonomy();
         store.state.composer = "/loop check the deploy".into();
@@ -34857,7 +36910,179 @@ now analyzing the bus module"
             .session_autonomy_for(&session_id)
             .expect("mirror");
         assert_eq!(mirror.agents.len(), 1);
-        assert!(store.state.status.contains("1 agent"));
+        assert!(store.state.status.contains("1 active agent"));
+    }
+
+    /// `agent/list` must NOT push per-agent activity chips. It is auto-fired by
+    /// `hydrate_autonomy_state_commands` on every session open/reconnect, and
+    /// `push_activity` appends with no dedup behind an 80-item cap — so a chip
+    /// per agent per result floods the feed and evicts meaningful rows. The
+    /// `AgentUpdated` arm is the single chip producer for agents.
+    #[test]
+    fn agent_list_result_pushes_no_activity_chips() {
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        use octos_core::ui_protocol::UiAgentRecord;
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+
+        let make_agent = |id: &str, status: &str| UiAgentRecord {
+            agent_id: id.into(),
+            parent_agent_id: None,
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "/root".into(),
+            role: "worker".into(),
+            nickname: id.into(),
+            title: None,
+            backend_kind: "native".into(),
+            status: status.into(),
+            last_task: None,
+            summary: None,
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+
+        let list = |store: &mut Store| {
+            store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+                result: AutonomyResult::AgentList(crate::model::AgentListResult {
+                    session_id: session_id.clone(),
+                    agents: vec![make_agent("ag-1", "running"), make_agent("ag-2", "running")],
+                }),
+            }));
+        };
+
+        // Three refreshes stand in for hydrate-on-reconnect firing repeatedly.
+        list(&mut store);
+        list(&mut store);
+        list(&mut store);
+
+        assert_eq!(
+            store.state.activity.len(),
+            0,
+            "agent/list must never push chips (reconnect would duplicate them); got: {:?}",
+            store.state.activity
+        );
+        // The mirror and the status line still carry the roster.
+        let mirror = store
+            .state
+            .session_autonomy_for(&session_id)
+            .expect("mirror");
+        assert_eq!(mirror.agents.len(), 2);
+        assert!(store.state.status.contains("2 active agent"));
+    }
+
+    /// Regression: when every agent in the list is terminal the status bar must
+    /// report 0 active agents, not the total roster size.
+    #[test]
+    fn agent_list_count_goes_to_zero_when_all_terminal() {
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        use octos_core::ui_protocol::UiAgentRecord;
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+
+        let make_agent = |id: &str, status: &str| UiAgentRecord {
+            agent_id: id.into(),
+            parent_agent_id: None,
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "/root".into(),
+            role: "worker".into(),
+            nickname: id.into(),
+            title: None,
+            backend_kind: "native".into(),
+            status: status.into(),
+            last_task: None,
+            summary: None,
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+
+        store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::AgentList(crate::model::AgentListResult {
+                session_id: session_id.clone(),
+                agents: vec![
+                    make_agent("ag-1", "completed"),
+                    make_agent("ag-2", "interrupted"),
+                    make_agent("ag-3", "failed"),
+                ],
+            }),
+        }));
+
+        assert!(
+            store.state.status.contains("0 active agent"),
+            "all-terminal agent list must report 0 active agents, got: {}",
+            store.state.status
+        );
+        let mirror = store
+            .state
+            .session_autonomy_for(&session_id)
+            .expect("mirror");
+        assert_eq!(mirror.agents.len(), 3, "the mirror keeps every agent");
+    }
+
+    /// `ready` / `cleared` / `active` are non-terminal wire statuses the server
+    /// does emit, so they must count as active. `done` is NOT emitted by any
+    /// server path — if that ever changes, `terminal_task_state_from_agent_status`
+    /// needs the arm and this test will catch the drift.
+    #[test]
+    fn agent_list_count_treats_unmapped_statuses_as_active() {
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        use octos_core::ui_protocol::UiAgentRecord;
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+
+        let make_agent = |id: &str, status: &str| UiAgentRecord {
+            agent_id: id.into(),
+            parent_agent_id: None,
+            session_id: session_id.clone(),
+            task_id: None,
+            path: "/root".into(),
+            role: "worker".into(),
+            nickname: id.into(),
+            title: None,
+            backend_kind: "native".into(),
+            status: status.into(),
+            last_task: None,
+            summary: None,
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+
+        store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::AgentList(crate::model::AgentListResult {
+                session_id: session_id.clone(),
+                agents: vec![
+                    make_agent("ag-1", "ready"),
+                    make_agent("ag-2", "cleared"),
+                    make_agent("ag-3", "active"),
+                    make_agent("ag-4", "completed"),
+                ],
+            }),
+        }));
+
+        assert!(
+            store.state.status.contains("3 active agent"),
+            "ready/cleared/active are non-terminal; only completed is terminal, got: {}",
+            store.state.status
+        );
     }
 
     #[test]
@@ -35913,7 +38138,8 @@ now analyzing the bus module"
         let session_id = SessionKey("local:test".into());
         store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
             result: AutonomyResult::LoopList(crate::model::LoopListResult {
-                session_id: session_id.clone(),
+                session_id: Some(session_id.clone()),
+                profile_id: None,
                 loops: vec![UiLoopRecord {
                     loop_id: "loop_a".into(),
                     session_id: session_id.clone(),
@@ -36106,6 +38332,248 @@ now analyzing the bus module"
             text, "Hello, world!",
             "the canonical persisted copy must REPLACE the legacy-fed text, not append"
         );
+    }
+
+    /// Real-wire reproduction of the duplicate-render report (octos#1916).
+    ///
+    /// The ids here are NOT invented — they are the ones a live
+    /// `dev:local:tui#coding` turn actually received. The server derives a
+    /// delta's segment index from how many persisted rows PRECEDE it, and
+    /// persisted rows only arrive at the end of a turn, so every delta of the
+    /// turn projects to `:assistant:1` — while the persisted rows increment.
+    /// A tool-using turn therefore streams its WHOLE answer under segment 1
+    /// and then persists it as segments 1 and 2:
+    ///
+    ///   1764 deltas       -> <turn>:assistant:1   (preamble + answer)
+    ///   assistant_persisted -> <turn>:assistant:1   52 chars (preamble)
+    ///   assistant_persisted -> <turn>:assistant:2 3683 chars (the answer)
+    ///
+    /// Segment 2 matches nothing the client has seen. This pins that the
+    /// answer still renders exactly once.
+    #[test]
+    fn mismatched_server_segment_ids_do_not_duplicate_the_answer() {
+        let session_id = SessionKey("local:test".into());
+        let wire = "019fd09a-9b0a-7f80-bb04-997cdee903fe";
+        let seg1 = format!("{wire}:assistant:1");
+        let seg2 = format!("{wire}:assistant:2");
+        const PREAMBLE: &str = "Reviewing the design docs first:";
+        const ANSWER: &str = "Here is the critical review of the design.";
+
+        let mut store = Store {
+            state: AppState::new(
+                vec![open_session_on("test")],
+                0,
+                "ready".into(),
+                None,
+                false,
+            ),
+        };
+        let mut seq = 0u64;
+        let mut send = |store: &mut Store, payload: PayloadV2| {
+            seq += 1;
+            store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+                session_id.clone(),
+                seq,
+                wire,
+                payload,
+            )));
+        };
+
+        send(
+            &mut store,
+            PayloadV2::UserMessage {
+                text: "review the design".into(),
+                files: vec![],
+            },
+        );
+        // The whole turn streams under segment 1 — preamble, tool call, answer.
+        for chunk in [PREAMBLE, "\n\n"] {
+            send(
+                &mut store,
+                PayloadV2::AssistantDelta {
+                    text: chunk.into(),
+                    assistant_segment_id: seg1.clone(),
+                },
+            );
+        }
+        send(
+            &mut store,
+            PayloadV2::ToolStart {
+                tool_call_id: "tool-1".into(),
+                name: "read_file".into(),
+                arguments_preview: None,
+            },
+        );
+        send(
+            &mut store,
+            PayloadV2::AssistantDelta {
+                text: ANSWER.into(),
+                assistant_segment_id: seg1.clone(),
+            },
+        );
+        // Canonical rows land at the END, and their indices disagree with the
+        // single segment the deltas opened.
+        for (segment, text) in [(&seg1, PREAMBLE), (&seg2, ANSWER)] {
+            send(
+                &mut store,
+                PayloadV2::AssistantPersisted {
+                    text: text.into(),
+                    assistant_segment_id: segment.clone(),
+                    meta: octos_core::ui_protocol::MessageMeta {
+                        message_id: format!("msg-{segment}"),
+                        persisted_at: chrono::Utc::now(),
+                        media: vec![],
+                    },
+                },
+            );
+        }
+
+        let session = store
+            .state
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .expect("session");
+        let mut seen = session
+            .messages
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>();
+        if let Some(live_reply) = session.live_reply.as_ref() {
+            seen.push(live_reply.text.clone());
+        }
+        let visible = seen.join("\n");
+        assert_eq!(
+            visible.matches(ANSWER).count(),
+            1,
+            "the answer must render exactly once, got: {visible:?}"
+        );
+        assert_eq!(
+            visible.matches(PREAMBLE).count(),
+            1,
+            "the preamble must render exactly once, got: {visible:?}"
+        );
+    }
+
+    /// #471 (the half the store-level tests could not see): a tool-using turn
+    /// streams its WHOLE answer over the legacy lane (deltas carry no segment
+    /// id), the inline viewport flushes the stable prefix into NATIVE
+    /// SCROLLBACK while the turn runs, and only then do the canonical
+    /// `assistant_persisted` rows replay — preamble and final answer as two
+    /// segments.
+    ///
+    /// The #379 clear + re-seed rebuilt the live reply as `preamble+answer`
+    /// with the streamed glue ("\n\n") dropped — a NON-PREFIX rewrite of a
+    /// buffer whose prefix was already immutable in scrollback. The watermark
+    /// (correctly) refuses to advance over a buffer that no longer starts with
+    /// it, commit-time coverage (correctly) only dedups a message that starts
+    /// with the flushed text, so the committed block re-rendered everything the
+    /// user had already read: the answer on screen twice.
+    ///
+    /// Pins the whole chain: flushed watermark + rebuilt commit + dedup render
+    /// must show each part of the answer exactly once.
+    #[test]
+    fn flushed_legacy_prefix_renders_once_after_canonical_replay() {
+        use crate::cli::ThemeName;
+        use crate::theme::Palette;
+
+        const PREAMBLE: &str = "Reviewing the design docs first:";
+        const ANSWER_HEAD: &str = "Here is the critical review of the design.";
+        const ANSWER_TAIL: &str = "Overall the plan is sound.";
+
+        let turn = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        // The legacy lane glued the paragraphs with blank lines as they
+        // streamed — this is the reconstructed 3738-char shape from the wire
+        // capture, in miniature.
+        let streamed = format!("{PREAMBLE}\n\n{ANSWER_HEAD}\n\n{ANSWER_TAIL}");
+        let mut store = store_with_live_reply(turn.clone(), streamed.clone());
+
+        // One inline-viewport frame while the turn is still live: the stable
+        // prefix (through the last blank line) is written to native scrollback.
+        let watermark = crate::app::next_live_turn_finalization(&store.state, None)
+            .expect("live turn advances the flush watermark");
+        assert!(
+            watermark.reply_flushed_text.contains(ANSWER_HEAD),
+            "precondition: the answer head flushed to scrollback before the \
+             canonical rows arrived, got {:?}",
+            watermark.reply_flushed_text
+        );
+        assert!(
+            streamed.starts_with(watermark.reply_flushed_text.as_str()),
+            "precondition: the watermark is a prefix of the streamed text"
+        );
+
+        // Canonical replay lands at the END of the turn: two persisted rows
+        // whose glue differs from what streamed (52 + 3683 = 3735 vs 3738 on
+        // the real wire).
+        store.apply_v2_assistant_persisted(&session_id, &turn, "seg-1".into(), PREAMBLE.into());
+        store.apply_v2_assistant_persisted(
+            &session_id,
+            &turn,
+            "seg-2".into(),
+            format!("{ANSWER_HEAD}\n\n{ANSWER_TAIL}"),
+        );
+
+        // The live buffer must stay an EXTENSION of what scrollback already
+        // holds — the invariant the non-prefix rebuild violated.
+        let live = store.state.sessions[0]
+            .live_reply
+            .as_ref()
+            .expect("live reply survives the replay")
+            .text
+            .clone();
+        assert!(
+            live.starts_with(watermark.reply_flushed_text.as_str()),
+            "the canonical replay must not rewrite text that already flushed \
+             to immutable scrollback: watermark {:?} vs live {:?}",
+            watermark.reply_flushed_text,
+            live
+        );
+
+        // The legacy terminal commits the reply; the viewport then renders the
+        // newly committed history against the archived watermark (the exact
+        // `finalized_history_lines_range_dedup_live` call in viewport.rs).
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        let rendered = crate::app::finalized_history_lines_range_dedup_live(
+            &store.state,
+            Palette::for_theme(ThemeName::Codex),
+            120,
+            0,
+            std::slice::from_ref(&watermark),
+        );
+        let rendered_text = rendered
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Native scrollback already holds the watermark text; the dedup render
+        // appends below it. Each part of the answer must appear exactly once
+        // across the two.
+        let on_screen = format!("{}\n{}", watermark.reply_flushed_text, rendered_text);
+        for part in [PREAMBLE, ANSWER_HEAD, ANSWER_TAIL] {
+            assert_eq!(
+                on_screen.matches(part).count(),
+                1,
+                "{part:?} must render exactly once, got:\n{on_screen}"
+            );
+        }
     }
 
     /// stdio wedge regression (#379 review F1): the persisted v2 rows register
@@ -36640,6 +39108,72 @@ now analyzing the bus module"
         );
     }
 
+    /// A lane saved OUTSIDE the wizard must still say a restart is required.
+    ///
+    /// The server persists the lane but does NOT rebuild the live runtime — the
+    /// isolated research router is built once at `ProfileRuntime` bootstrap — so
+    /// it sends `restart_required` specifically "so the client never presents a
+    /// persisted change as already-live". The client did not deserialise that
+    /// field, and the only restart notice lived on the WIZARD path
+    /// (`status.research_lane_saved`). An inline `/research add` therefore
+    /// reported a bare success while deep_research kept resolving `cheap` /
+    /// `strong` to the coding provider — the lane looked configured and did
+    /// nothing.
+    #[test]
+    fn inline_lane_save_announces_that_a_restart_is_required() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(lane_capabilities());
+        // No wizard save in flight: this is the inline `/research add` path.
+        assert!(store.state.onboarding.provider_pending.is_none());
+
+        store.apply_sub_providers_mutation_event(SubProvidersMutationClientEvent {
+            result: crate::model::SubProvidersMutationResult {
+                profile_id: Some("coding".into()),
+                sub_providers: vec![crate::model::SubProviderView {
+                    key: "strong".into(),
+                    provider: Some("moonshot".into()),
+                    model: Some("kimi-k3".into()),
+                    ..Default::default()
+                }],
+                applied: true,
+                restart_required: true,
+                runtime_policy_stamp: None,
+            },
+            message: "research lane saved".into(),
+        });
+
+        assert!(
+            store.state.status.contains("restart"),
+            "an applied lane save must tell the user a restart is needed, else the \
+             lane looks live while deep_research still uses the coding provider; \
+             got {:?}",
+            store.state.status
+        );
+    }
+
+    /// A mutation that did NOT apply must not claim a restart is needed.
+    #[test]
+    fn an_unapplied_mutation_does_not_ask_for_a_restart() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(lane_capabilities());
+
+        store.apply_sub_providers_mutation_event(SubProvidersMutationClientEvent {
+            result: crate::model::SubProvidersMutationResult {
+                profile_id: Some("coding".into()),
+                sub_providers: Vec::new(),
+                applied: false,
+                restart_required: false,
+                runtime_policy_stamp: None,
+            },
+            message: "nothing changed".into(),
+        });
+
+        assert_eq!(
+            store.state.status, "nothing changed",
+            "an unapplied mutation must pass the server message through untouched"
+        );
+    }
+
     /// PR384 fix F2 (corrected): an applied lane mutation completes the
     /// wizard's OWN lane save — consumes the pending flag, records the save,
     /// resets the staged selection (like a fallback save), clears the intent,
@@ -36666,6 +39200,7 @@ now analyzing the bus module"
                     ..Default::default()
                 }],
                 applied: true,
+                restart_required: true,
                 runtime_policy_stamp: None,
             },
             message: "research lane saved".into(),
@@ -36718,6 +39253,7 @@ now analyzing the bus module"
                 profile_id: Some("coding".into()),
                 sub_providers: Vec::new(),
                 applied: true,
+                restart_required: true,
                 runtime_policy_stamp: None,
             },
             message: "lane removed".into(),
@@ -36908,6 +39444,7 @@ now analyzing the bus module"
                     })
                     .collect(),
                 applied: true,
+                restart_required: true,
                 runtime_policy_stamp: None,
             },
             message: "lanes updated".into(),
@@ -37017,5 +39554,38 @@ now analyzing the bus module"
             "a refused entry must not leave a live lane intent behind"
         );
         assert!(!store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+    }
+}
+
+#[cfg(test)]
+mod activity_line_width_tests {
+    use super::*;
+
+    /// `session_activity_line` capped at 60 CHARS. The peer dock row
+    /// (`app::peer_activity_line`) and the Alt+S switcher rows both budget in
+    /// COLUMNS, so a CJK summary was twice its allowance and overflowed.
+    #[test]
+    fn session_activity_line_caps_columns_not_chars() {
+        use unicode_width::UnicodeWidthStr;
+        let session_id = SessionKey("local:b".into());
+        let long = "正在重构速率限制器并为并发请求增加背压控制以避免上游服务被打满".repeat(3);
+        let session = SessionView {
+            id: session_id.clone(),
+            title: "b".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![Message::assistant(long)],
+            tasks: vec![],
+            live_reply: None,
+        };
+        let state = AppState::new(vec![session], 0, "ready".into(), None, false);
+
+        let line = state
+            .session_activity_line(&session_id)
+            .expect("activity line present");
+        assert!(
+            line.width() <= 60,
+            "the activity line budget is 60 columns, got {} columns: {line:?}",
+            line.width()
+        );
     }
 }

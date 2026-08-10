@@ -620,6 +620,7 @@ fn chat_layout_areas_for_menu(
     let harness_height = harness_status_height(app);
     let decision_height = decision_banner_height(app);
     let agent_strip_height = agent_strip_height(app, area.height);
+    let status_height = render::status_bar_height(app, area.width);
     let surface_budget = area.height.saturating_sub(
         min_transcript_height(area.height)
             + session_strip_height
@@ -628,7 +629,7 @@ fn chat_layout_areas_for_menu(
             + harness_height
             + decision_height
             + agent_strip_height
-            + 1,
+            + status_height,
     );
     let menu_height = desired_menu_height.min(surface_budget);
     let root = Layout::default()
@@ -642,7 +643,7 @@ fn chat_layout_areas_for_menu(
             Constraint::Length(decision_height),
             Constraint::Length(composer_height),
             Constraint::Length(agent_strip_height),
-            Constraint::Length(1),
+            Constraint::Length(status_height),
         ])
         .split(area);
 
@@ -993,8 +994,15 @@ fn is_running_activity(item: &ActivityItem) -> bool {
 
 /// True for a fresh session that has no messages yet — where we show the launch
 /// banner at the top of the transcript area (it scrolls away on the first turn).
+/// Visible client-local REPORTS dismiss it too: a `/loop list` result or a
+/// `!`-bang report (running or settled) in a fresh session must render instead
+/// of being covered by the banner. Deliberately NOT gated on plain activity:
+/// most `push_local_activity` rows are unstamped, and letting any of them
+/// suppress the banner while the idle turn flow renders none of them left a
+/// blank transcript area (codex on #513).
 fn launch_banner_active(app: &AppState) -> bool {
     app.pending_messages.is_empty()
+        && flow_report_items(app).is_empty()
         && app
             .active_session()
             .is_some_and(|session| session.messages.is_empty() && session.live_reply.is_none())
@@ -2418,16 +2426,76 @@ fn is_active_group(app: &AppState, group_turn: Option<&octos_core::ui_protocol::
     }
 }
 
+/// Test-only: render `app` to a row-aware buffer string. Keeping row separators
+/// lets store-level tests prove that a multi-line report really occupies
+/// distinct terminal rows instead of merely finding its data in the model.
+#[cfg(test)]
+pub(crate) fn debug_render_text(app: &AppState) -> String {
+    debug_render_text_with_size(app, 120, 42)
+}
+
+#[cfg(test)]
+pub(crate) fn debug_render_text_with_size(app: &AppState, width: u16, height: u16) -> String {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| render(frame, app, Palette::for_theme(crate::cli::ThemeName::Slate)))
+        .expect("render succeeds");
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(" "))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn flow_activity_items(app: &AppState) -> Vec<&ActivityItem> {
     let active_turn_id = app.active_turn().map(|(_, turn_id)| turn_id);
+    let active_session_id = app.active_session().map(|session| &session.id);
     app.activity
         .iter()
+        // An item STAMPED with a session belongs to that session's transcript
+        // and nowhere else. Without this, a background session's turn-less
+        // chips (agent/updated, for one) rendered in whichever session happened
+        // to be focused — the cross-session bleed #247 closed elsewhere. Items
+        // with no session are local/global and still render everywhere, which
+        // is what the majority of `push_activity` callers rely on.
+        .filter(|item| match (item.session_id.as_ref(), active_session_id) {
+            (Some(item_session), Some(active)) => item_session == active,
+            (Some(_), None) => false,
+            (None, _) => true,
+        })
+        // Reports have their own full-fidelity transcript block. Feeding one
+        // into this collection would count it as an agent action and subject it
+        // to settled-group collapse before the report renderer can see it.
+        .filter(|item| item.kind != ActivityKind::Report)
         .filter(|item| match active_turn_id {
             Some(turn_id) => item.turn_id.as_ref() == Some(turn_id),
             // When no turn is active, turn-less running sub-agent progress is
             // folded into the orchestrating turn's chip (as children) — don't
             // also render it here as a separate turn-less "Orchestrating" chip.
             None => item.turn_id.is_none() && !is_subagent_progress(app, item),
+        })
+        .collect()
+}
+
+/// Client-local transcript reports visible in the current chat context.
+/// Unscoped reports (such as global `/loop list`) remain visible without a
+/// session; scoped reports follow their owning session and never bleed into a
+/// different session after the operator switches focus.
+fn flow_report_items(app: &AppState) -> Vec<&ActivityItem> {
+    let active_session_id = app.active_session().map(|session| &session.id);
+    app.activity
+        .iter()
+        .filter(|item| item.kind == ActivityKind::Report)
+        .filter(|item| match item.session_id.as_ref() {
+            Some(owner) => active_session_id == Some(owner),
+            None => true,
         })
         .collect()
 }
@@ -2491,7 +2559,33 @@ fn spinner_frame() -> &'static str {
     use std::time::Instant;
     static START: OnceLock<Instant> = OnceLock::new();
     let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
-    SPINNER_FRAMES[(elapsed / 160) as usize % SPINNER_FRAMES.len()]
+    SPINNER_FRAMES[(elapsed / turn_spinner_period_ms()) as usize % SPINNER_FRAMES.len()]
+}
+
+/// Frame period of the turn spinner, in milliseconds. Exposed so the loop
+/// indicator can prove it animates on a calmer cadence.
+pub(crate) fn turn_spinner_period_ms() -> u128 {
+    160
+}
+
+/// Frame period of the LOOP indicator's rotation. The autonomy row is
+/// permanently visible while a loop is armed, so it rotates ~3x slower than
+/// the turn spinner — liveness without visual noise (spec
+/// task-loop-liveness-indicator).
+pub(crate) fn loop_spinner_period_ms() -> u128 {
+    520
+}
+
+const LOOP_SPINNER_FRAMES: [&str; 4] = ["↻", "↺", "↻", "↺"];
+
+/// Current loop-rotation frame, riding the same process clock as
+/// `spinner_frame` but on the slower `loop_spinner_period_ms` cadence.
+fn loop_spinner_frame() -> &'static str {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
+    LOOP_SPINNER_FRAMES[(elapsed / loop_spinner_period_ms()) as usize % LOOP_SPINNER_FRAMES.len()]
 }
 
 /// Seconds since process start — the same process clock `spinner_frame` rides,
@@ -3004,7 +3098,18 @@ fn running_subagent_titles_for_chip(
             Some(task_turn) => task_turn == chip_turn,
             None => owns_unattributed,
         })
-        .map(|task| task.title.clone())
+        .map(|task| {
+            // Elapsed suffix (spec task-approval-ux-salience): the chip row
+            // must show a long-running sub-agent is aging, not frozen. The
+            // live chip repaints on the animation cadence, so this refreshes
+            // for free while the turn is active.
+            let elapsed = app
+                .task_first_seen
+                .get(&task.id)
+                .map(|seen| format!(" · {}", format_elapsed_secs(seen.elapsed().as_secs())))
+                .unwrap_or_default();
+            format!("{}{elapsed}", task.title)
+        })
         .collect()
 }
 
@@ -3417,6 +3522,149 @@ fn autonomy_loop_cadence(record: &octos_core::ui_protocol::UiLoopRecord) -> Stri
     }
 }
 
+/// Coarse duration for loop chips: hours+minutes past an hour, else the
+/// existing minute/second form. `format_elapsed_secs` alone renders three
+/// hours as "179m 59s", which reads as noise on a permanently visible row.
+pub(crate) fn format_loop_duration(secs: u64) -> String {
+    if secs >= 86_400 {
+        format!("{}d {}h", secs / 86_400, (secs % 86_400) / 3600)
+    } else if secs >= 3600 {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format_elapsed_secs(secs)
+    }
+}
+
+/// Milliseconds from now until `at_ms`, or `None` when the instant is absent
+/// or already past (a stale countdown is worse than none).
+fn millis_until(at_ms: Option<i64>) -> Option<u64> {
+    let target = at_ms?;
+    let now = chrono::Utc::now().timestamp_millis();
+    (target > now).then(|| (target - now) as u64)
+}
+
+/// Seconds until the loop's next run, when it has one scheduled.
+fn loop_next_run_secs(record: &octos_core::ui_protocol::UiLoopRecord) -> Option<u64> {
+    millis_until(record.next_run_at_ms).map(|ms| ms / 1000)
+}
+
+/// Seconds until the loop expires on its own.
+fn loop_expiry_secs(record: &octos_core::ui_protocol::UiLoopRecord) -> Option<u64> {
+    millis_until(Some(record.expires_at_ms)).map(|ms| ms / 1000)
+}
+
+/// The live detail suffix for a loop chip (spec task-loop-liveness-indicator):
+/// ` · 第 N 轮 · 下次 2m 14s · 剩 3h 0m`. Every segment is derived from real
+/// record data and omitted when that data is absent — no invented progress.
+fn autonomy_loop_detail(app: &AppState, record: &octos_core::ui_protocol::UiLoopRecord) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let fires = app
+        .loop_fire_counts
+        .get(&(record.session_id.clone(), record.loop_id.clone()))
+        .copied()
+        .unwrap_or(0);
+    if fires > 0 {
+        parts.push(t!("app.autonomy.loop_iteration", count = fires).into_owned());
+    }
+    if autonomy_loop_is_active(record) {
+        match loop_next_run_secs(record) {
+            Some(secs) => parts.push(
+                t!(
+                    "app.autonomy.loop_next_run",
+                    remaining = format_loop_duration(secs)
+                )
+                .into_owned(),
+            ),
+            None => parts.push(t!("app.autonomy.loop_next_run_pending").into_owned()),
+        }
+    }
+    if let Some(secs) = loop_expiry_secs(record) {
+        parts.push(
+            t!(
+                "app.autonomy.loop_expires_in",
+                remaining = format_loop_duration(secs)
+            )
+            .into_owned(),
+        );
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", parts.join(" · "))
+    }
+}
+
+/// Render the `/loop list` result as transcript lines (spec
+/// task-loop-list-transcript). Each row leads with the loop id — the four
+/// id-taking verbs (`pause` / `resume` / `delete` / `fire-now`) had no other
+/// source for it, which made them unusable from the UI.
+pub(crate) fn format_loop_list_block(
+    loops: &[octos_core::ui_protocol::UiLoopRecord],
+    // A GLOBAL list spans sessions, so each row names the session it belongs
+    // to. A SCOPED list shares one known session — repeating it every row is
+    // noise (spec task-loop-list-global-decode).
+    global: bool,
+) -> String {
+    if loops.is_empty() {
+        return t!("status.loop_list_empty_hint").into_owned();
+    }
+    loops
+        .iter()
+        .map(|record| {
+            let mut segments = vec![autonomy_loop_cadence(record)];
+            if let Some(secs) =
+                loop_next_run_secs(record).filter(|_| autonomy_loop_is_active(record))
+            {
+                segments.push(
+                    t!(
+                        "app.autonomy.loop_next_run",
+                        remaining = format_loop_duration(secs)
+                    )
+                    .into_owned(),
+                );
+            }
+            // Drop the profile prefix: in a global list every row shares
+            // the queried profile, so repeating it adds width without info.
+            let session = if global {
+                let key = &record.session_id;
+                let shown = key
+                    .profile_id()
+                    .and_then(|profile| {
+                        key.0
+                            .strip_prefix(profile)
+                            .map(|r| r.trim_start_matches(':'))
+                    })
+                    .unwrap_or(key.0.as_str());
+                format!("  [{shown}]")
+            } else {
+                String::new()
+            };
+            format!(
+                "{}  {}  {}  {}{}",
+                record.loop_id,
+                record.status,
+                segments.join(" · "),
+                autonomy_loop_label(record),
+                session
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Shortest next-run countdown across the active session's active loops,
+/// pre-formatted for the status bar chip. `None` when no active loop has a
+/// scheduled next run (a self-paced loop mid-turn).
+pub(crate) fn active_loop_countdown(app: &AppState) -> Option<String> {
+    active_session_autonomy(app)?
+        .loops
+        .iter()
+        .filter(|record| autonomy_loop_is_active(record))
+        .filter_map(loop_next_run_secs)
+        .min()
+        .map(format_loop_duration)
+}
+
 /// True when a loop is in the runnable `"active"` state. Paused / deleted
 /// loops still appear in the chip row but are dimmed.
 fn autonomy_loop_is_active(record: &octos_core::ui_protocol::UiLoopRecord) -> bool {
@@ -3548,7 +3796,16 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette, width: u16) -> Vec
             .count();
         let paused = state.loops.iter().filter(|l| l.status == "paused").count();
         spans.push(Span::styled(
-            "↻ ",
+            // Slow rotation (spec task-loop-liveness-indicator): a permanently
+            // visible row must read as alive without becoming noise.
+            format!(
+                "{} ",
+                if running > 0 {
+                    loop_spinner_frame()
+                } else {
+                    "↻"
+                }
+            ),
             Style::default()
                 .fg(palette.accent)
                 .add_modifier(Modifier::BOLD)
@@ -3563,15 +3820,41 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette, width: u16) -> Vec
             palette.title().bg(palette.surface),
         ));
         spans.push(Span::styled("   ", palette.text().bg(palette.surface)));
+        // Width accounting for the whole-chip fit (spec
+        // task-loop-row-overflow): reserve room for the worst-case overflow
+        // hint so adding it can never push the row past `width`.
+        let mut used_width: usize = spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum();
+        let mut dropped_chips = 0usize;
+        let overflow_reserve = UnicodeWidthStr::width(
+            t!("app.autonomy.loops_overflow", count = state.loops.len()).as_ref(),
+        ) + 1;
+        let budget = (width as usize).saturating_sub(overflow_reserve);
         for record in &state.loops {
             let label = autonomy_loop_label(record);
             let cadence = autonomy_loop_cadence(record);
-            let chip = format!("[{cadence} {label}]");
+            let detail = autonomy_loop_detail(app, record);
+            let chip = if detail.is_empty() {
+                format!("[{cadence} {label}]")
+            } else {
+                format!("[{cadence}{detail} {label}]")
+            };
             let chip_style = if autonomy_loop_is_active(record) {
                 palette.text().bg(palette.surface)
             } else {
                 palette.muted().bg(palette.surface)
             };
+            // Spec task-loop-row-overflow: fit WHOLE chips. A chip that would
+            // not fit is folded into a trailing `+N more` instead of being
+            // hard-cut by ratatui, which used to drop its tail silently.
+            let chip_width = UnicodeWidthStr::width(chip.as_str()) + 1;
+            if used_width + chip_width > budget {
+                dropped_chips += 1;
+                continue;
+            }
+            used_width += chip_width;
             spans.push(Span::styled(chip, chip_style));
             spans.push(Span::styled(" ", palette.text().bg(palette.surface)));
         }
@@ -3579,7 +3862,16 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette, width: u16) -> Vec
         if matches!(spans.last(), Some(s) if s.content == " ") {
             spans.pop();
         }
-        lines.push(Line::from(spans));
+        if dropped_chips > 0 {
+            spans.push(Span::styled(
+                format!(
+                    " {}",
+                    t!("app.autonomy.loops_overflow", count = dropped_chips)
+                ),
+                palette.muted().bg(palette.surface),
+            ));
+        }
+        lines.push(Line::from(clip_line_spans(spans, width as usize)));
     }
     if let Some(plan) = state.plan.as_ref() {
         lines.extend(plan_indicator_lines(plan, palette));
@@ -4422,9 +4714,11 @@ pub(crate) fn context_window_usage(app: &AppState, session_id: &SessionKey) -> O
     Some((used, window))
 }
 
-/// Context-window fill ratio (0.0..=1.0) for the harness row `LineGauge`, or
-/// `None` when no `token_estimate` is known for the active session yet.
-fn harness_context_ratio(app: &AppState) -> Option<f64> {
+/// Raw context-window fill for the active session — UNCLAMPED, so an estimate
+/// over the window reads >1.0 (e.g. a server-rebuilt ledger published before
+/// its open/pre-turn compaction pass). `None` when no `token_estimate` is
+/// known for the active session yet.
+fn harness_context_fill(app: &AppState) -> Option<f64> {
     let session = app.active_session()?;
     let token_estimate = app
         .context_lifecycle_for(&session.id)?
@@ -4443,12 +4737,22 @@ fn harness_context_ratio(app: &AppState) -> Option<f64> {
     if window == 0 {
         return None;
     }
-    Some((token_estimate as f64 / window as f64).clamp(0.0, 1.0))
+    Some(token_estimate as f64 / window as f64)
 }
 
-/// Integer context-window percent (0..=100) for the `ctx N%` label.
+/// Context-window fill ratio (0.0..=1.0) for the harness row `LineGauge`, or
+/// `None` when no `token_estimate` is known for the active session yet.
+fn harness_context_ratio(app: &AppState) -> Option<f64> {
+    harness_context_fill(app).map(|fill| fill.clamp(0.0, 1.0))
+}
+
+/// Integer context-window percent for the `ctx N%` label. Deliberately NOT
+/// clamped at 100: the label prints the raw used/max counts next to it, and a
+/// clamped percent contradicts them (`ctx 1.2M/1M ~100%` — field report
+/// 2026-08-07). Saturates at 999 so a pathological estimate cannot blow the
+/// status row width open.
 fn harness_context_percent(app: &AppState) -> Option<u16> {
-    harness_context_ratio(app).map(|ratio| (ratio * 100.0).round() as u16)
+    harness_context_fill(app).map(|fill| ((fill * 100.0).round() as u64).min(999) as u16)
 }
 
 /// Full context-window label for the harness gauge/row: `ctx 128K/1M ~13%`.
@@ -4518,7 +4822,7 @@ fn harness_status_lines(
     let mut spans: Vec<Span<'static>> = Vec::new();
     // Water-wave gradient on "spinner + phase" (e.g. "◠ Working"): a bright crest
     // ripples across the label, advanced by the ~25ms animation redraw via the
-    // shared process clock. Uses Color::Rgb like the rest of octos-tui's themes
+    // shared process clock. Uses Color::Rgb like the rest of octoscode's themes
     // (truecolor-assuming, so it works over SSH where COLORTERM isn't forwarded);
     // the non-RGB Terminal theme degrades to a neutral-grey ripple via rgb_of.
     let label = format!("{} {}", spinner_frame(), phase);
@@ -4533,6 +4837,17 @@ fn harness_status_lines(
         &stops,
         palette.surface,
     ));
+
+    // Live action count (spec task-activity-compact-fold): a silent agentic
+    // turn (zero interleaved text) still shows a pulse here. Independent of
+    // the orchestration status block below.
+    let action_count = flow_activity_items(app).len();
+    if action_count > 0 {
+        spans.push(Span::styled(
+            format!(" · {}", t!("app.statusbar.actions", count = action_count)),
+            palette.muted().bg(palette.surface),
+        ));
+    }
 
     if let Some(status) = status {
         if status.running_agents > 0 {
@@ -4736,7 +5051,7 @@ fn composer_cursor_row_and_width(
             (view.cursor_row, view.cursor_width)
         }
         ComposerPresentation::Collapsed(collapse) => {
-            (0, "[paste] ".width() + collapse.summary.width())
+            (0, "[paste ]".width() + collapse.summary.width())
         }
     }
 }

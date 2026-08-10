@@ -224,7 +224,7 @@ pub struct ProtocolAppUiBackend {
     /// Latched when the spawned backend refuses to start because another serve
     /// owns the data dir ([`DATA_DIR_LOCKED_MARKER`]). While set, reconnect is
     /// suppressed so we don't respawn a backend that will only crash again —
-    /// the fix for the "two octos-tui competing for the DB" silent crash-loop.
+    /// the fix for the "two octoscode competing for the DB" silent crash-loop.
     fatal_error: Option<String>,
     /// The session to re-open after a reconnect: the MOST RECENTLY opened
     /// session, which tracks the user's current selection (set by `/resume`, a
@@ -371,6 +371,11 @@ struct PendingRequest {
 struct ProtocolExchange {
     pending_requests: HashMap<String, PendingRequest>,
     session_cursors: HashMap<SessionKey, UiCursor>,
+    /// Server-confirmed `workspace_root` per session, captured from
+    /// `session/opened` (see [`Self::record_event_state`]). Used by the
+    /// reconnect/launch reopen to scope to the session's real workspace, not
+    /// `launch.cwd` (#476).
+    session_workspace_roots: HashMap<SessionKey, String>,
     next_request_id: u64,
 }
 
@@ -499,6 +504,13 @@ impl ProtocolExchange {
                 if let Some(cursor) = &opened.cursor {
                     self.session_cursors
                         .insert(opened.session_id.clone(), cursor.clone());
+                }
+                // Capture the server-confirmed workspace root so a respawn
+                // reopen scopes to the session's real workspace (#476), not
+                // `launch.cwd` (the shell's dir for a bare `octoscode`).
+                if let Some(root) = &opened.workspace_root {
+                    self.session_workspace_roots
+                        .insert(opened.session_id.clone(), root.clone());
                 }
             }
             AppUiEvent::Protocol(UiNotification::TurnCompleted(completed)) => {
@@ -847,10 +859,10 @@ impl StdioTransportDriver {
                 let mut command = shell_command(&self.command);
                 // Multi-instance stdio: isolate this window's runtime (redb
                 // stores, sessions, goals, the serve flock) under a per-cwd
-                // instance dir so several octos-tui windows can run at once
+                // instance dir so several octoscode windows can run at once
                 // while sharing one profile registry. No-op for explicit
                 // --data-dir launches, remote launches, or when opted out via
-                // OCTOS_TUI_SHARED_INSTANCE. Re-spawns (reconnects) resolve to
+                // OCTOSCODE_SHARED_INSTANCE. Re-spawns (reconnects) resolve to
                 // the same dir, so a reconnect re-attaches, not forks.
                 if let Some(instance_dir) = crate::profiles::instance_data_dir_for_launch(
                     Some(&self.command),
@@ -1478,7 +1490,7 @@ impl ProtocolAppUiBackend {
     ///
     /// This intentionally bypasses every server-side guard (no SafePolicy /
     /// blocklist, no sandbox, no `BLOCKED_ENV_VARS` scrub) — that is the
-    /// Claude Code `!` model: the command runs on the machine octos-tui runs
+    /// Claude Code `!` model: the command runs on the machine octoscode runs
     /// on, with the TUI launch dir as cwd and the inherited environment. The
     /// activity card labels it as a local shell command (the mitigation).
     ///
@@ -1623,7 +1635,7 @@ impl ProtocolAppUiBackend {
 
         // The backend refused to start because another octos serve already owns
         // this data directory (redb single-writer). Respawning it would only
-        // crash again — the silent ~5s loop the user hit with two octos-tui
+        // crash again — the silent ~5s loop the user hit with two octoscode
         // windows. Latch a fatal state (suppresses reconnect in
         // `ensure_connected`) and surface one clear, terminal error INSTEAD OF
         // the raw stderr status (suppressed below). Latch once so a
@@ -1631,9 +1643,9 @@ impl ProtocolAppUiBackend {
         let is_fatal_conflict = message.contains(DATA_DIR_LOCKED_MARKER);
         if is_fatal_conflict && self.fatal_error.is_none() {
             let explanation =
-                "Another octos-tui is already running and using this data directory, so this \
+                "Another octoscode is already running and using this data directory, so this \
                  window can't start its own backend (the database allows only one at a time). \
-                 Close the other octos-tui window (or any `octos serve`), then restart this one. \
+                 Close the other octoscode window (or any `octos serve`), then restart this one. \
                  To run two at once, start this one in a workspace with its own data directory."
                     .to_string();
             self.fatal_error = Some(explanation.clone());
@@ -1678,11 +1690,21 @@ impl ProtocolAppUiBackend {
 
     fn launch_session_open_command(&self) -> Option<AppUiCommand> {
         self.launch.session_id.clone().map(|session_id| {
+            // Same workspace-root precedence as the reconnect reopen: prefer
+            // the session's server-confirmed root over `launch.cwd` so a
+            // relaunch from a different shell directory does not rescope the
+            // launch session (#476).
+            let cwd = self
+                .protocol
+                .session_workspace_roots
+                .get(&session_id)
+                .cloned()
+                .or_else(|| self.launch.cwd.clone());
             AppUiCommand::OpenSession(SessionOpenParams {
                 session_id,
                 topic: None,
                 profile_id: self.launch.profile_id.clone(),
-                cwd: self.launch.cwd.clone(),
+                cwd,
                 sandbox: None,
                 after: None,
             })
@@ -1732,9 +1754,25 @@ impl ProtocolAppUiBackend {
     /// session (tracks the current selection), falling back to the launch
     /// `--session` when nothing has been opened yet.
     fn reopen_session_open_command(&self) -> Option<AppUiCommand> {
+        // Prefer the session's server-confirmed workspace root for the reopen
+        // cwd: a bare `octoscode` (no --cwd) falls back to the shell's
+        // current_dir for `launch.cwd`, which may differ from the session's
+        // workspace. Reopening with the shell's cwd rescopes the session to
+        // the wrong `~cwd-<hash>` and presents an empty session (#476). The
+        // captured root is the authoritative scope; `launch.cwd` is only the
+        // launch-time request and must not override it.
         self.reopen_session
             .clone()
-            .map(AppUiCommand::OpenSession)
+            .map(|mut params| {
+                if let Some(root) = self
+                    .protocol
+                    .session_workspace_roots
+                    .get(&params.session_id)
+                {
+                    params.cwd = Some(root.clone());
+                }
+                AppUiCommand::OpenSession(params)
+            })
             .or_else(|| self.launch_session_open_command())
     }
 
@@ -2484,7 +2522,7 @@ fn websocket_request(
 /// Build the `X-Octos-Ui-Features` negotiation value.
 ///
 /// Normally the TUI advertises the full modern feature set. When
-/// `OCTOS_TUI_OLD_SERVER_FEATURES=1` is set it advertises only the
+/// `OCTOSCODE_OLD_SERVER_FEATURES=1` is set it advertises only the
 /// pre-autonomy baseline, dropping the coding autonomy / agent-control /
 /// goal / loop / harness-task-control features. This lets the onboarding
 /// soak exercise the genuine old-server fallback path (header-negotiated):
@@ -2492,7 +2530,7 @@ fn websocket_request(
 /// must hide those controls and never probe `review/start`, `task/list`,
 /// or `task/artifact/*`.
 fn appui_feature_header_value() -> String {
-    let old_server = std::env::var("OCTOS_TUI_OLD_SERVER_FEATURES").as_deref() == Ok("1");
+    let old_server = std::env::var("OCTOSCODE_OLD_SERVER_FEATURES").as_deref() == Ok("1");
     appui_feature_header_for(old_server)
 }
 
@@ -5165,7 +5203,7 @@ impl AppUiBackend for MockAppUiBackend {
 }
 
 fn mock_approval_kind() -> String {
-    std::env::var("OCTOS_TUI_MOCK_APPROVAL_KIND").unwrap_or_else(|_| approval_kinds::COMMAND.into())
+    std::env::var("OCTOSCODE_MOCK_APPROVAL_KIND").unwrap_or_else(|_| approval_kinds::COMMAND.into())
 }
 
 fn mock_model_status(selected: bool) -> ModelStatus {
@@ -6050,6 +6088,8 @@ mod tests {
         let request = rpc_request_from_command(
             "tui-7".into(),
             AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id: SessionKey("local:test".into()),
                 turn_id: TurnId::new(),
                 input: vec![InputItem::Text {
@@ -6078,6 +6118,8 @@ mod tests {
         let request = rpc_request_from_command(
             "tui-9".into(),
             AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id: SessionKey("local:test".into()),
                 turn_id: TurnId::new(),
                 input: vec![
@@ -7665,6 +7707,8 @@ mod tests {
 
         let mutating_commands = [
             AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id: session_id.clone(),
                 turn_id: TurnId::new(),
                 input: vec![InputItem::Text {
@@ -8145,7 +8189,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock is valid")
             .as_nanos();
-        let marker = std::env::temp_dir().join(format!("octos-tui-backoff-{nonce}.log"));
+        let marker = std::env::temp_dir().join(format!("octoscode-backoff-{nonce}.log"));
         let command = format!("echo spawned >> {}; exit 7", marker.display());
 
         let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
@@ -8589,6 +8633,7 @@ mod tests {
             lang: crate::cli::Lang::En,
             scroll_mode: crate::cli::ScrollMode::Native,
             vim_mode: false,
+            steer_mid_turn: false,
         };
 
         let launch = launch_from_cli(&cli);
@@ -8949,7 +8994,7 @@ mod tests {
         assert!(error.message.contains("transport closed for test"));
     }
 
-    /// Two octos-tui competing for the DB: the spawned backend refuses to start
+    /// Two octoscode competing for the DB: the spawned backend refuses to start
     /// (its stderr tail carries `DATA_DIR_LOCKED_MARKER`). The client must latch
     /// a fatal state — surface ONE clean terminal error (not the raw stderr
     /// status) and suppress reconnect so it stops the silent respawn crash-loop.
@@ -8980,7 +9025,7 @@ mod tests {
         };
         assert_eq!(error.code, DATA_DIR_LOCKED_CODE);
         assert!(
-            error.message.contains("Close the other octos-tui"),
+            error.message.contains("Close the other octoscode"),
             "message must be the actionable explanation; got: {}",
             error.message
         );
@@ -9262,6 +9307,8 @@ mod tests {
 
         let request = backend
             .build_tracked_request(AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id: SessionKey("local:test".into()),
                 turn_id: TurnId::new(),
                 input: vec![InputItem::Text {
@@ -9987,6 +10034,7 @@ mod tests {
             lang: crate::cli::Lang::En,
             scroll_mode: crate::cli::ScrollMode::Native,
             vim_mode: false,
+            steer_mid_turn: false,
         };
 
         let launch = launch_from_cli(&cli);
@@ -10323,6 +10371,168 @@ mod tests {
         assert_eq!(request.params["after"]["seq"], 42);
     }
 
+    /// #476: a stdio respawn must tell the REPLACEMENT child the workspace
+    /// cwd. `cwd` is what scopes the server's session store — without it the
+    /// new child opens the UNSCOPED store, so the user's transcript stays on
+    /// disk under `<key>\0~cwd-<hash>` while the UI shows an empty session and
+    /// any peer of the dead child is orphaned. Observed live: ~10 MB of ledger
+    /// stranded that way after the child exited.
+    ///
+    /// `reconnect_reopens_current_session_not_launch_session` below pins
+    /// `session_id` and `profile_id` on the same three paths but never pinned
+    /// `cwd`, so a reopen could lose scoping while every reconnect test stayed
+    /// green.
+    #[test]
+    fn reconnect_reopen_carries_the_workspace_cwd() {
+        let launch_session = SessionKey("local:launch".into());
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            profile_id: Some("coding".into()),
+            session_id: Some(launch_session.clone()),
+            cwd: Some("/tmp/workspace".into()),
+            ..AppUiLaunch::default()
+        });
+
+        let expect_reopen = |backend: &ProtocolAppUiBackend| -> SessionOpenParams {
+            match backend
+                .reopen_session_open_command()
+                .expect("a reopen target must exist")
+            {
+                AppUiCommand::OpenSession(params) => params,
+                other => panic!("reopen must be an OpenSession, got {other:?}"),
+            }
+        };
+
+        // 1. Nothing opened yet — the launch fallback must carry the cwd.
+        assert_eq!(
+            expect_reopen(&backend).cwd.as_deref(),
+            Some("/tmp/workspace"),
+            "the launch-fallback reopen must scope to the workspace"
+        );
+
+        // 2. An explicit open carries its OWN cwd, not the launch one.
+        backend.record_reopen_target(&AppUiCommand::OpenSession(SessionOpenParams {
+            session_id: SessionKey("local:other".into()),
+            topic: None,
+            profile_id: Some("research".into()),
+            cwd: Some("/tmp/other".into()),
+            sandbox: None,
+            after: None,
+        }));
+        assert_eq!(
+            expect_reopen(&backend).cwd.as_deref(),
+            Some("/tmp/other"),
+            "an explicitly opened session reopens under its own workspace"
+        );
+
+        // 3. `/resume` emits a HydrateSession, which has no cwd of its own. It
+        //    must inherit the launch cwd — otherwise a respawn after /resume
+        //    reopens unscoped, which is the reported failure.
+        backend.record_reopen_target(&AppUiCommand::HydrateSession(SessionHydrateParams {
+            session_id: SessionKey("local:hydrated".into()),
+            after: None,
+            include: vec!["messages".into(), "turns".into()],
+        }));
+        assert_eq!(
+            expect_reopen(&backend).cwd.as_deref(),
+            Some("/tmp/workspace"),
+            "a hydrate-sourced reopen must inherit the launch workspace cwd"
+        );
+    }
+
+    #[test]
+    fn reopen_prefers_server_confirmed_workspace_root_over_launch_cwd() {
+        // Regression (#476): a bare `octoscode` (no --cwd) falls back to the
+        // shell's current_dir for `launch.cwd`, which may differ from the
+        // session's real workspace. A respawn reopen must scope to the
+        // server-confirmed `workspace_root` from `session/opened`, not
+        // `launch.cwd`, else the session is rescoped to the wrong
+        // `~cwd-<hash>` and presents as empty.
+        let session_id = SessionKey("local:test".into());
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            profile_id: Some("coding".into()),
+            session_id: Some(session_id.clone()),
+            cwd: Some("/shell/cwd".into()),
+            ..AppUiLaunch::default()
+        });
+
+        // The server confirms the session's real workspace via session/opened.
+        backend
+            .protocol
+            .record_event_state(&AppUiEvent::Protocol(UiNotification::SessionOpened(
+                session_opened_compat(
+                    session_id.clone(),
+                    None,
+                    Some("/real/workspace".into()),
+                    None,
+                    None,
+                ),
+            )));
+
+        // The reconnect reopen (launch-session fallback path) uses the
+        // captured workspace root, not `launch.cwd`.
+        let reopen = backend
+            .reopen_session_open_command()
+            .expect("launch session is the fallback reopen target");
+        let AppUiCommand::OpenSession(reopen) = reopen else {
+            panic!("reopen command must be an OpenSession");
+        };
+        assert_eq!(reopen.session_id, session_id);
+        assert_eq!(
+            reopen.cwd.as_deref(),
+            Some("/real/workspace"),
+            "reopen cwd must be the server-confirmed workspace_root, not launch.cwd"
+        );
+
+        // An explicitly recorded reopen target (e.g. after /resume) also gets
+        // its cwd corrected to the confirmed root.
+        backend.record_reopen_target(&AppUiCommand::OpenSession(SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: Some("coding".into()),
+            cwd: Some("/shell/cwd".into()),
+            sandbox: None,
+            after: None,
+        }));
+        let reopen = backend
+            .reopen_session_open_command()
+            .expect("a reopen target is recorded after opening a session");
+        let AppUiCommand::OpenSession(reopen) = reopen else {
+            panic!("reopen command must be an OpenSession");
+        };
+        assert_eq!(
+            reopen.cwd.as_deref(),
+            Some("/real/workspace"),
+            "recorded reopen target cwd must be overridden by the confirmed workspace_root"
+        );
+
+        // A session with no captured root still falls back to `launch.cwd`.
+        let unknown = SessionKey("local:unknown".into());
+        let backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            endpoint: Some(AppUiEndpoint::websocket(
+                "wss://example.test/ui-protocol",
+                None,
+            )),
+            session_id: Some(unknown.clone()),
+            cwd: Some("/shell/cwd".into()),
+            ..AppUiLaunch::default()
+        });
+        let reopen = backend
+            .launch_session_open_command()
+            .expect("launch session should reopen");
+        let AppUiCommand::OpenSession(reopen) = reopen else {
+            panic!("reopen command must be an OpenSession");
+        };
+        assert_eq!(reopen.cwd.as_deref(), Some("/shell/cwd"));
+    }
+
     #[test]
     fn reconnect_reopens_current_session_not_launch_session() {
         // Regression: a reconnect must re-open the session the user is CURRENTLY
@@ -10451,6 +10661,8 @@ mod tests {
 
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id: session_id.clone(),
                 turn_id: TurnId::new(),
                 input: vec![InputItem::Text {
@@ -10513,6 +10725,8 @@ mod tests {
 
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id: session,
                 turn_id: TurnId::new(),
                 input: vec![InputItem::Text {
@@ -10546,6 +10760,8 @@ mod tests {
         let turn_id = TurnId::new();
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id: session_id.clone(),
                 turn_id: turn_id.clone(),
                 input: vec![InputItem::Text {
@@ -10698,6 +10914,8 @@ mod tests {
 
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                // Ordinary chat turn: context-scoped tools stay unadvertised.
+                tool_context: None,
                 session_id,
                 turn_id,
                 input: vec![InputItem::Text {

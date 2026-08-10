@@ -561,7 +561,7 @@ mod tests {
     /// A `Backend + Write` that records every byte emitted, so tests can assert on
     /// the exact escape-sequence stream `insert_history_lines` writes into the
     /// terminal's real scrollback (codex's tests use a VT100 backend for this; the
-    /// octos-tui crate has no vt100 dep, so we inspect the raw bytes instead).
+    /// octoscode crate has no vt100 dep, so we inspect the raw bytes instead).
     struct RecordingBackend {
         buf: Vec<u8>,
         size: Size,
@@ -877,19 +877,18 @@ mod tests {
                 }
                 let symbol = cell.symbol();
                 let row = &mut self.rows[usize::from(y)];
-                let mut col = usize::from(x);
+                let col = usize::from(x);
                 if symbol.is_empty() {
                     if let Some(target) = row.get_mut(col) {
                         *target = ' ';
                     }
                     continue;
                 }
-                for ch in symbol.chars() {
+                for (col, ch) in (col..).zip(symbol.chars()) {
                     if col >= row.len() {
                         break;
                     }
                     row[col] = ch;
-                    col += 1;
                 }
             }
             Ok(())

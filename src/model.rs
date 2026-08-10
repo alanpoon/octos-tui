@@ -552,14 +552,25 @@ pub struct LoopCreateResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopListParams {
-    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoopListResult {
-    pub session_id: SessionKey,
+    /// Echoed back from the request. A GLOBAL query sends no `session_id`, and
+    /// the server echoes that as `null` — a non-Option field here made the
+    /// whole response undecodable, so the list came back permanently empty
+    /// (spec task-loop-list-global-decode).
+    #[serde(default)]
+    pub session_id: Option<SessionKey>,
+    /// The profile the server RESOLVED for this query. A global query is
+    /// authoritative exactly within this profile — it is what lets the client
+    /// clear stale mirrors without touching other profiles.
+    #[serde(default)]
+    pub profile_id: Option<String>,
     #[serde(default)]
     pub loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
 }
@@ -826,7 +837,7 @@ pub enum AppUiCommand {
     ResumeLoop(LoopIdParams),
     FireLoopNow(LoopIdParams),
     /// `!`-bang client-local shell exec (Claude Code's `!` model). Runs a
-    /// native shell command on the machine octos-tui runs on — NOT the
+    /// native shell command on the machine octoscode runs on — NOT the
     /// agent's sandboxed server `shell` tool — so it intentionally bypasses
     /// every server-side guard. Carries NO JSON-RPC method: the transport
     /// intercepts it directly, spawns the command on its tokio runtime, and
@@ -3789,6 +3800,16 @@ pub struct SubProvidersMutationResult {
     pub sub_providers: Vec<SubProviderView>,
     #[serde(default)]
     pub applied: bool,
+    /// The server PERSISTED the lane but the live runtime was NOT rebuilt: the
+    /// isolated research router is built once at `ProfileRuntime` bootstrap, so
+    /// the change only takes effect on the next restart.
+    ///
+    /// The server has always sent this ("so the client never presents a
+    /// persisted change as already-live"); the client simply did not
+    /// deserialise it, so an inline `/research add` reported a bare success and
+    /// deep_research kept running on the coding provider.
+    #[serde(default)]
+    pub restart_required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_policy_stamp: Option<RuntimePolicyStamp>,
 }
@@ -4442,12 +4463,58 @@ pub struct AppState {
     /// plain text field (equivalent to always-Insert); `composer_mode` is only
     /// consulted when this is true.
     pub vim_mode: bool,
+    /// octos#1807 steering as an OPT-IN: when true, a prompt typed while a
+    /// turn is running is injected into the LIVE turn via `turn/steer`. The
+    /// default is false — mid-turn prompts stage FIFO in `pending_messages`
+    /// and each drains as its OWN turn at turn-end, so every prompt is
+    /// processed to completion in the order it was typed. Steering makes the
+    /// model treat the newest instruction as superseding the work in
+    /// progress (the steer lands as a bare `role: user` message mid-loop),
+    /// which reads as "interrupt and pivot" — the right tool for a course
+    /// correction, the wrong default for "also do this next".
+    pub steer_mid_turn: bool,
     /// Current composer editing mode under Vim. Defaults to `Insert` so typing
     /// works immediately when Vim is enabled; `Esc` switches to `Normal`.
     pub composer_mode: ComposerMode,
     /// Pending Vim multi-key prefix in Normal mode (`g`/`d`/`c`), resolved or
     /// cleared by the next key. `None` when no sequence is in progress.
     pub composer_vim_pending: Option<char>,
+    /// Armed by an idle Ctrl+C (nothing to interrupt); the next consecutive
+    /// Ctrl+C quits the TUI. Any other key press disarms. Escape hatch for
+    /// surfaces that eat plain keys (onboarding wizard, menus), where `q` and
+    /// `/exit` type into a filter instead of quitting.
+    pub ctrl_c_quit_armed: bool,
+    /// Armed when an approval or AskUserQuestion ARRIVES (live server event);
+    /// the event loop drains it by writing BEL to the terminal exactly once.
+    /// Store stays I/O-free — same pattern as the pending-clipboard flush.
+    pub pending_decision_bell: bool,
+    /// Client-side first-seen clock per task id, for the sub-agent chip's
+    /// elapsed display (server events carry no wall-clock the TUI can trust
+    /// across hosts — same rationale as `PeerMeta.created`). Populated when a
+    /// task first shows up pending/running.
+    pub task_first_seen: std::collections::HashMap<TaskId, std::time::Instant>,
+    /// The last turn terminal was quota exhaustion (spec
+    /// task-quota-exhausted-card): the status bar shows an amber Quota state
+    /// instead of the generic red Error. Cleared when the next turn starts.
+    pub quota_exhausted: bool,
+    /// Client-side per-loop fire counter (spec task-loop-liveness-indicator):
+    /// how many times each loop has fired in this session. The server carries
+    /// no such counter, so this is a session-local approximation that resets
+    /// on restart — enough to answer "is it still going, and how far in".
+    pub loop_fire_counts: std::collections::HashMap<(SessionKey, String), u32>,
+    /// Turns known to have been started by a loop firing, so their activity
+    /// group can carry the `↻` attribution prefix.
+    pub loop_attributed_turns: std::collections::HashSet<(SessionKey, TurnId)>,
+    /// Session whose NEXT turn should be attributed to a loop: set when
+    /// `loop/fired` arrives, consumed when that session's next turn starts.
+    pub pending_loop_attribution: std::collections::HashSet<SessionKey>,
+    /// True while a USER-dispatched `/loop list` awaits its result. The
+    /// session-open hydration fires the same RPC silently; only an explicit
+    /// user query may pop the loops menu when the result lands.
+    pub pending_loop_list_menu: bool,
+    /// Loop id the `MENU_LOOP_ACTIONS` submenu is acting on (set when a
+    /// loops-list row is activated).
+    pub loop_actions_target: Option<String>,
     /// Path of the `--config` file this session launched from, retained so
     /// `/saveconfig` can persist runtime UI settings back. `None` when launched
     /// without `--config` (saving then falls back to the default path).
@@ -4477,7 +4544,7 @@ pub struct AppState {
     /// the `file-picker` menu build; rebuilt on every `@` (never stale-served).
     pub file_picker: Option<crate::file_picker::FilePickerState>,
     /// Cross-session command history for Up/Down recall (codex/claude-code
-    /// style); persisted to `~/.config/octos-tui/history.jsonl`. See
+    /// style); persisted to `~/.config/octoscode/history.jsonl`. See
     /// [`crate::history::ComposerHistory`].
     pub composer_history: crate::history::ComposerHistory,
     /// Prompts staged while the ACTIVE session's turn was running, submitted
@@ -4831,7 +4898,7 @@ impl ComposerPresentation {
         match self {
             Self::Empty => 0,
             Self::Inline(text) => text.rsplit('\n').next().unwrap_or("").width(),
-            Self::Collapsed(collapse) => "[paste] ".width() + collapse.summary.width(),
+            Self::Collapsed(collapse) => "[paste ]".width() + collapse.summary.width(),
         }
     }
 }
@@ -5050,6 +5117,9 @@ impl From<SessionStatusReadResult> for SessionRuntimeStatus {
 pub enum ActivityKind {
     Tool,
     Progress,
+    /// A client-local, fully rendered transcript report. Unlike runtime
+    /// activity, reports never enter the agent-task grouping/collapse path.
+    Report,
     Approval,
     Warning,
     Error,
@@ -5060,6 +5130,7 @@ impl ActivityKind {
         match self {
             Self::Tool => "tool",
             Self::Progress => "progress",
+            Self::Report => "report",
             Self::Approval => "approval",
             Self::Warning => "warning",
             Self::Error => "error",
@@ -6526,8 +6597,18 @@ impl AppState {
             goal_objective_folded_effective: std::cell::Cell::new(false),
             pinned_scroll: false,
             vim_mode: false,
+            steer_mid_turn: false,
             composer_mode: ComposerMode::Insert,
             composer_vim_pending: None,
+            ctrl_c_quit_armed: false,
+            pending_decision_bell: false,
+            task_first_seen: std::collections::HashMap::new(),
+            quota_exhausted: false,
+            loop_fire_counts: std::collections::HashMap::new(),
+            loop_attributed_turns: std::collections::HashSet::new(),
+            pending_loop_attribution: std::collections::HashSet::new(),
+            pending_loop_list_menu: false,
+            loop_actions_target: None,
             config_path: None,
             activity_navigator: ActivityNavigatorState::default(),
             focus: FocusPane::Composer,
@@ -8358,6 +8439,17 @@ impl AppState {
             .unwrap_or(&[])
     }
 
+    /// Active-session loop roster for the `/loop` list menu — mirrors
+    /// `active_session_agents` but for `UiLoopRecord`s.
+    pub fn active_session_loops(&self) -> &[octos_core::ui_protocol::UiLoopRecord] {
+        let Some(session) = self.active_session() else {
+            return &[];
+        };
+        self.session_autonomy_for(&session.id)
+            .map(|state| state.loops.as_slice())
+            .unwrap_or(&[])
+    }
+
     /// Agent ids with unread terminal outcomes in the active session — the
     /// Agent Dock badge set (#323). Empty when there is no active session.
     pub fn active_session_unseen_agents(&self) -> &[String] {
@@ -8837,6 +8929,9 @@ impl AppState {
         if !self.run_state.is_active() {
             self.run_state_started_at = Some(Instant::now());
         }
+        // A new turn supersedes the quota terminal (spec
+        // task-quota-exhausted-card).
+        self.quota_exhausted = false;
         self.run_state = SessionRunState::InProgress;
     }
 
@@ -9047,18 +9142,30 @@ impl AppState {
     pub fn session_activity_line(&self, session_id: &SessionKey) -> Option<String> {
         const ACTIVITY_CHARS: usize = 60;
         fn last_line_tail(text: &str, cap: usize) -> Option<String> {
+            use unicode_segmentation::UnicodeSegmentation;
+            use unicode_width::UnicodeWidthStr;
             let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
             let line = line.trim();
-            let chars = line.chars().count();
-            Some(if chars > cap {
-                let tail: String = line
-                    .chars()
-                    .skip(chars.saturating_sub(cap.saturating_sub(1)))
-                    .collect();
-                format!("…{tail}")
-            } else {
-                line.to_owned()
-            })
+            // `cap` is a COLUMN budget — the peer dock row and the Alt+S
+            // switcher row both size in columns. Counting `char`s let a CJK
+            // summary render at twice its allowance (119 columns for a cap of
+            // 60) and overflow the row. Walk graphemes from the END, keeping
+            // one column for the leading ellipsis.
+            if line.width() <= cap {
+                return Some(line.to_owned());
+            }
+            let budget = cap.saturating_sub(1);
+            let mut kept = std::collections::VecDeque::new();
+            let mut used = 0usize;
+            for grapheme in line.graphemes(true).rev() {
+                let w = grapheme.width();
+                if used + w > budget {
+                    break;
+                }
+                used += w;
+                kept.push_front(grapheme);
+            }
+            Some(format!("…{}", kept.into_iter().collect::<String>()))
         }
         if let Some(reason) = self.session_blocked_reason(session_id) {
             return Some(t!("menu.sessions.item.blocked_reason", reason = reason).into_owned());
@@ -9190,6 +9297,29 @@ impl AppState {
         let large = paste_should_collapse(text);
         let cursor = self.composer_cursor_index();
         self.insert_composer_text(text);
+
+        // Small "paste" that is really typed input: some terminals (bracketed
+        // paste over SSH/tmux, or fast IME bursts) deliver quick keystrokes as a
+        // Paste event. When that lands while a real paste is collapsed, treating
+        // the tiny fragment as another paste keeps `composer_pasted` set and the
+        // chip stays collapsed — the typed text is swallowed into the `[paste]`
+        // block (its char count ticks up) but never echoes. A fragment below the
+        // paste threshold is not a paste worth boxing: union it but CLEAR the
+        // paste flag so the composer re-opens inline and the text echoes.
+        if !large && self.composer_pasted {
+            if let Some(mut existing) = self.composer_paste_span.take() {
+                if cursor <= existing.start {
+                    existing.start += text.len();
+                    existing.end += text.len();
+                } else if cursor < existing.end {
+                    existing.end += text.len();
+                }
+                self.composer_paste_span = Some(existing);
+            }
+            self.composer_pasted = false;
+            return;
+        }
+
         if large {
             // Record the pasted byte range; a second paste while collapsed
             // unions with the existing span (the chip presents them as one
@@ -9246,7 +9376,7 @@ impl AppState {
     /// without a valid span the whole draft clears (the #380 behavior).
     /// Returns true when the delete was handled here.
     fn take_collapsed_paste_block(&mut self) -> bool {
-        // A collapsed block (the `[paste] N lines · M chars` chip) is an ATOMIC
+        // A collapsed block (the `[paste N lines · M chars]` chip) is an ATOMIC
         // unit: one Backspace/Delete removes the whole block, never one char.
         // Gate on the Collapsed PRESENTATION, not `composer_pasted` — a paste
         // whose terminal delivered it as keystrokes (no bracketed-paste event,
@@ -9260,11 +9390,23 @@ impl AppState {
         ) {
             return false;
         }
-        match self
-            .composer_paste_span
-            .take()
-            .filter(|_| self.composer_pasted)
-        {
+        // NOT `.filter(|_| self.composer_pasted)`. The gate above deliberately
+        // keys on the Collapsed PRESENTATION rather than the flag, and adding
+        // the flag back here reintroduced exactly the dependency it was written
+        // to avoid — with a worse failure than the one it guarded against.
+        //
+        // The two desync by design. `insert_pasted_text` clears `composer_pasted`
+        // for a small fragment (so a tiny burst re-opens the composer inline and
+        // echoes) while KEEPING the recorded span. But clearing the flag only
+        // re-opens content under the TYPED thresholds — 32 lines / 4000 chars,
+        // versus 4 lines / 400 for a paste. Above those, the chip stays
+        // Collapsed with a perfectly valid span and a false flag, so this filter
+        // discarded the span and fell through to `_ =>`, which clears the ENTIRE
+        // draft. A 40-line paste with typed text around it lost the lot.
+        //
+        // The span's own bounds check below is what makes dropping it safe: a
+        // stale or malformed span still falls to `_ =>`.
+        match self.composer_paste_span.take() {
             Some(span)
                 if span.start < span.end
                     && span.end <= self.composer.len()
@@ -9726,7 +9868,8 @@ fn composer_presentation_for_text(text: &str, from_paste: bool) -> ComposerPrese
         return ComposerPresentation::Inline(text.to_string());
     }
 
-    // Renders after the `[paste] ` prefix, e.g. "[paste] 18 lines · 1240 chars".
+    // Rendered INSIDE the chip, e.g. "[paste 18 lines · 1240 chars]" — the
+    // counts belong to the bracket rather than trailing it as loose text.
     let summary = if line_count > 1 {
         format!("{line_count} lines · {char_count} chars")
     } else {
@@ -10117,6 +10260,13 @@ fn estimated_activity_rows(item: &ActivityItem) -> usize {
                 2
             }
         }
+        ActivityKind::Report => {
+            1 + item
+                .detail
+                .as_deref()
+                .map(|body| body.lines().count().max(1))
+                .unwrap_or(0)
+        }
         ActivityKind::Approval | ActivityKind::Warning | ActivityKind::Error => 2,
     }
 }
@@ -10217,7 +10367,7 @@ mod tests {
         UiGitStatusItem, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
     };
 
-    /// The client's LOCAL launch/resolve types (octos-tui pins an older
+    /// The client's LOCAL launch/resolve types (octoscode pins an older
     /// octos-core, so `LaunchResolveResult`/`LaunchDecisionKind` are hand
     /// mirrored) must decode the EXACT bytes a live `octos serve` emits —
     /// including the omitted `resolved_profile`/`existing_profiles` on the
@@ -10838,6 +10988,58 @@ mod tests {
         assert_eq!(
             complete_plan_steps_in_text("1. [ ] Fix model\n2. Run tests"),
             "- [x] Fix model\n- [x] Run tests"
+        );
+    }
+
+    #[test]
+    fn typed_fragment_delivered_as_paste_reopens_collapsed_block() {
+        // Regression: some terminals (bracketed paste over SSH/tmux, fast IME
+        // bursts) deliver quick typed keystrokes as a Paste event. When that
+        // lands while a real paste is collapsed, the tiny fragment must clear
+        // the paste flag so the composer re-opens inline and the text echoes —
+        // otherwise the chip stays collapsed, its char count ticks up, and the
+        // typed text never shows.
+        let mut state = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "t".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let block = (1..=10)
+            .map(|i| format!("pasted code line {i} with content"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.insert_pasted_text(&block);
+        assert!(state.composer_pasted);
+        assert!(matches!(
+            state.composer_presentation(),
+            ComposerPresentation::Collapsed(_)
+        ));
+
+        // A short fragment arrives as a Paste event (misdelivered typed input).
+        state.insert_pasted_text("x");
+        assert!(
+            !state.composer_pasted,
+            "a tiny paste-fragment while collapsed clears the paste flag"
+        );
+        assert!(
+            matches!(
+                state.composer_presentation(),
+                ComposerPresentation::Inline(_)
+            ),
+            "composer re-opens inline so the typed text echoes"
+        );
+        assert!(
+            state.composer.contains('x'),
+            "the typed char is in the text"
         );
     }
 
@@ -11477,6 +11679,85 @@ mod tests {
             None,
             false,
         )
+    }
+
+    /// A large paste followed by a SMALL paste event must not destroy the draft.
+    ///
+    /// `insert_pasted_text` clears `composer_pasted` for a small fragment (so a
+    /// tiny burst re-opens the composer inline and echoes) while keeping the
+    /// recorded span. But clearing the flag only re-opens content under the
+    /// TYPED thresholds — 32 lines / 4000 chars, versus 4 lines / 400 for a
+    /// paste. Above those the chip stays Collapsed with a valid span and a
+    /// false flag.
+    ///
+    /// `take_collapsed_paste_block` used to `.filter(|_| self.composer_pasted)`,
+    /// which discarded that valid span and fell through to "clear the whole
+    /// draft". Everything the user had typed around the paste went with it.
+    #[test]
+    fn small_paste_after_a_large_one_does_not_destroy_the_surrounding_draft() {
+        let mut state = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+
+        state.insert_composer_text("before ");
+        // 40 lines: above BOTH the paste thresholds and the 32-line typed one,
+        // so it stays Collapsed even once `composer_pasted` is cleared.
+        let block = (1..=40)
+            .map(|i| format!("pasted line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.insert_pasted_text(&block);
+        state.insert_composer_text(" after");
+        assert!(state.composer_paste_span.is_some(), "span recorded");
+
+        // A tiny fragment delivered as a Paste event (fast IME burst, or
+        // bracketed paste over SSH/tmux). This clears the flag but keeps the
+        // span, and the block is far too big to re-open inline.
+        state.insert_pasted_text("x");
+        assert!(
+            !state.composer_pasted,
+            "precondition: the small paste cleared the flag"
+        );
+        assert!(
+            matches!(
+                state.composer_presentation(),
+                ComposerPresentation::Collapsed(_)
+            ),
+            "precondition: 40 lines stays collapsed past the typed threshold"
+        );
+        assert!(
+            state.composer_paste_span.is_some(),
+            "precondition: the span survived the flag being cleared"
+        );
+
+        state.delete_composer_prev_char();
+
+        assert!(
+            state.composer.contains("before"),
+            "text typed BEFORE the paste must survive: {:?}",
+            state.composer
+        );
+        assert!(
+            state.composer.contains("after"),
+            "text typed AFTER the paste must survive: {:?}",
+            state.composer
+        );
+        assert!(
+            !state.composer.contains("pasted line 1"),
+            "the pasted block itself is what Backspace removes: {:?}",
+            state.composer
+        );
     }
 
     fn big_paste_block() -> String {
