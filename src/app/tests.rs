@@ -970,6 +970,77 @@ mod tests {
     }
 
     #[test]
+    fn status_work_text_keeps_the_full_missing_field_name_of_a_decode_error() {
+        // Regression: the status bar head-truncated the run-state message at 80
+        // chars, and serde puts the diagnosis LAST — so a real decode failure
+        // rendered as "... missing field `obj ...", naming a field that does not
+        // exist. The operator then hunts for `obj` instead of `objective`.
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "t".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let message =
+            "failed to decode UI protocol result for session/goal/get: missing field `objective`";
+        app.run_state = SessionRunState::Error {
+            message: message.into(),
+        };
+
+        let work = status_bar_work_text(&app);
+        assert!(
+            work.contains("missing field `objective`"),
+            "the missing field name must survive truncation: {work:?}"
+        );
+        assert!(
+            !work.contains("`obj ..."),
+            "a mangled identifier must never reach the status line: {work:?}"
+        );
+        assert!(
+            work.contains("failed to decode UI protocol result"),
+            "the head still identifies the failure: {work:?}"
+        );
+
+        // Blocked messages take the same path.
+        app.run_state = SessionRunState::Blocked {
+            message: message.into(),
+        };
+        assert!(status_bar_work_text(&app).contains("missing field `objective`"));
+    }
+
+    #[test]
+    fn elide_middle_keeps_both_ends_within_budget() {
+        // Short enough → untouched.
+        assert_eq!(elide_middle_terminal_line("short", 80), "short");
+
+        let long = "a".repeat(60) + "TAIL_MARKER";
+        let elided = elide_middle_terminal_line(&long, 40);
+        assert!(elided.chars().count() <= 40, "budget respected: {elided:?}");
+        assert!(elided.starts_with("aaaa"), "head kept: {elided:?}");
+        assert!(elided.ends_with("TAIL_MARKER"), "tail kept: {elided:?}");
+        assert!(elided.contains(" ... "), "seam is marked: {elided:?}");
+
+        // Multibyte input must not panic and must not split a char.
+        let cjk = "日本語のとても長いエラーメッセージです".repeat(4);
+        let elided = elide_middle_terminal_line(&cjk, 30);
+        assert!(elided.chars().count() <= 30);
+        assert!(cjk.ends_with(elided.rsplit(" ... ").next().unwrap()));
+
+        // Budget too small for two halves → plain head cut, still no panic.
+        let narrow = elide_middle_terminal_line(&long, 10);
+        assert!(narrow.chars().count() <= 10, "narrow budget: {narrow:?}");
+    }
+
+    #[test]
     fn status_work_text_advertises_recovery_keys_when_a_decision_is_pending() {
         // Regression: a turn parked on an approval/question locks the composer and
         // its card can scroll off the clipped live tail — leaving a bare "Waiting"

@@ -1610,6 +1610,53 @@ fn truncate_terminal_line(text: &str, max_chars: usize) -> String {
     preview
 }
 
+/// Marker joining the two surviving halves of an elided status message.
+const ELIDE_MARKER: &str = " ... ";
+
+/// Fit `text` into `max_chars` by eliding the MIDDLE instead of the tail.
+///
+/// Head-truncation ([`truncate_terminal_line`]) is actively misleading for
+/// decode diagnostics: serde reports the failure at the END of the string —
+/// ``failed to decode UI protocol result for session/goal/get: missing field
+/// `objective` `` — so cutting the tail leaves a *mangled identifier* (`` `obj
+/// ...``) that names no field the operator can look up, which is strictly worse
+/// than showing nothing. Keeping both ends preserves the failing method AND the
+/// full field name inside the same column budget, so the status line never
+/// invents a truncated key.
+///
+/// Char-based (not byte-based) at both cuts, so it cannot panic on a multibyte
+/// boundary. The result is at most `max_chars` chars.
+fn elide_middle_terminal_line(text: &str, max_chars: usize) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return text.to_string();
+    }
+    // Too narrow to keep two legible halves — a plain head cut reads better
+    // than two-or-three-char stumps either side of the marker.
+    if max_chars <= ELIDE_MARKER.chars().count() + 8 {
+        return truncate_terminal_line(text, max_chars);
+    }
+
+    let keep = max_chars - ELIDE_MARKER.chars().count();
+    // The tail carries the diagnosis, so it takes the larger half.
+    let tail = keep.div_ceil(2);
+    let head = keep - tail;
+
+    let mut out = chars[..head].iter().collect::<String>();
+    // Trim only whitespace around the seam: trimming to a *word* boundary could
+    // eat into the identifier this function exists to preserve.
+    let out_trimmed = out.trim_end().len();
+    out.truncate(out_trimmed);
+    out.push_str(ELIDE_MARKER);
+    out.push_str(
+        chars[chars.len() - tail..]
+            .iter()
+            .collect::<String>()
+            .trim_start(),
+    );
+    out
+}
+
 /// Truncate `text` to at most `max_cols` terminal *display* columns
 /// (unicode-width aware), appending a `…` when it overflows. Unlike
 /// [`truncate_terminal_line`] this counts double-width CJK/emoji glyphs as 2
@@ -5325,7 +5372,10 @@ fn status_bar_work_text(app: &AppState) -> String {
         SessionRunState::Blocked { message } | SessionRunState::Error { message }
             if !message.trim().is_empty() =>
         {
-            parts.push(truncate_terminal_line(message, 80));
+            // Elide the middle, never the tail: a decode failure names the
+            // offending field last, and a head-only cut turns `objective` into
+            // `obj` — an identifier that does not exist.
+            parts.push(elide_middle_terminal_line(message, 80));
         }
         _ => {}
     }
