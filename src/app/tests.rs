@@ -1002,11 +1002,19 @@ mod tests {
             "the missing field name must survive truncation: {work:?}"
         );
         assert!(
+            work.contains("session/goal/get"),
+            "the failing method must survive truncation whole: {work:?}"
+        );
+        assert!(
             !work.contains("`obj ..."),
             "a mangled identifier must never reach the status line: {work:?}"
         );
         assert!(
-            work.contains("failed to decode UI protocol result"),
+            work.contains("... session/goal/get"),
+            "nor may the seam land inside the method name: {work:?}"
+        );
+        assert!(
+            work.contains("failed to decode"),
             "the head still identifies the failure: {work:?}"
         );
 
@@ -1015,6 +1023,29 @@ mod tests {
             message: message.into(),
         };
         assert!(status_bar_work_text(&app).contains("missing field `objective`"));
+    }
+
+    #[test]
+    fn elide_middle_snaps_the_seam_to_token_boundaries() {
+        // Neither half may show a fragment of a token: a cut identifier names
+        // something that does not exist, in the head as much as in the tail.
+        let message =
+            "failed to decode UI protocol result for session/goal/get: missing field `objective`";
+        let elided = elide_middle_terminal_line(message, 80);
+        assert_eq!(
+            elided,
+            "failed to decode UI protocol ... session/goal/get: missing field `objective`"
+        );
+        assert!(elided.chars().count() <= 80);
+
+        // Every surviving token is a whole token of the original.
+        let words = message.split_whitespace().collect::<Vec<_>>();
+        for token in elided.split_whitespace().filter(|token| *token != "...") {
+            assert!(
+                words.contains(&token),
+                "{token:?} is not a whole token of the original: {elided:?}"
+            );
+        }
     }
 
     #[test]

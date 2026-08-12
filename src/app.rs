@@ -1613,16 +1613,30 @@ fn truncate_terminal_line(text: &str, max_chars: usize) -> String {
 /// Marker joining the two surviving halves of an elided status message.
 const ELIDE_MARKER: &str = " ... ";
 
-/// Fit `text` into `max_chars` by eliding the MIDDLE instead of the tail.
+/// Fit `text` into `max_chars` by eliding the MIDDLE instead of the tail, and
+/// only ever at a whitespace boundary.
 ///
 /// Head-truncation ([`truncate_terminal_line`]) is actively misleading for
 /// decode diagnostics: serde reports the failure at the END of the string —
 /// ``failed to decode UI protocol result for session/goal/get: missing field
 /// `objective` `` — so cutting the tail leaves a *mangled identifier* (`` `obj
-/// ...``) that names no field the operator can look up, which is strictly worse
-/// than showing nothing. Keeping both ends preserves the failing method AND the
-/// full field name inside the same column budget, so the status line never
-/// invents a truncated key.
+/// ...``) that names no field the operator can look up. That is strictly worse
+/// than showing nothing: it sends them hunting for a key that does not exist.
+///
+/// A blind midpoint cut just moves the lie to the other half (`on/goal/get` is
+/// no more real a method than `obj` is a field), so the seam snaps to token
+/// boundaries: the tail grows backwards to the start of its token, and the head
+/// shrinks to the end of its own. Both the failing method and the full field
+/// name survive inside the same column budget:
+///
+/// ```text
+/// failed to decode UI protocol ... session/goal/get: missing field `objective`
+/// ```
+///
+/// The tail is the half that gets the boundary *guarantee* — it carries the
+/// diagnosis, and the elided head is generic boilerplate. A token longer than
+/// the whole budget (no boundary to snap to) is cut mid-token as a last resort;
+/// nothing else can fit.
 ///
 /// Char-based (not byte-based) at both cuts, so it cannot panic on a multibyte
 /// boundary. The result is at most `max_chars` chars.
@@ -1638,23 +1652,37 @@ fn elide_middle_terminal_line(text: &str, max_chars: usize) -> String {
     }
 
     let keep = max_chars - ELIDE_MARKER.chars().count();
-    // The tail carries the diagnosis, so it takes the larger half.
-    let tail = keep.div_ceil(2);
-    let head = keep - tail;
+    // `i` starts a token when it opens the string or follows whitespace.
+    let starts_token = |i: usize| i == 0 || chars[i - 1].is_whitespace();
 
-    let mut out = chars[..head].iter().collect::<String>();
-    // Trim only whitespace around the seam: trimming to a *word* boundary could
-    // eat into the identifier this function exists to preserve.
-    let out_trimmed = out.trim_end().len();
-    out.truncate(out_trimmed);
-    out.push_str(ELIDE_MARKER);
-    out.push_str(
-        chars[chars.len() - tail..]
-            .iter()
-            .collect::<String>()
-            .trim_start(),
-    );
-    out
+    // The tail takes the larger half, then snaps to a token start. Prefer
+    // growing (search backwards, bounded by the budget) so the whole token is
+    // shown; only when no boundary fits does it shrink forwards, dropping the
+    // fragment rather than displaying it.
+    let earliest = chars.len() - keep;
+    let midpoint = chars.len() - keep.div_ceil(2);
+    let tail_start = (earliest..=midpoint)
+        .rev()
+        .find(|i| starts_token(*i))
+        .or_else(|| (midpoint..chars.len()).find(|i| starts_token(*i)))
+        .unwrap_or(midpoint);
+    let tail = chars[tail_start..].iter().collect::<String>();
+
+    // Whatever the tail left over goes to the head, trimmed back to a whole
+    // token (and of trailing whitespace, so the marker reads cleanly).
+    let head = chars[..keep - tail.chars().count()]
+        .iter()
+        .collect::<String>();
+    let head = match head.rsplit_once(char::is_whitespace) {
+        Some((whole_tokens, _partial)) => whole_tokens.trim_end(),
+        // A single token wider than the head budget: keep the prefix. The
+        // boundary guarantee is the tail's — the head is context.
+        None => head.as_str(),
+    };
+
+    format!("{head}{ELIDE_MARKER}{tail}")
+        .trim_start()
+        .to_string()
 }
 
 /// Truncate `text` to at most `max_cols` terminal *display* columns
