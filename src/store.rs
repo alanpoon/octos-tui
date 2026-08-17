@@ -33827,6 +33827,8 @@ now analyzing the bus module"
             session_id.clone(),
             crate::model::LiveCompaction {
                 started_at: std::time::Instant::now(),
+                completed_at: None,
+                token_estimate_after: None,
                 token_estimate_before: 91_000,
                 threshold_tokens: 96_000,
                 trigger: "preflight".into(),
