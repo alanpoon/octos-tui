@@ -1087,9 +1087,78 @@ fn context_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         searchable: false,
         search_placeholder: None,
         footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
-        preview: None,
+        preview: context_cache_diagnostics_preview(ctx),
         mode: MenuMode::SingleSelect,
     })
+}
+
+fn context_cache_diagnostics_preview(ctx: &MenuContext<'_>) -> Option<MenuPreview> {
+    let diagnostics = ctx.app.context_cache_diagnostics?;
+    let mut rows = Vec::new();
+
+    if let Some(epoch) = diagnostics.cache_epoch_id.as_deref() {
+        rows.push(MenuPreviewRow {
+            label: t!("menu.context.diagnostics.cache_epoch").into_owned(),
+            value: abbreviate_context_diagnostic_id(epoch),
+        });
+    }
+
+    let semantic_head = match (
+        diagnostics.semantic_head_kind.as_deref(),
+        diagnostics.semantic_head_id.as_deref(),
+    ) {
+        (Some(kind), Some(id)) => Some(format!(
+            "{} · {}",
+            humanize_context_diagnostic_label(kind),
+            abbreviate_context_diagnostic_id(id)
+        )),
+        (Some(kind), None) => Some(humanize_context_diagnostic_label(kind)),
+        (None, Some(id)) => Some(abbreviate_context_diagnostic_id(id)),
+        (None, None) => None,
+    };
+    if let Some(value) = semantic_head {
+        rows.push(MenuPreviewRow {
+            label: t!("menu.context.diagnostics.semantic_head").into_owned(),
+            value,
+        });
+    }
+
+    if let Some(reason) = diagnostics.last_cache_invalidation_reason.as_deref() {
+        rows.push(MenuPreviewRow {
+            label: t!("menu.context.diagnostics.last_invalidation").into_owned(),
+            value: humanize_context_diagnostic_label(reason),
+        });
+    }
+
+    (!rows.is_empty()).then(|| MenuPreview::KeyValues {
+        title: Some(t!("menu.context.diagnostics.title").into_owned()),
+        rows,
+    })
+}
+
+fn humanize_context_diagnostic_label(value: &str) -> String {
+    const MAX_LABEL_CHARS: usize = 56;
+
+    let humanized = value.replace(['_', '-'], " ");
+    if humanized.chars().count() <= MAX_LABEL_CHARS {
+        return humanized;
+    }
+    let prefix: String = humanized.chars().take(MAX_LABEL_CHARS).collect();
+    format!("{prefix}…")
+}
+
+fn abbreviate_context_diagnostic_id(value: &str) -> String {
+    const PREFIX_CHARS: usize = 18;
+    const SUFFIX_CHARS: usize = 6;
+    const MAX_CHARS: usize = PREFIX_CHARS + SUFFIX_CHARS + 1;
+
+    if value.chars().count() <= MAX_CHARS {
+        return value.to_owned();
+    }
+    let prefix: String = value.chars().take(PREFIX_CHARS).collect();
+    let mut suffix: Vec<char> = value.chars().rev().take(SUFFIX_CHARS).collect();
+    suffix.reverse();
+    format!("{prefix}…{}", suffix.into_iter().collect::<String>())
 }
 
 /// `/resume` session picker. Renders `Loading` until the `session/list` result
@@ -9088,6 +9157,10 @@ mod tests {
             selected_path: &[],
         };
         let spec = ready_spec(context_menu(&usage_ctx));
+        assert!(
+            spec.preview.is_none(),
+            "old servers must not get an invented cache diagnostic pane"
+        );
         let subtitle = spec.subtitle.expect("context menu carries a subtitle");
         assert!(
             subtitle.contains("128K / 1M"),
@@ -9114,6 +9187,57 @@ mod tests {
         let fallback = ready_spec(context_menu(&empty_ctx));
         let expected = t!("menu.context.subtitle").into_owned();
         assert_eq!(fallback.subtitle.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn context_menu_renders_compact_cache_diagnostics_in_preview_only() {
+        let capabilities = CapabilitySet::from_methods([APPUI_METHOD_SESSION_COMPACT]);
+        let session_id = SessionKey("local:test".into());
+        let diagnostics = crate::model::ContextCacheDiagnostics {
+            cache_epoch_id: Some(
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            ),
+            last_cache_invalidation_reason: Some("tool_schema_changed".into()),
+            semantic_head_id: Some("semblk_000042".into()),
+            semantic_head_kind: Some("tool_interaction".into()),
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                selected_session_id: Some(&session_id),
+                context_cache_diagnostics: Some(&diagnostics),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+
+        let spec = ready_spec(context_menu(&ctx));
+        let MenuPreview::KeyValues { title, rows } = spec.preview.expect("diagnostic preview")
+        else {
+            panic!("expected key/value diagnostic preview");
+        };
+        assert_eq!(
+            title.as_deref(),
+            Some(t!("menu.context.diagnostics.title").as_ref())
+        );
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].value.starts_with("sha256:0123456789a"));
+        assert!(rows[0].value.contains('…'));
+        assert!(!rows[0].value.contains("0123456789abcdef0123456789abcdef"));
+        assert_eq!(rows[1].value, "tool interaction · semblk_000042");
+        assert_eq!(rows[2].value, "tool schema changed");
+        assert!(
+            spec.items.iter().all(|item| {
+                !item.label.contains("sha256")
+                    && item
+                        .description
+                        .as_deref()
+                        .is_none_or(|description| !description.contains("sha256"))
+            }),
+            "diagnostics belong in the inspector preview, not action rows"
+        );
     }
 
     #[test]

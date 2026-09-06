@@ -4,8 +4,8 @@
 use super::*;
 
 pub(super) fn activity_finalization_key(item: &ActivityItem, ordinal: usize) -> String {
-    if let Some(tool_call_id) = item.tool_call_id.as_deref() {
-        return format!("tool:{tool_call_id}");
+    if let Some(identity) = item.stable_activity_identity() {
+        return identity;
     }
     if let Some(turn_id) = item.turn_id.as_ref() {
         return format!(

@@ -200,7 +200,8 @@ mod i18n_tests {
             "app.statusbar.awaiting_fleet",
             "app.autonomy.status_budget_limited_fleet",
             "app.hint.peer_dock_landed",
-            "status.summary_waiting_on_fleet",
+            "status.turn_waiting_on_fleet",
+            "status.turn_missing_answer",
         ];
         for key in keys {
             for locale in ["en", "zh"] {

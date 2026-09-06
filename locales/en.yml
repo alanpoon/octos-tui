@@ -536,7 +536,10 @@ status:
   tool_started: "Tool started: %{name} (%{id})"
   question_asked: "Question asked: %{title}"
   turn_completed: "Turn completed in %{title} at seq %{seq}"
+  turn_missing_answer: "No final assistant answer received. Reopen the session to inspect canonical history, or retry."
+  turn_waiting_on_fleet: "%{landed} of %{total} peers landed · waiting on %{peers}; the master resumes when the fleet lands."
   backend_relaunched_turn_lost: "Backend process restarted — the in-flight turn was lost; staged prompts go to the new backend."
+  hydration_queue_full: "Follow-up request queue is full; dropped %{method}."
   turn_completed_stale: "Ignored completed stale turn in %{title}"
   # Read-only mode feedback
   readonly_turn_disabled: "Read-only mode: turn/start disabled"
@@ -935,22 +938,12 @@ status:
   recovery_search_restricted: "search/fetch is restricted; ask for provider configuration or proceed with an explicit offline caveat"
   # Staged diff-hunk context prompt (inserted into the composer / sent to the agent)
   diff_hunk_prompt: "Use this selected diff hunk as context for the next coding turn.\nfile: %{path}\nstatus: %{status}\nhunk: %{hunk}\n```diff\n"
-  # Turn-completion fallback "Session Summary" assistant cards
+  # Genuine error cards and historical summary rendering
   summary_title: "Session Summary"
   summary_error_label: "Error"
   quota_card: "⏳ Quota exhausted — %{provider}\n  This provider's usage limit for the current billing cycle is reached; the turn could not finish.\n  What you can do now:\n   ▸ Purchase extra usage or upgrade your plan%{link}\n   ▸ /model — switch to another configured model and continue this session\n   ▸ Retry this message after the quota resets (your draft survives)"
   quota_card_provider_unknown: "the active provider"
-  summary_completed_no_answer: "Session Summary\n- Result: Turn completed, but the TUI did not receive a final assistant answer.\n- Activity: %{count} action(s) recorded.\n- Files changed: %{files}.\n- Validation: %{validation}.\n- Risks / follow-up: Review the activity above and continue the turn if the requested answer is incomplete."
-  summary_partial_answer: "Session Summary\n- Result: Turn completed, but the TUI only received a partial live answer.\n- Activity: %{count} action(s) recorded.\n- Files changed: %{files}.\n- Validation: %{validation}.\n- Risks / follow-up: The server may have persisted a fuller answer; continue if the visible answer is incomplete."
-  # octoscode#532: replaces `summary_completed_no_answer` when the master's turn
-  # ends while its peer fleet is still running. That turn ended BY DESIGN — the
-  # fleet-synthesis wake re-enters the master once every peer is done+settled —
-  # so the void-turn wording read as a crash at the exact moment the fleet was
-  # doing its most impressive work.
-  summary_waiting_on_fleet: "Session Summary\n- Result: Turn ended while the peer fleet is still running. The master is NOT stopped — it wakes and synthesizes when the fleet lands.\n- Fleet: %{landed} of %{total} peers landed · waiting on %{peers}.\n- Activity: %{count} action(s) recorded.\n- Files changed: %{files}.\n- Validation: %{validation}.\n- Risks / follow-up: Nothing to do — Alt+P peeks the peer dock. The master reports once the last peer lands."
   summary_failed: "Session Summary\n- Result: Turn failed before producing a final answer.\n- Error: %{code}: %{message}\n- Activity: %{count} action(s) recorded.\n- Failures: %{failed}.\n- Risks / follow-up: Fix the error above or continue the turn with a more specific instruction."
-  summary_none_observed: "none observed"
-  summary_not_reported: "not reported"
   summary_none_recorded: "none recorded"
   # Shown (status line + terse transcript note) when the user interrupts their
   # own turn (Esc/Ctrl+C). Deliberately terse: a user stop is not a failure, so
@@ -1210,6 +1203,11 @@ menu:
     unavailable_no_session: Compaction requires an open Octos UI session.
     unavailable_title: Compaction unavailable
   context:
+    diagnostics:
+      cache_epoch: Cache epoch
+      last_invalidation: Last invalidation
+      semantic_head: Semantic head
+      title: OUP context cache
     item:
       compact:
         desc: Summarize older messages now to free up the context window.

@@ -697,6 +697,11 @@ menu:
     unavailable_no_session: 压缩需要已打开的 Octos UI 会话。
     unavailable_title: 压缩不可用
   context:
+    diagnostics:
+      cache_epoch: 缓存代次
+      last_invalidation: 最近失效原因
+      semantic_head: 语义头部
+      title: OUP 上下文缓存
     item:
       compact:
         desc: 立即总结较早的消息以释放上下文窗口。
@@ -1303,6 +1308,7 @@ status:
   question_asked: "提出问题：%{title}"
   turn_completed: "轮次已完成于 %{title}，序号 %{seq}"
   backend_relaunched_turn_lost: "后端进程已重启 — 进行中的回合已丢失；排队的消息将发送到新的后端。"
+  hydration_queue_full: "后续请求队列已满，已丢弃 %{method}。"
   turn_completed_stale: "已忽略 %{title} 中的过期完成轮次"
   edit_field_prompt: 编辑字段后按 Enter 确认
   keymap_save_not_wired: 快捷键保存尚未实现
@@ -1688,17 +1694,12 @@ status:
   recovery_search_restricted: "搜索/抓取受限；请申请供应商配置，或在明确的离线告知下继续"
   diff_hunk_prompt: "将选中的差异代码块用作下一个编码轮次的上下文。\nfile: %{path}\nstatus: %{status}\nhunk: %{hunk}\n```diff\n"
   summary_title: "会话摘要"
+  turn_missing_answer: "未收到最终助手回答。请重新打开会话查看持久化记录，或重试。"
+  turn_waiting_on_fleet: "%{total} 个 peer 中已落地 %{landed} 个 · 等待 %{peers}；舰队落地后主 agent 会自动继续。"
   summary_error_label: "错误"
   quota_card: "⏳ 额度已用完 — %{provider}\n  该提供商本计费周期的用量已达上限,本回合未能完成。\n  现在可以:\n   ▸ 购买加量或升级套餐%{link}\n   ▸ /model — 切换到其他已配置模型继续当前会话\n   ▸ 等额度刷新后重发这条消息(草稿会保留)"
   quota_card_provider_unknown: "当前提供商"
-  summary_completed_no_answer: "会话摘要\n- 结果：轮次已完成，但 TUI 未收到最终的助手回答。\n- 活动：已记录 %{count} 个操作。\n- 文件改动：%{files}。\n- 验证：%{validation}。\n- 风险 / 后续：请查看上方活动，若所需回答不完整，请继续该轮次。"
-  summary_partial_answer: "会话摘要\n- 结果：轮次已完成，但 TUI 仅收到部分实时回答。\n- 活动：已记录 %{count} 个操作。\n- 文件改动：%{files}。\n- 验证：%{validation}。\n- 风险 / 后续：服务器可能已持久化更完整的回答；若可见回答不完整，请继续。"
-  # octoscode#532：主 agent 的轮次在 peer 舰队仍在运行时结束——这是设计使然，
-  # 等最后一个 peer 落地后会自动唤醒并汇总，因此不能再用"未收到回答"的措辞。
-  summary_waiting_on_fleet: "会话摘要\n- 结果：轮次已结束，但 peer 舰队仍在运行。主 agent 并未停止——舰队全部落地后它会自动唤醒并汇总。\n- 舰队：%{total} 个 peer 中已落地 %{landed} 个 · 仍在等待 %{peers}。\n- 活动：已记录 %{count} 个操作。\n- 文件改动：%{files}。\n- 验证：%{validation}。\n- 风险 / 后续：无需操作——Alt+P 可查看 peer 面板；最后一个 peer 落地后主 agent 会汇报。"
   summary_failed: "会话摘要\n- 结果：轮次在产生最终回答前失败。\n- 错误：%{code}：%{message}\n- 活动：已记录 %{count} 个操作。\n- 失败：%{failed}。\n- 风险 / 后续：请修复上方错误，或用更具体的指令继续该轮次。"
-  summary_none_observed: "未观察到"
-  summary_not_reported: "未报告"
   summary_none_recorded: "未记录"
   # 用户主动中断（Esc/Ctrl+C）自己的轮次时的状态行与简短转录提示。刻意从简：
   # 用户主动停止不是失败，因此不显示真正错误才有的详细“会话摘要”卡片。

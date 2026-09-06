@@ -575,7 +575,7 @@ mod tests {
         app.session_reasoning_display.insert(session_id);
         let on = committed_messages_fingerprint(&app);
         assert_eq!(
-            off.content_hash, on.content_hash,
+            off.message_prefix_hashes, on.message_prefix_hashes,
             "the display toggle must not force a committed-history re-flush"
         );
     }
@@ -786,13 +786,7 @@ mod tests {
         // The native-scrollback segmented path (tool-backed replies) must also
         // give a trailing Session Summary the card treatment, not flat
         // markdown (codex P2 round 2 on #292).
-        let summary = t!(
-            "status.summary_partial_answer",
-            count = 2,
-            files = "none observed",
-            validation = "not reported",
-        )
-        .into_owned();
+        let summary = "Session Summary\n- Result: Historical transcript fixture.".to_owned();
         // A reply with an internal segment boundary (as a tool call inserts),
         // then the appended summary.
         let body = "First I ran a tool.\n\nThen I continued.";
@@ -818,13 +812,7 @@ mod tests {
         // The partial-completion path appends the summary AFTER the model's
         // partial reply (`{prose}\n\n{summary}`), so the title is NOT the
         // first line — detection must still find it (codex P2 on #292).
-        let summary = t!(
-            "status.summary_partial_answer",
-            count = 3,
-            files = "none observed",
-            validation = "not reported",
-        )
-        .into_owned();
+        let summary = "Session Summary\n- Result: Historical transcript fixture.".to_owned();
         let content = format!("Emulator installed. Booting the AVD now:\n\n{summary}");
 
         let start = session_summary_block_start(&content)
@@ -6373,12 +6361,14 @@ mod tests {
             reply_flushed_text: "streamed prefix".into(),
             activity_flushed_items: 0,
             activity_flushed_keys: Vec::new(),
+            summary_flushed: false,
         };
         let flushed: String = finalized_late_activity_lines_for_coverages(
             &app,
             Palette::for_theme(ThemeName::Slate),
             100,
             &[coverage],
+            app.sessions[0].messages.len(),
         )
         .iter()
         .flat_map(|line| line.spans.iter())
@@ -7636,6 +7626,10 @@ mod tests {
             UiNotification::ContextCompactionCompleted(ContextCompactionCompletedEvent {
                 session_id: session_id.clone(),
                 context_state: UiContextState {
+                    cache_epoch_id: None,
+                    last_cache_invalidation_reason: None,
+                    semantic_head_id: None,
+                    semantic_head_kind: None,
                     session_id: session_id.clone(),
                     thread_id: None,
                     generation: 4,
@@ -10390,6 +10384,10 @@ mod tests {
             UiNotification::ContextCompactionCompleted(ContextCompactionCompletedEvent {
                 session_id: session_id.clone(),
                 context_state: UiContextState {
+                    cache_epoch_id: None,
+                    last_cache_invalidation_reason: None,
+                    semantic_head_id: None,
+                    semantic_head_kind: None,
                     session_id: session_id.clone(),
                     thread_id: None,
                     generation: 4,
@@ -12865,8 +12863,22 @@ mod tests {
         app.set_run_state_in_progress();
         // Boundary recorded at the tool call between segment one and two. There is
         // no blank line, so only this boundary can advance the watermark.
+        let turn_key = (session, turn_id);
         app.live_reply_segment_boundaries
-            .insert((session, turn_id), vec![head.len()]);
+            .insert(turn_key.clone(), vec![head.len()]);
+        // Pin the v1-only compatibility path explicitly: a legacy server's
+        // NEGOTIATED capability set (known, and not advertising
+        // projection.envelope.v2 — the realistic wire order, since the
+        // capabilities response precedes any turn on that connection). No
+        // canonical takeover will ever arrive, so the completed v1 segment
+        // must keep flushing progressively. (While capabilities are still
+        // UNKNOWN, v1 bytes are held instead — see P2-17.)
+        app.set_capabilities(octos_core::ui_protocol::UiProtocolCapabilities::new(
+            &[],
+            &[],
+        ));
+        app.assistant_projection_lanes
+            .insert(turn_key, crate::model::AssistantProjectionLane::V1);
 
         let mut tracker = ScrollbackTracker::new();
         let update = tracker.sync(&app, Palette::for_theme(ThemeName::Slate), 100);
