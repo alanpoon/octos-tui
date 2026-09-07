@@ -982,7 +982,7 @@ command:
   profiles:
     desc: Manage local profiles — list, set the default, delete, or create one.
   goal:
-    desc: "Set: /goal <objective> [--budget 2m|500k]. Manage: pause, resume, stop, clear. Plain /goal shows the current goal."
+    desc: "Set: /goal <objective> [--budget 2m|500k]. Manage: pause, resume, stop, clear, archive, reopen [--reason <text>]. Plain /goal shows the current goal."
   help:
     desc: Show available commands.
   keymap:

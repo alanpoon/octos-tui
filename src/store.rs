@@ -948,6 +948,10 @@ impl Store {
         // readonly-mutating block, bad id, no active turn). Map that Option by
         // `is_some` to Accepted/Rejected. Parse errors and `Ok(None)` (no
         // intent, e.g. bare `/turn`) are rejected — fail-closed, never recorded.
+        // Snapshot so `reject_autonomy_slash` can tell whether the rejecting
+        // dispatcher actually explained itself, and never republish a stale
+        // status as if it were this command's reason.
+        let status_before = self.state.status.clone();
         let produced = match crate::autonomy::parse_autonomy_slash(draft) {
             Ok(Some(crate::autonomy::AutonomyCommand::Agents(cmd))) => {
                 self.dispatch_agents_command(cmd)
@@ -967,16 +971,55 @@ impl Store {
             Ok(Some(crate::autonomy::AutonomyCommand::Loop(cmd))) => {
                 self.dispatch_loop_command(cmd)
             }
-            Ok(None) => return SlashDispatchOutcome::Rejected,
+            Ok(None) => {
+                self.reject_autonomy_slash(draft, &status_before);
+                return SlashDispatchOutcome::Rejected;
+            }
             Err(err) => {
                 self.state.status = err.to_string();
+                self.reject_autonomy_slash(draft, &status_before);
                 return SlashDispatchOutcome::Rejected;
             }
         };
         match produced {
             Some(command) => SlashDispatchOutcome::accepted(Some(command)),
-            None => SlashDispatchOutcome::Rejected,
+            None => {
+                self.reject_autonomy_slash(draft, &status_before);
+                SlashDispatchOutcome::Rejected
+            }
         }
+    }
+
+    /// Surface an autonomy-slash rejection in the transcript, not only in
+    /// the status bar.
+    ///
+    /// The `dispatch_*_command` helpers reject by setting `state.status`
+    /// and returning `None` (missing session, capability gate, illegal
+    /// goal state, readonly, bad id). That bar is shared with turn state,
+    /// approval mode, and user chrome, and `dispatch_slash_command` has
+    /// already cleared the composer by the time we get here — so a
+    /// rejected `/goal archive` read as "Enter did nothing": the typed
+    /// command vanished and no transcript line replaced it. The registry's
+    /// own rejection paths ([`Self::show_unknown_slash_command`],
+    /// [`Self::show_unavailable_slash_command`]) push a Warning activity
+    /// for precisely this reason; autonomy dispatch now matches them.
+    ///
+    /// `status_before` guards the case where a dispatcher rejected without
+    /// setting a reason: republishing whatever the bar happened to hold
+    /// would attribute an unrelated message to this command, so fall back
+    /// to the generic unavailable text instead.
+    fn reject_autonomy_slash(&mut self, draft: &str, status_before: &str) {
+        let reason = if self.state.status == status_before {
+            t!("status.command_unavailable").into_owned()
+        } else {
+            self.state.status.clone()
+        };
+        self.push_local_activity(
+            ActivityKind::Warning,
+            t!("status.local_slash_command").into_owned(),
+            reason,
+            Some(t!("status.ignored_input", draft = draft).into_owned()),
+        );
     }
 
     /// `/research` — manage the named provider lanes (`sub_providers`) that back
@@ -40636,6 +40679,64 @@ now analyzing the bus module"
             }
             other => panic!("expected OperatorTransitionSessionGoal, got {other:?}"),
         }
+    }
+
+    /// A backend older than octos v2.0.3-rc.10 advertises `session/goal/
+    /// {get,set,clear}` but not `session/goal/operator_transition`, so
+    /// `/goal archive` is gated off. The gate itself is correct — but it
+    /// used to report ONLY through `state.status`, a bar already carrying
+    /// turn state, approval mode, and user chrome, while
+    /// `clear_current_composer_draft` wiped the typed command. Enter
+    /// therefore looked like a no-op: text gone, nothing in the
+    /// transcript. Every other slash rejection path
+    /// (`show_unknown_slash_command`, `show_unavailable_slash_command`)
+    /// pushes a Warning activity for exactly this reason; the autonomy
+    /// dispatchers must too.
+    #[test]
+    fn goal_archive_on_a_backend_without_the_rpc_pushes_a_visible_warning() {
+        let mut store = protocol_store_with_autonomy();
+        // Reproduce the older server: goal runtime present, operator
+        // transition absent.
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [
+                crate::model::APPUI_METHOD_SESSION_GOAL_GET,
+                crate::model::APPUI_METHOD_SESSION_GOAL_SET,
+                crate::model::APPUI_METHOD_SESSION_GOAL_CLEAR,
+            ],
+            [crate::model::APPUI_FEATURE_CODING_AUTONOMY_V1],
+        ));
+        let session_id = SessionKey("local:test".into());
+        store.state.set_session_goal(
+            &session_id,
+            Some(goal_record("active")),
+            Some("user".into()),
+        );
+        store.state.composer = "/goal archive --reason retiring stale goal".into();
+
+        assert!(
+            store.compose_command().is_none(),
+            "the gate must still refuse to probe an unadvertised method"
+        );
+        assert!(
+            store
+                .state
+                .status
+                .contains("session/goal/operator_transition"),
+            "status should still name the missing method: {}",
+            store.state.status
+        );
+        let activity = store
+            .state
+            .activity
+            .last()
+            .expect("rejection must surface a visible activity, not just a status line");
+        assert_eq!(activity.kind, ActivityKind::Warning);
+        assert_eq!(activity.title, "local slash command");
+        assert!(
+            activity.status.contains("session/goal/operator_transition"),
+            "the visible warning must carry the dispatcher's reason: {}",
+            activity.status
+        );
     }
 
     /// `/goal archive` with no `--reason` still sends a non-empty reason:

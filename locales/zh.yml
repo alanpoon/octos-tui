@@ -468,7 +468,7 @@ command:
   profiles:
     desc: 管理本地档案——列出、设为默认、删除或新建。
   goal:
-    desc: "设置：/goal <目标> [--budget 2m|500k]。管理：pause、resume、stop、clear。单独 /goal 查看当前目标。"
+    desc: "设置：/goal <目标> [--budget 2m|500k]。管理：pause、resume、stop、clear、archive、reopen [--reason <说明>]。单独 /goal 查看当前目标。"
   help:
     desc: 显示可用命令
   keymap:
