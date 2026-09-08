@@ -1,5 +1,26 @@
 use std::collections::BTreeSet;
 
+/// What the key handler must do with a Ctrl+V after the clipboard-image
+/// reducer has had its turn.
+///
+/// The distinction that matters is the last arm: Ctrl+V is NOT owned by
+/// this feature. When the clipboard holds no bitmap — overwhelmingly the
+/// common case — the keypress has to reach the existing text-paste path
+/// untouched, or the feature would break ordinary pasting for everyone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClipboardImagePaste {
+    /// A bitmap was staged onto the turn; the key is consumed.
+    Staged,
+    /// The clipboard DID hold a bitmap but it was refused (over the byte
+    /// ceiling, or the turn is already at its image cap). The key is
+    /// consumed and the status line explains why — silently doing nothing
+    /// after a deliberate paste is the failure mode being avoided.
+    Rejected,
+    /// No bitmap available (empty clipboard, or the helper could not run).
+    /// The key is NOT consumed: fall through to the text-paste path.
+    FallThroughToText,
+}
+
 use octos_core::app_ui::{AppUiError, AppUiEvent, AppUiSnapshot};
 use octos_core::ui_protocol::{
     ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalId,
@@ -6671,6 +6692,20 @@ impl Store {
         self.state.scroll_transcript_to_latest();
     }
 
+    /// Bound the attach count so a payload cannot balloon. Shared by BOTH
+    /// image routes — prompt paths (Route-1) and clipboard bitmaps (Route-2)
+    /// merge into one `Message.media` list, so the cap has to be one number.
+    /// Hoisted out of `image_media_from_prompt` for that sharing only; the
+    /// value is unchanged.
+    pub(crate) const MAX_TURN_IMAGES: usize = 4;
+
+    /// Per-file byte ceiling. The server reads+base64s the whole file
+    /// synchronously in `vision::encode_image`; a multi-hundred-MB file
+    /// would block the executor and blow the wire payload. 20 MB comfortably
+    /// covers real screenshots/photos. Also unchanged — a clipboard bitmap
+    /// hits the very same server-side encoder, so it obeys the very same limit.
+    pub(crate) const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+
     /// Detect image-file references in a submitted prompt and stage them as
     /// turn media. Terminals cannot deliver pasted image BYTES (bracketed
     /// paste is text-only), so the PATH is the paste surface: drag-drop into
@@ -6683,17 +6718,10 @@ impl Store {
     /// Extension set mirrors the server's `vision::is_image` — attaching
     /// anything else would be silently dropped by the vision filter.
     fn image_media_from_prompt(prompt: &str) -> Vec<octos_core::ui_protocol::FileRef> {
-        /// Bound the attach count so a payload cannot balloon.
-        const MAX_TURN_IMAGES: usize = 4;
         /// Bound the candidate scan independently of successes: a prompt with
         /// thousands of `@…png` tokens must not run thousands of stat syscalls
         /// on the UI thread.
         const MAX_CANDIDATES: usize = 32;
-        /// Per-file byte ceiling. The server reads+base64s the whole file
-        /// synchronously in `vision::encode_image`; a multi-hundred-MB file
-        /// would block the executor and blow the wire payload. 20 MB comfortably
-        /// covers real screenshots/photos.
-        const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
         fn image_mime(path: &str) -> Option<&'static str> {
             let lower = path.to_ascii_lowercase();
             if lower.ends_with(".png") {
@@ -6757,7 +6785,7 @@ impl Store {
             if meta.file_type().is_symlink() || !meta.is_file() {
                 continue;
             }
-            if meta.len() == 0 || meta.len() > MAX_IMAGE_BYTES {
+            if meta.len() == 0 || meta.len() > Self::MAX_IMAGE_BYTES {
                 continue;
             }
             // Dedupe on the CANONICAL path so `@a.png` and `@./a.png` are one.
@@ -6771,9 +6799,132 @@ impl Store {
                 mime: mime.to_owned(),
                 size_bytes: meta.len(),
             });
-            if media.len() >= MAX_TURN_IMAGES {
+            if media.len() >= Self::MAX_TURN_IMAGES {
                 break;
             }
+        }
+        media
+    }
+
+    /// Route-2 image attach: pull a bitmap off the system clipboard, stage it
+    /// under `dir`, and hang it on the next turn's media.
+    ///
+    /// `source` and `dir` are both injected so the whole decision tree is
+    /// exercisable with a fake clipboard and a temp directory — no real
+    /// terminal, no real clipboard, and never the user's real `~/.octos`.
+    ///
+    /// The composer text is deliberately left alone: a clipboard bitmap has no
+    /// sensible textual form, and mutating the draft under the user is exactly
+    /// what a paste of an image should not do. The status line carries the
+    /// feedback instead.
+    pub(crate) fn paste_clipboard_image_in(
+        &mut self,
+        source: &dyn crate::clipboard::ClipboardImageSource,
+        dir: &std::path::Path,
+    ) -> ClipboardImagePaste {
+        let bytes = match source.read_png() {
+            crate::clipboard::ClipboardImage::Png(bytes) => bytes,
+            // Silent: the clipboard holding text is the normal state of the
+            // world, and a status line on every ordinary paste would be noise.
+            crate::clipboard::ClipboardImage::Empty => {
+                return ClipboardImagePaste::FallThroughToText;
+            }
+            // Not silent: the user asked for an image and the machine could not
+            // even look. One line, no clipboard bytes, no logging (contract:
+            // 不把剪贴板字节写进命令历史或日志).
+            crate::clipboard::ClipboardImage::Unavailable(_) => {
+                self.state.status = t!("status.clipboard_image_unavailable").into_owned();
+                return ClipboardImagePaste::FallThroughToText;
+            }
+        };
+
+        // A "successful" helper that produced nothing is indistinguishable to
+        // the user from a broken one, and is reported the same way.
+        if bytes.is_empty() {
+            self.state.status = t!("status.clipboard_image_unavailable").into_owned();
+            return ClipboardImagePaste::FallThroughToText;
+        }
+
+        // Cap before size: at 4 images the answer is "no" regardless of how big
+        // the fifth one is, and this is the branch that must not write a file.
+        if self.state.staged_clipboard_media.len() >= Self::MAX_TURN_IMAGES {
+            self.state.status = t!(
+                "status.clipboard_image_turn_cap",
+                count = Self::MAX_TURN_IMAGES
+            )
+            .into_owned();
+            return ClipboardImagePaste::Rejected;
+        }
+
+        // Checked on the BYTES, before any write: an oversized paste must not
+        // leave a 21 MiB file behind in the staging directory just to be
+        // rejected a line later.
+        if bytes.len() as u64 > Self::MAX_IMAGE_BYTES {
+            self.state.status = t!(
+                "status.clipboard_image_too_large",
+                limit = Self::MAX_IMAGE_BYTES / (1024 * 1024)
+            )
+            .into_owned();
+            return ClipboardImagePaste::Rejected;
+        }
+
+        let path = match crate::clipboard::stage_clipboard_png(dir, &bytes) {
+            Ok(path) => path,
+            Err(_) => {
+                self.state.status = t!("status.clipboard_image_stage_failed").into_owned();
+                return ClipboardImagePaste::Rejected;
+            }
+        };
+
+        self.state
+            .staged_clipboard_media
+            .push(octos_core::ui_protocol::FileRef {
+                path: path.to_string_lossy().into_owned(),
+                mime: "image/png".to_owned(),
+                size_bytes: bytes.len() as u64,
+            });
+        self.state.status = t!(
+            "status.clipboard_image_staged",
+            count = self.state.staged_clipboard_media.len()
+        )
+        .into_owned();
+        ClipboardImagePaste::Staged
+    }
+
+    /// Production entry point for Ctrl+V: same reducer, default staging
+    /// directory. Degrades to the text paste when `$HOME` is unresolvable
+    /// rather than guessing at a write location.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn paste_clipboard_image(
+        &mut self,
+        source: &dyn crate::clipboard::ClipboardImageSource,
+    ) -> ClipboardImagePaste {
+        let Some(dir) = crate::clipboard::default_paste_staging_dir() else {
+            return ClipboardImagePaste::FallThroughToText;
+        };
+        self.paste_clipboard_image_in(source, &dir)
+    }
+
+    /// Merge both image routes into the single `Message.media` list a turn
+    /// carries. Clipboard bitmaps go first (they were staged by an explicit
+    /// keypress), then prompt paths fill the remaining slots.
+    ///
+    /// Route-1's own semantics are untouched: with nothing staged this returns
+    /// exactly `image_media_from_prompt(prompt)`.
+    fn turn_media(&mut self, prompt: &str) -> Vec<octos_core::ui_protocol::FileRef> {
+        // Taken, not cloned: a staged bitmap rides one turn and then is gone.
+        // Note the staged entries are NOT deduped against each other — pasting
+        // the same screenshot twice is the user saying "two images", even
+        // though content addressing means both point at one file on disk.
+        let mut media = std::mem::take(&mut self.state.staged_clipboard_media);
+        for candidate in Self::image_media_from_prompt(prompt) {
+            if media.len() >= Self::MAX_TURN_IMAGES {
+                break;
+            }
+            if media.iter().any(|existing| existing.path == candidate.path) {
+                continue;
+            }
+            media.push(candidate);
         }
         media
     }
@@ -6816,10 +6967,11 @@ impl Store {
             .session_reasoning_effort
             .get(&session_id)
             .copied();
-        // Route-1 image attach: existing image paths in the prompt (pasted,
-        // drag-dropped, or `@`-picked) ride the turn as media so the vision
-        // pipeline sees them. Text keeps the reference readable either way.
-        let media = Self::image_media_from_prompt(&prompt);
+        // Image attach, both routes into one media list: Route-1 existing image
+        // paths in the prompt (pasted, drag-dropped, or `@`-picked) and Route-2
+        // clipboard bitmaps staged by Ctrl+V. Text keeps the reference readable
+        // either way.
+        let media = self.turn_media(&prompt);
         if !media.is_empty() {
             self.state.status = t!("status.images_attached", count = media.len()).into_owned();
         }
@@ -37683,6 +37835,317 @@ now analyzing the bus module"
         assert!(
             Store::image_media_from_prompt(&prompt).is_empty(),
             "a file over the byte cap must be skipped"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Route-2: Ctrl+V clipboard bitmap → turn media
+    // (specs/task-clipboard-image-paste.spec.md)
+    //
+    // Every test here drives a FAKE `ClipboardImageSource` and an explicit temp
+    // staging directory, so none of them needs a terminal, a real clipboard, a
+    // platform helper binary, or the user's real `~/.octos`.
+    // ---------------------------------------------------------------------
+
+    /// Fake clipboard: hands back a scripted outcome per read, so the "two
+    /// pastes in a row" and "helper is broken" cases are expressible.
+    struct FakeClipboard {
+        reads: std::cell::RefCell<std::collections::VecDeque<crate::clipboard::ClipboardImage>>,
+    }
+
+    impl FakeClipboard {
+        fn always(image: crate::clipboard::ClipboardImage) -> Self {
+            Self {
+                reads: std::cell::RefCell::new(std::collections::VecDeque::from(vec![image])),
+            }
+        }
+
+        fn sequence(images: Vec<crate::clipboard::ClipboardImage>) -> Self {
+            Self {
+                reads: std::cell::RefCell::new(images.into()),
+            }
+        }
+    }
+
+    impl crate::clipboard::ClipboardImageSource for FakeClipboard {
+        fn read_png(&self) -> crate::clipboard::ClipboardImage {
+            let mut reads = self.reads.borrow_mut();
+            // A single scripted read repeats; a multi-read script advances.
+            if reads.len() == 1 {
+                reads[0].clone()
+            } else {
+                reads
+                    .pop_front()
+                    .unwrap_or(crate::clipboard::ClipboardImage::Empty)
+            }
+        }
+    }
+
+    /// Minimal PNG-shaped payload of an exact byte length. Content only has to
+    /// be deterministic bytes — nothing in this path decodes the image.
+    fn fake_png(len: usize, fill: u8) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.resize(len, fill);
+        bytes
+    }
+
+    fn staged_png_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut files: Vec<_> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "png"))
+            .collect();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn ctrl_v_stages_clipboard_bitmap_as_turn_media() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = fake_png(4 * 1024, 0xa1);
+        let clipboard = FakeClipboard::always(crate::clipboard::ClipboardImage::Png(bytes.clone()));
+
+        let mut store = store_with_empty_session();
+        store.state.set_composer_text("what does this show?");
+
+        let outcome = store.paste_clipboard_image_in(&clipboard, dir.path());
+        assert_eq!(outcome, ClipboardImagePaste::Staged);
+
+        // The bitmap landed on disk as a `.png` under the staging directory.
+        let files = staged_png_files(dir.path());
+        assert_eq!(files.len(), 1, "exactly one staged png");
+        assert_eq!(std::fs::read(&files[0]).unwrap(), bytes, "bytes round-trip");
+        assert!(
+            files[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("paste-"),
+            "content-addressed staging name"
+        );
+
+        // The composer is untouched — an image paste must not rewrite the draft.
+        assert_eq!(
+            store.state.composer, "what does this show?",
+            "clipboard image paste must not change composer text"
+        );
+
+        // ...and it reaches the SAME `Message.media` channel Route-1 feeds.
+        let cmd = store.compose_command().expect("prompt turn dispatches");
+        let AppUiCommand::SubmitPrompt(params) = cmd else {
+            panic!("expected SubmitPrompt");
+        };
+        assert_eq!(params.media.len(), 1, "staged bitmap rides the turn");
+        assert_eq!(params.media[0].mime, "image/png");
+        assert_eq!(params.media[0].path, files[0].to_string_lossy());
+        assert_eq!(params.media[0].size_bytes, bytes.len() as u64);
+    }
+
+    #[test]
+    fn ctrl_v_without_clipboard_image_falls_back_to_text_paste() {
+        // The overwhelmingly common case: the clipboard holds text. Ctrl+V must
+        // stay a plain paste — if this feature swallowed the key, it would break
+        // pasting for every user who never pastes an image.
+        let dir = tempfile::tempdir().unwrap();
+        let clipboard = FakeClipboard::always(crate::clipboard::ClipboardImage::Empty);
+
+        let mut store = store_with_empty_session();
+        let outcome = store.paste_clipboard_image_in(&clipboard, dir.path());
+
+        assert_eq!(
+            outcome,
+            ClipboardImagePaste::FallThroughToText,
+            "the keypress must continue to the text-paste path"
+        );
+        assert!(store.state.staged_clipboard_media.is_empty());
+        assert!(
+            staged_png_files(dir.path()).is_empty(),
+            "nothing written when there is no bitmap"
+        );
+
+        store.state.set_composer_text("hello");
+        let cmd = store.compose_command().expect("prompt turn dispatches");
+        let AppUiCommand::SubmitPrompt(params) = cmd else {
+            panic!("expected SubmitPrompt");
+        };
+        assert!(params.media.is_empty(), "this turn carries no media");
+    }
+
+    #[test]
+    fn oversized_clipboard_image_is_rejected_with_status() {
+        // The ceiling is checked on the BYTES, before any write: a 21 MiB paste
+        // must not leave a 21 MiB file behind just to be refused a line later.
+        let dir = tempfile::tempdir().unwrap();
+        let oversized = fake_png(21 * 1024 * 1024, 0xb2);
+        assert!(oversized.len() as u64 > Store::MAX_IMAGE_BYTES);
+        let clipboard = FakeClipboard::always(crate::clipboard::ClipboardImage::Png(oversized));
+
+        let mut store = store_with_empty_session();
+        let outcome = store.paste_clipboard_image_in(&clipboard, dir.path());
+
+        assert_eq!(outcome, ClipboardImagePaste::Rejected);
+        assert!(store.state.staged_clipboard_media.is_empty());
+        assert!(
+            staged_png_files(dir.path()).is_empty(),
+            "an over-cap bitmap must not be written to the staging dir"
+        );
+        assert_eq!(
+            store.state.status,
+            t!("status.clipboard_image_too_large", limit = 20).into_owned(),
+            "the status line explains the refusal"
+        );
+
+        store.state.set_composer_text("look");
+        let cmd = store.compose_command().expect("prompt turn dispatches");
+        let AppUiCommand::SubmitPrompt(params) = cmd else {
+            panic!("expected SubmitPrompt");
+        };
+        assert!(params.media.is_empty());
+    }
+
+    #[test]
+    fn clipboard_image_paste_respects_turn_image_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store_with_empty_session();
+
+        // Fill the turn to MAX_TURN_IMAGES with four DISTINCT bitmaps.
+        for index in 0..Store::MAX_TURN_IMAGES {
+            let clipboard = FakeClipboard::always(crate::clipboard::ClipboardImage::Png(fake_png(
+                1024,
+                index as u8,
+            )));
+            assert_eq!(
+                store.paste_clipboard_image_in(&clipboard, dir.path()),
+                ClipboardImagePaste::Staged
+            );
+        }
+        assert_eq!(
+            store.state.staged_clipboard_media.len(),
+            Store::MAX_TURN_IMAGES
+        );
+
+        // The fifth paste is refused, loudly.
+        let extra = FakeClipboard::always(crate::clipboard::ClipboardImage::Png(fake_png(1024, 9)));
+        let outcome = store.paste_clipboard_image_in(&extra, dir.path());
+
+        assert_eq!(outcome, ClipboardImagePaste::Rejected);
+        assert_eq!(
+            store.state.staged_clipboard_media.len(),
+            4,
+            "the turn stays at the cap"
+        );
+        assert_eq!(
+            store.state.status,
+            t!("status.clipboard_image_turn_cap", count = 4).into_owned(),
+            "the status line names the cap"
+        );
+        assert_eq!(
+            staged_png_files(dir.path()).len(),
+            4,
+            "the refused bitmap is never written"
+        );
+
+        store.state.set_composer_text("compare these");
+        let cmd = store.compose_command().expect("prompt turn dispatches");
+        let AppUiCommand::SubmitPrompt(params) = cmd else {
+            panic!("expected SubmitPrompt");
+        };
+        assert_eq!(params.media.len(), 4, "the turn ships exactly the cap");
+    }
+
+    #[test]
+    fn missing_clipboard_helper_degrades_to_text_paste() {
+        // No helper installed (`xclip not found`) is not the user's mistake to
+        // discover silently: fall through to text AND say why.
+        let dir = tempfile::tempdir().unwrap();
+        let clipboard = FakeClipboard::always(crate::clipboard::ClipboardImage::Unavailable(
+            "xclip not found".into(),
+        ));
+
+        let mut store = store_with_empty_session();
+        let outcome = store.paste_clipboard_image_in(&clipboard, dir.path());
+
+        assert_eq!(
+            outcome,
+            ClipboardImagePaste::FallThroughToText,
+            "the text-paste path still receives the keypress"
+        );
+        assert!(store.state.staged_clipboard_media.is_empty());
+        assert_eq!(
+            store.state.status,
+            t!("status.clipboard_image_unavailable").into_owned()
+        );
+        // The helper's diagnostic never reaches a user-visible surface, so a
+        // clipboard-derived string can't leak through the status line.
+        assert!(!store.state.status.contains("xclip"));
+        assert!(staged_png_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn empty_clipboard_helper_output_degrades_to_text_paste() {
+        // Exit code 0 with zero bytes: "succeeded" but produced nothing. From
+        // the user's seat that is indistinguishable from a broken helper, and
+        // it is reported the same way.
+        let dir = tempfile::tempdir().unwrap();
+        let clipboard = FakeClipboard::always(crate::clipboard::ClipboardImage::Png(Vec::new()));
+
+        let mut store = store_with_empty_session();
+        let outcome = store.paste_clipboard_image_in(&clipboard, dir.path());
+
+        assert_eq!(
+            outcome,
+            ClipboardImagePaste::FallThroughToText,
+            "the text-paste path still receives the keypress"
+        );
+        assert!(store.state.staged_clipboard_media.is_empty());
+        assert_eq!(
+            store.state.status,
+            t!("status.clipboard_image_unavailable").into_owned()
+        );
+        assert!(
+            staged_png_files(dir.path()).is_empty(),
+            "a zero-byte payload must not create a file"
+        );
+    }
+
+    #[test]
+    fn identical_clipboard_bitmap_reuses_staged_temp_file() {
+        // Content-addressed naming: pasting the same screenshot twice is the
+        // user saying "two images", but it must not litter the staging dir with
+        // byte-identical copies.
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = fake_png(2048, 0xc3);
+        let clipboard = FakeClipboard::sequence(vec![
+            crate::clipboard::ClipboardImage::Png(bytes.clone()),
+            crate::clipboard::ClipboardImage::Png(bytes.clone()),
+        ]);
+
+        let mut store = store_with_empty_session();
+        assert_eq!(
+            store.paste_clipboard_image_in(&clipboard, dir.path()),
+            ClipboardImagePaste::Staged
+        );
+        assert_eq!(
+            store.paste_clipboard_image_in(&clipboard, dir.path()),
+            ClipboardImagePaste::Staged
+        );
+
+        let files = staged_png_files(dir.path());
+        assert_eq!(files.len(), 1, "identical bytes reuse one staged file");
+        assert_eq!(std::fs::read(&files[0]).unwrap(), bytes);
+
+        store.state.set_composer_text("twice");
+        let cmd = store.compose_command().expect("prompt turn dispatches");
+        let AppUiCommand::SubmitPrompt(params) = cmd else {
+            panic!("expected SubmitPrompt");
+        };
+        assert_eq!(params.media.len(), 2, "two media entries");
+        assert_eq!(
+            params.media[0].path, params.media[1].path,
+            "both point at the same staged file"
         );
     }
 
