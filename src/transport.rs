@@ -5688,6 +5688,7 @@ impl AppUiBackend for MockAppUiBackend {
                     available: Some(true),
                     queue_mode: Some("interactive".into()),
                     qoe_policy: Some("mock".into()),
+                    vision: None,
                 };
                 self.queue.push_back(model_select_event(
                     ModelSelectResult {
@@ -5717,6 +5718,7 @@ impl AppUiBackend for MockAppUiBackend {
                     available: Some(true),
                     queue_mode: None,
                     qoe_policy: None,
+                    vision: None,
                 };
                 let initiating = params
                     .session_id
@@ -6183,6 +6185,7 @@ fn mock_model_status(selected: bool) -> ModelStatus {
         available: Some(true),
         queue_mode: Some("interactive".into()),
         qoe_policy: Some("mock".into()),
+        vision: None,
     }
 }
 
@@ -6197,6 +6200,7 @@ fn mock_alt_model_status() -> ModelStatus {
         available: Some(true),
         queue_mode: Some("collect".into()),
         qoe_policy: Some("mock".into()),
+        vision: None,
     }
 }
 

@@ -8154,6 +8154,7 @@ mod tests {
                 available: Some(true),
                 queue_mode: Some("collect".into()),
                 qoe_policy: Some("balanced".into()),
+                vision: None,
             }),
             permission_profile: Some("workspace-write-no-network".into()),
             approval_policy: Some("never".into()),
@@ -10394,6 +10395,7 @@ mod tests {
                 available: Some(true),
                 queue_mode: Some("interactive".into()),
                 qoe_policy: Some("adaptive".into()),
+                vision: None,
             }],
         };
         let ctx = MenuContext {
@@ -10457,6 +10459,7 @@ mod tests {
             available: Some(true),
             queue_mode: None,
             qoe_policy: None,
+            vision: None,
         };
         let marked_ids = |catalog: &SessionModelCatalog, current: Option<&'static str>| {
             let ctx = MenuContext {
@@ -11549,6 +11552,7 @@ mod tests {
                 available: Some(true),
                 queue_mode: None,
                 qoe_policy: None,
+                vision: None,
             }],
         };
         let ctx = MenuContext {

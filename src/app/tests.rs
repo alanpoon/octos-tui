@@ -425,6 +425,7 @@ mod tests {
                 available: Some(true),
                 queue_mode: None,
                 qoe_policy: None,
+                vision: None,
             }),
             permission_profile: None,
             approval_policy: None,
@@ -1035,6 +1036,7 @@ mod tests {
                     available: Some(true),
                     queue_mode: None,
                     qoe_policy: None,
+                    vision: None,
                 },
                 ModelStatus {
                     model: "gpt-5".into(),
@@ -1046,6 +1048,7 @@ mod tests {
                     available: Some(true),
                     queue_mode: None,
                     qoe_policy: None,
+                    vision: None,
                 },
             ],
         });

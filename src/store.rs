@@ -44,7 +44,7 @@ use crate::{
         SessionView, StagedSubmitGate, SubProviderView, SubProvidersListParams,
         SubProvidersRemoveParams, SubProvidersUpsertParams, TaskView, ToolConfigDeleteParams,
         ToolConfigListParams, ToolConfigSetEnabledParams, ToolConfigTestParams,
-        ToolConfigUpsertParams, UserQuestionPickerState, V2AssistantSegment,
+        ToolConfigUpsertParams, UserQuestionPickerState, V2AssistantSegment, VisionCapability,
         complete_plan_steps_in_text, task_state_label, terminal_task_state_from_agent_status,
     },
     transport::{
@@ -6778,6 +6778,48 @@ impl Store {
         media
     }
 
+    /// task-vision-capability-guard: drop this turn's image media when the
+    /// SERVER advertised `vision = false` for the model that will actually run
+    /// the turn, and say so by name instead of letting the server silently
+    /// discard the images (or fail the whole turn).
+    ///
+    /// Deliberately evaluated on the SUBMIT path, not the attach path: media is
+    /// staged from prompt text, and a `/model` switch between staging and
+    /// submit must be re-judged against the model that receives the turn.
+    ///
+    /// Rejection is scoped to `media` — the caller's prompt TEXT is never
+    /// touched, so the user's words still reach the model and the image paths
+    /// stay readable in the transcript.
+    ///
+    /// Returns `true` when media was rejected.
+    fn reject_media_without_vision(
+        &mut self,
+        session_id: &SessionKey,
+        media: &mut Vec<octos_core::ui_protocol::FileRef>,
+    ) -> bool {
+        // Supported = the server said yes. Unknown = the server said nothing
+        // usable (old server, absent field, malformed value, failed
+        // `model/list`) and MUST keep the pre-guard behaviour — attaching, with
+        // no hint — or every pre-`vision` server regresses.
+        if self.state.vision_capability_for(session_id) != VisionCapability::Unsupported {
+            return false;
+        }
+        // `Unsupported` can only come from a resolved active model, so the id
+        // the hint names is the same one the capability was read from.
+        let Some(model) = self
+            .state
+            .active_model_status(session_id)
+            .map(|model| model.model.clone())
+        else {
+            return false;
+        };
+        let count = media.len();
+        media.clear();
+        self.state.status =
+            t!("status.vision_media_rejected", model = model, count = count).into_owned();
+        true
+    }
+
     fn start_prompt_turn(
         &mut self,
         prompt: String,
@@ -6819,8 +6861,8 @@ impl Store {
         // Route-1 image attach: existing image paths in the prompt (pasted,
         // drag-dropped, or `@`-picked) ride the turn as media so the vision
         // pipeline sees them. Text keeps the reference readable either way.
-        let media = Self::image_media_from_prompt(&prompt);
-        if !media.is_empty() {
+        let mut media = Self::image_media_from_prompt(&prompt);
+        if !media.is_empty() && !self.reject_media_without_vision(&session_id, &mut media) {
             self.state.status = t!("status.images_attached", count = media.len()).into_owned();
         }
         Some(AppUiCommand::SubmitPrompt(TurnStartParams {
@@ -29258,6 +29300,7 @@ now analyzing the bus module"
                 available: Some(true),
                 queue_mode: Some("collect".into()),
                 qoe_policy: Some("balanced".into()),
+                vision: None,
             }),
             permission_profile: Some("workspace-write-no-network".into()),
             approval_policy: Some("never".into()),
@@ -30750,6 +30793,7 @@ now analyzing the bus module"
                         available: Some(true),
                         queue_mode: None,
                         qoe_policy: None,
+                        vision: None,
                     },
                     crate::model::ModelStatus {
                         model: "deepseek-chat".into(),
@@ -30761,6 +30805,7 @@ now analyzing the bus module"
                         available: Some(true),
                         queue_mode: None,
                         qoe_policy: None,
+                        vision: None,
                     },
                 ],
             });
@@ -30782,6 +30827,7 @@ now analyzing the bus module"
                         available: Some(true),
                         queue_mode: None,
                         qoe_policy: None,
+                        vision: None,
                     },
                     applied: true,
                     restart_required: false,
@@ -30852,6 +30898,7 @@ now analyzing the bus module"
                         available: Some(true),
                         queue_mode: None,
                         qoe_policy: None,
+                        vision: None,
                     },
                     ModelStatus {
                         model: "deepseek-chat".into(),
@@ -30863,6 +30910,7 @@ now analyzing the bus module"
                         available: Some(true),
                         queue_mode: None,
                         qoe_policy: None,
+                        vision: None,
                     },
                 ],
             });
@@ -30881,6 +30929,7 @@ now analyzing the bus module"
                         available: Some(true),
                         queue_mode: None,
                         qoe_policy: None,
+                        vision: None,
                     },
                     applied: true,
                     restart_required: true,
@@ -30979,6 +31028,7 @@ now analyzing the bus module"
                         available: Some(true),
                         queue_mode: None,
                         qoe_policy: None,
+                        vision: None,
                     }],
                 });
         }
@@ -30996,6 +31046,7 @@ now analyzing the bus module"
                         available: Some(true),
                         queue_mode: None,
                         qoe_policy: None,
+                        vision: None,
                     },
                     applied: true,
                     restart_required: false,
@@ -37625,6 +37676,337 @@ now analyzing the bus module"
         assert!(text.contains("shot.png"));
     }
 
+    // ---------------------------------------------------------------------
+    // task-vision-capability-guard: image media is gated on the SERVER's
+    // advertised `vision` flag for the active model, evaluated at SUBMIT.
+    // ---------------------------------------------------------------------
+
+    /// A `model/list` reply as it comes off the wire, so the tests exercise the
+    /// real decode (including `vision`'s absence and malformed shapes) instead
+    /// of hand-building the typed struct the decode is supposed to produce.
+    fn apply_model_list_json(
+        store: &mut Store,
+        session_id: &SessionKey,
+        models: serde_json::Value,
+    ) {
+        let result: crate::model::ModelListResult = serde_json::from_value(serde_json::json!({
+            "session_id": session_id.0,
+            "models": models,
+        }))
+        .expect("model/list decodes");
+        store.apply_client_event(ClientEvent::ModelList(
+            crate::client_event::ModelListClientEvent {
+                result,
+                message: "models listed".into(),
+            },
+        ));
+    }
+
+    /// One `model/list` entry. `vision` is injected verbatim so a test can hand
+    /// the decoder an absent field or a malformed value.
+    fn model_entry(
+        model: &str,
+        selected: bool,
+        vision: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut entry = serde_json::json!({
+            "model": model,
+            "provider": "acme",
+            "selected": selected,
+            "available": true,
+        });
+        if let Some(vision) = vision {
+            entry["vision"] = vision;
+        }
+        entry
+    }
+
+    /// A store with one session and a real `@`-referenced PNG staged in the
+    /// composer. The returned `TempDir` owns the file — dropping it early would
+    /// delete the image out from under the attach path.
+    fn store_with_staged_image(prefix: &str) -> (Store, tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("a.png");
+        std::fs::write(&img, b"\x89PNG fake").unwrap();
+        // Absolute + `@`: the `@` is the intent signal the attach path
+        // requires, and an absolute path keeps the test independent of the
+        // process cwd (which other tests run in parallel with).
+        let prompt = format!("{prefix} @{}", img.display());
+        let mut store = store_with_empty_session();
+        store.state.set_composer_text(prompt.clone());
+        (store, dir, prompt)
+    }
+
+    fn submitted_media(store: &mut Store) -> (Vec<octos_core::ui_protocol::FileRef>, String) {
+        let cmd = store.compose_command().expect("prompt turn dispatches");
+        let AppUiCommand::SubmitPrompt(params) = cmd else {
+            panic!("expected SubmitPrompt, got {cmd:?}");
+        };
+        let InputItem::Text { text } = &params.input[0] else {
+            panic!("text input expected");
+        };
+        (params.media.clone(), text.clone())
+    }
+
+    #[test]
+    fn vision_capable_model_attaches_images() {
+        // The server advertised `vision: true` for the active model, so the
+        // guard is a no-op: the image rides the turn exactly as before and the
+        // status line is the ordinary attach hint, not a capability complaint.
+        let (mut store, _dir, _prompt) = store_with_staged_image("what is wrong in");
+        let session_id = store.state.sessions[0].id.clone();
+        apply_model_list_json(
+            &mut store,
+            &session_id,
+            serde_json::json!([model_entry(
+                "acme-vision",
+                true,
+                Some(serde_json::json!(true))
+            )]),
+        );
+
+        let (media, _text) = submitted_media(&mut store);
+        assert_eq!(
+            media.len(),
+            1,
+            "a vision-capable model still gets the image"
+        );
+        assert!(media[0].path.ends_with("a.png"));
+        assert_eq!(
+            store.state.status,
+            t!("status.images_attached", count = 1usize).into_owned(),
+            "no vision hint when the server said the model can see"
+        );
+    }
+
+    #[test]
+    fn non_vision_model_rejects_image_media_with_hint() {
+        // `vision: false` is server truth, so the turn ships WITHOUT media and
+        // the user is told which model dropped it — the failure the server
+        // would otherwise absorb silently becomes visible at the client.
+        let (mut store, _dir, _prompt) = store_with_staged_image("what is wrong in");
+        let session_id = store.state.sessions[0].id.clone();
+        apply_model_list_json(
+            &mut store,
+            &session_id,
+            serde_json::json!([model_entry(
+                "acme-text-only",
+                true,
+                Some(serde_json::json!(false))
+            )]),
+        );
+
+        let (media, _text) = submitted_media(&mut store);
+        assert!(media.is_empty(), "a non-vision model gets no image media");
+        assert!(
+            store.state.status.contains("acme-text-only"),
+            "the hint must name the active model id, got {:?}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn unknown_vision_capability_keeps_existing_attach_behavior() {
+        // COMPATIBILITY GUARANTEE: a server that never advertises `vision`
+        // must see byte-identical behaviour to the pre-guard client. Anything
+        // else is a regression for every older `octos serve`.
+        let (mut store, _dir, _prompt) = store_with_staged_image("what is wrong in");
+        let session_id = store.state.sessions[0].id.clone();
+        apply_model_list_json(
+            &mut store,
+            &session_id,
+            serde_json::json!([model_entry("acme-legacy", true, None)]),
+        );
+        assert_eq!(
+            store.state.vision_capability_for(&session_id),
+            VisionCapability::Unknown,
+            "an absent field is UNKNOWN, never a guess from the model name"
+        );
+
+        let (media, _text) = submitted_media(&mut store);
+        assert_eq!(media.len(), 1, "unknown capability attaches, as before");
+        assert_eq!(
+            store.state.status,
+            t!("status.images_attached", count = 1usize).into_owned(),
+            "unknown capability shows no vision hint"
+        );
+    }
+
+    #[test]
+    fn rejected_image_media_still_submits_prompt_text() {
+        // Rejection is scoped to media. The user's words — and the readable
+        // image reference inside them — reach the model unchanged; only the
+        // attachment is dropped.
+        let (mut store, _dir, prompt) = store_with_staged_image("看看");
+        let session_id = store.state.sessions[0].id.clone();
+        apply_model_list_json(
+            &mut store,
+            &session_id,
+            serde_json::json!([model_entry(
+                "acme-text-only",
+                true,
+                Some(serde_json::json!(false))
+            )]),
+        );
+
+        let (media, text) = submitted_media(&mut store);
+        assert!(media.is_empty(), "media is rejected");
+        assert_eq!(
+            text, prompt,
+            "the submitted text is the typed text, byte for byte"
+        );
+        assert!(text.starts_with("看看 "));
+        assert!(text.ends_with("a.png"));
+    }
+
+    #[test]
+    fn model_switch_to_non_vision_rejects_staged_media() {
+        // The guard lives on the SUBMIT path, not the attach path: media
+        // staged under a vision-capable model must be re-judged against the
+        // model that will actually receive the turn.
+        let (mut store, _dir, _prompt) = store_with_staged_image("what is wrong in");
+        let session_id = store.state.sessions[0].id.clone();
+        apply_model_list_json(
+            &mut store,
+            &session_id,
+            serde_json::json!([
+                model_entry("acme-vision", true, Some(serde_json::json!(true))),
+                model_entry("acme-text-only", false, Some(serde_json::json!(false))),
+            ]),
+        );
+        assert_eq!(
+            store.state.vision_capability_for(&session_id),
+            VisionCapability::Supported,
+            "staged under a model the server says can see"
+        );
+
+        // `/model` switch lands as a `model/select` result attributed to this
+        // session; the reducer re-points `selected` in the cached catalog.
+        let selected = store
+            .state
+            .model_catalog_for(&session_id)
+            .expect("catalog")
+            .models
+            .iter()
+            .find(|model| model.model == "acme-text-only")
+            .cloned()
+            .expect("switch target in catalog");
+        store.apply_client_event(ClientEvent::ModelSelect(
+            crate::client_event::ModelSelectClientEvent {
+                result: crate::model::ModelSelectResult {
+                    session_id: session_id.clone(),
+                    selected,
+                    applied: true,
+                    restart_required: false,
+                    runtime_policy_stamp: None,
+                },
+                message: "Model selected".into(),
+                initiating_session: Some(session_id.clone()),
+            },
+        ));
+
+        let (media, _text) = submitted_media(&mut store);
+        assert!(
+            media.is_empty(),
+            "already-staged media is re-judged at submit"
+        );
+        assert!(
+            store.state.status.contains("acme-text-only"),
+            "the hint names the model switched TO, got {:?}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn model_list_failure_treats_vision_as_unknown_and_allows_media() {
+        // A failed `model/list` leaves no catalog, so there is no server truth
+        // to gate on. UNKNOWN, not "assume no vision" — a client that guessed
+        // here would break image attach on every transient list failure.
+        use octos_core::app_ui::AppUiError;
+        let (mut store, _dir, _prompt) = store_with_staged_image("what is wrong in");
+        let session_id = store.state.sessions[0].id.clone();
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "invalid_result".into(),
+            message: format!(
+                "failed to decode UI protocol result for {}: boom",
+                crate::model::APPUI_METHOD_MODEL_LIST
+            ),
+        }));
+        assert!(
+            store.state.model_catalog_for(&session_id).is_none(),
+            "a failed model/list leaves no catalog"
+        );
+        assert_eq!(
+            store.state.vision_capability_for(&session_id),
+            VisionCapability::Unknown
+        );
+
+        let (media, _text) = submitted_media(&mut store);
+        assert_eq!(media.len(), 1, "no server truth ⇒ attach as before");
+        assert_eq!(
+            store.state.status,
+            t!("status.images_attached", count = 1usize).into_owned(),
+            "no vision hint when the capability is unknown"
+        );
+    }
+
+    #[test]
+    fn malformed_vision_field_treats_capability_as_unknown() {
+        // `"vision": "yes"` is not a boolean the client may act on. It must
+        // degrade to UNKNOWN *without* failing the decode of the rest of the
+        // entry (the model still shows up in the catalog).
+        let (mut store, _dir, _prompt) = store_with_staged_image("what is wrong in");
+        let session_id = store.state.sessions[0].id.clone();
+        apply_model_list_json(
+            &mut store,
+            &session_id,
+            serde_json::json!([model_entry(
+                "acme-malformed",
+                true,
+                Some(serde_json::json!("yes"))
+            )]),
+        );
+        let catalog = store
+            .state
+            .model_catalog_for(&session_id)
+            .expect("a malformed vision value must not sink the whole entry");
+        assert_eq!(catalog.models.len(), 1);
+        assert_eq!(catalog.models[0].vision, None, "malformed ⇒ not advertised");
+        assert_eq!(
+            store.state.vision_capability_for(&session_id),
+            VisionCapability::Unknown
+        );
+
+        let (media, _text) = submitted_media(&mut store);
+        assert_eq!(media.len(), 1, "malformed ⇒ unknown ⇒ attach as before");
+        assert_eq!(
+            store.state.status,
+            t!("status.images_attached", count = 1usize).into_owned(),
+            "no vision hint when the capability is unknown"
+        );
+    }
+
+    #[test]
+    fn vision_rejection_hint_resolves_in_en_and_zh() {
+        // Mirrors `resolves_keys_in_en_and_zh`: per-call `locale =` override
+        // (never `set_locale`, which would mutate the process-global locale and
+        // flake tests that assume English). rust-i18n echoes the KEY on a miss,
+        // and `fallback = "en"` would hide a missing zh key behind the English
+        // string — so both renderings must differ from the key AND each other.
+        const KEY: &str = "status.vision_media_rejected";
+        let en = t!(KEY, locale = "en", model = "acme-text-only", count = 1usize).into_owned();
+        let zh = t!(KEY, locale = "zh", model = "acme-text-only", count = 1usize).into_owned();
+        assert_ne!(en, KEY, "en.yml is missing {KEY}");
+        assert_ne!(zh, KEY, "zh.yml is missing {KEY}");
+        assert_ne!(en, zh, "zh.yml fell back to the en translation for {KEY}");
+        for rendered in [&en, &zh] {
+            assert!(
+                rendered.contains("acme-text-only"),
+                "the hint must name the active model id, got {rendered:?}"
+            );
+        }
+    }
+
     #[test]
     fn bare_filename_never_attaches_only_at_reference_does() {
         // codex security P1: `rename foo.png to bar.png` with both files real
@@ -38678,6 +39060,7 @@ now analyzing the bus module"
             available: Some(true),
             queue_mode: None,
             qoe_policy: None,
+            vision: None,
         };
         let mut effective = session_status_result(&session_id);
         let expected = effective.model.clone().expect("effective model");

@@ -599,6 +599,7 @@ status:
   setting_goal: "Setting goal: %{objective}"
   clearing_goal: "Clearing goal"
   images_attached: "%{count} image(s) attached to this turn"
+  vision_media_rejected: "%{model} does not support image input — %{count} image(s) not attached. Switch to a vision-capable model with /model."
   listing_loops: "Listing loops"
   loop_interval_min: "Loop interval must be at least 1 second"
   creating_loop: "Creating loop"

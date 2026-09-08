@@ -1183,6 +1183,46 @@ pub struct ModelStatus {
     pub queue_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qoe_policy: Option<String>,
+    /// task-vision-capability-guard: the server's OPTIONAL advertisement of
+    /// whether this model accepts image input. `Some(true)`/`Some(false)` are
+    /// server truth; `None` means "not advertised" — an older server, an
+    /// absent field, or a malformed value — and the client must treat the
+    /// capability as UNKNOWN. The model NAME is never consulted: guessing
+    /// vision support locally is exactly the "本地伪造状态" the project spec
+    /// forbids, and a wrong guess either drops a legitimate image or ships one
+    /// to a text-only model.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_advertised_flag",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub vision: Option<bool>,
+}
+
+/// Server-advertised capability truth, as three states. `Unknown` is the
+/// compatibility state: it MUST behave exactly like the pre-guard client so a
+/// server that never advertises `vision` sees no behaviour change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionCapability {
+    /// The server advertised `vision: true` for this model.
+    Supported,
+    /// The server advertised `vision: false` for this model.
+    Unsupported,
+    /// The server advertised nothing usable (field absent, catalog missing,
+    /// `model/list` failed, or the value was not a JSON boolean).
+    Unknown,
+}
+
+/// Decode an OPTIONAL server-advertised boolean flag WITHOUT failing the whole
+/// result on a malformed value: a non-boolean (`"yes"`, `1`, an object) is not
+/// a truth the client may act on, so it degrades to `None` (UNKNOWN) rather
+/// than aborting the decode of every other model in the list.
+fn deserialize_advertised_flag<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| value.as_bool()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4249,6 +4289,9 @@ impl LlmConfiguredProvider {
             available: self.available,
             queue_mode: None,
             qoe_policy: None,
+            // `profile/llm/list` does not advertise vision — UNKNOWN, which
+            // keeps the pre-guard attach behaviour on this legacy shape.
+            vision: None,
         }
     }
 }
@@ -7797,6 +7840,47 @@ impl AppState {
         self.session_model_catalogs
             .iter()
             .find(|catalog| &catalog.session_id == session_id)
+    }
+
+    /// The model the SERVER says is serving `session_id`. Runtime status
+    /// (`session/status`) wins because it is the effective model; the
+    /// `model/list` entry the server marked `selected` is the fallback for a
+    /// session that has a catalog but no runtime status yet. Never guessed.
+    pub fn active_model_status(&self, session_id: &SessionKey) -> Option<&ModelStatus> {
+        self.session_runtime_statuses
+            .iter()
+            .find(|status| &status.session_id == session_id)
+            .and_then(|status| status.model.as_ref())
+            .or_else(|| {
+                self.model_catalog_for(session_id)
+                    .and_then(|catalog| catalog.models.iter().find(|model| model.selected))
+            })
+    }
+
+    /// task-vision-capability-guard: the server-advertised vision capability of
+    /// the model currently serving `session_id`, read ONLY off that model's
+    /// `model/list` catalog entry.
+    ///
+    /// Every path that cannot produce server truth — no active model, no
+    /// catalog (never fetched, or `model/list` returned an error), an active
+    /// model missing from the catalog, or an entry without a usable `vision`
+    /// boolean — resolves to [`VisionCapability::Unknown`], which callers must
+    /// treat as "behave exactly as before the guard existed".
+    pub fn vision_capability_for(&self, session_id: &SessionKey) -> VisionCapability {
+        let Some(active) = self.active_model_status(session_id) else {
+            return VisionCapability::Unknown;
+        };
+        let entry = self.model_catalog_for(session_id).and_then(|catalog| {
+            catalog
+                .models
+                .iter()
+                .find(|model| model.model == active.model && model.provider == active.provider)
+        });
+        match entry.and_then(|model| model.vision) {
+            Some(true) => VisionCapability::Supported,
+            Some(false) => VisionCapability::Unsupported,
+            None => VisionCapability::Unknown,
+        }
     }
 
     pub fn set_model_catalog(&mut self, catalog: SessionModelCatalog) {

@@ -32,8 +32,13 @@ estimate: 0.75d
 - locales/en.yml
 - locales/zh.yml
 - specs/**
+- src/menu/providers.rs
+- src/transport.rs
+- src/app/tests.rs
 
 ### Forbidden
+- `src/menu/providers.rs`、`src/transport.rs`、`src/app/tests.rs` 三个文件只允许
+  为既有 fixture 字面量补 `vision: None`（新增字段的机械性波及），不得夹带其它改动。
 - 不根据模型名字符串推断视觉能力。
 - 不在 media 被拒时丢弃或改写用户的 prompt 文本。
 - 不新增 crate 依赖。
