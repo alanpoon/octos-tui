@@ -37962,6 +37962,50 @@ now analyzing the bus module"
     }
 
     #[test]
+    fn vision_guard_also_rejects_clipboard_staged_media() {
+        // MERGE-INTEGRATION REGRESSION, bound to no single contract: Route-2
+        // (a Ctrl+V clipboard bitmap) must clear the same vision guard Route-1
+        // (an image path in the prompt) clears. Each contract covers only its
+        // own route, so the combination is exactly what the submit-path merge
+        // could have broken — taking the clipboard side alone would have let
+        // pasted bitmaps sail past the guard into a text-only model.
+        let dir = tempfile::tempdir().unwrap();
+        let clipboard = FakeClipboard::always(crate::clipboard::ClipboardImage::Png(fake_png(
+            4 * 1024,
+            0xb2,
+        )));
+        let mut store = store_with_empty_session();
+        store.state.set_composer_text("what does this show?");
+        assert_eq!(
+            store.paste_clipboard_image_in(&clipboard, dir.path()),
+            ClipboardImagePaste::Staged,
+            "precondition: the bitmap is staged as Route-2 media"
+        );
+
+        let session_id = store.state.sessions[0].id.clone();
+        apply_model_list_json(
+            &mut store,
+            &session_id,
+            serde_json::json!([model_entry(
+                "acme-text-only",
+                true,
+                Some(serde_json::json!(false))
+            )]),
+        );
+
+        let (media, _text) = submitted_media(&mut store);
+        assert!(
+            media.is_empty(),
+            "clipboard-staged media must clear the vision guard too, got {media:?}"
+        );
+        assert!(
+            store.state.status.contains("acme-text-only"),
+            "the hint must name the active model id, got {:?}",
+            store.state.status
+        );
+    }
+
+    #[test]
     fn unknown_vision_capability_keeps_existing_attach_behavior() {
         // COMPATIBILITY GUARANTEE: a server that never advertises `vision`
         // must see byte-identical behaviour to the pre-guard client. Anything
