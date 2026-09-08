@@ -4878,6 +4878,31 @@ impl Store {
         Some(AppUiCommand::ProfileLlmFetchModels(params))
     }
 
+    /// Gate every provider SAVE on a resolved profile id.
+    ///
+    /// `profile_id` is `skip_serializing_if = "Option::is_none"`, so an
+    /// unresolved profile drops the field off the wire entirely. The server
+    /// then defaults it to `MAIN_PROFILE_ID` (`_main`) — an id its own profile
+    /// store cannot persist, because the slug validator accepts only
+    /// `[a-z0-9-]` and the leading underscore fails it. The save comes back as
+    /// `-32603 … profile ID must contain only lowercase letters, digits, and
+    /// hyphens`, which names nothing the operator can act on, and onboarding is
+    /// stuck: "Continue to Workspace" is gated on a saved provider.
+    ///
+    /// Test/fetch_models deliberately are NOT gated: they never reach the
+    /// profile store, so they work unscoped and are useful before a profile
+    /// exists.
+    fn onboarding_profile_id_is_resolved(&mut self, profile_id: Option<&str>) -> bool {
+        if profile_id.is_some() {
+            return true;
+        }
+        let message = t!("status.onboarding_profile_unresolved").into_owned();
+        self.state.onboarding.last_message = Some(message.clone());
+        self.state.status = message;
+        self.refresh_active_menu_if_open();
+        false
+    }
+
     fn onboarding_save_provider_command(&mut self) -> Option<AppUiCommand> {
         // Route on the PERSISTENT lane intent: bare `/research add` sets
         // `research_lane_intent`, which survives staged-input edits (unlike the
@@ -4903,6 +4928,9 @@ impl Store {
             self.state.status = t!("status.onboarding_provider_selection_incomplete").into_owned();
             return None;
         };
+        if !self.onboarding_profile_id_is_resolved(params.profile_id.as_deref()) {
+            return None;
+        }
         if let OnboardingKeyGate::Blocked(command) =
             self.onboarding_require_api_key("status.onboarding_api_key_empty_onboard")
         {
@@ -4982,6 +5010,12 @@ impl Store {
             self.state.status = t!("status.onboarding_provider_selection_incomplete").into_owned();
             return None;
         };
+        // `profile/sub_providers/upsert` resolves its profile through the same
+        // server-side `_main` default and ends in the same `save_with_merge`,
+        // so an unresolved profile fails identically here.
+        if !self.onboarding_profile_id_is_resolved(params.profile_id.as_deref()) {
+            return None;
+        }
         // Pop the picker so the wizard beneath shows the pending save spinner.
         self.close_menu();
         self.state.onboarding.last_message = Some(t!("status.saving_provider").into_owned());
@@ -5012,6 +5046,9 @@ impl Store {
             self.state.status = t!("status.onboarding_fallback_selection_incomplete").into_owned();
             return None;
         };
+        if !self.onboarding_profile_id_is_resolved(params.profile_id.as_deref()) {
+            return None;
+        }
         if let OnboardingKeyGate::Blocked(command) =
             self.onboarding_require_api_key("status.onboarding_api_key_empty_provider")
         {
@@ -24486,6 +24523,71 @@ now analyzing the bus module"
         );
         assert!(!format!("{params:?}").contains("sk-test-secret"));
         assert!(!format!("{:?}", store.state.onboarding).contains("sk-test-secret"));
+    }
+
+    /// Regression: with no profile resolvable anywhere, the wizard used to
+    /// dispatch an upsert whose `profile_id` was omitted from the wire. The
+    /// server defaults that to `MAIN_PROFILE_ID` (`_main`), whose underscore
+    /// its own profile-id slug validator rejects, so the save came back as an
+    /// opaque `-32603 … profile ID must contain only lowercase letters, digits,
+    /// and hyphens` — and onboarding could never leave the provider step.
+    #[test]
+    fn onboarding_save_refuses_to_dispatch_without_a_resolved_profile() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT]);
+        store.state.sessions[0].profile_id = None;
+        assert!(
+            store.current_profile_for_onboarding().is_none(),
+            "test fixture must have no resolvable profile"
+        );
+
+        store.state.composer =
+            "/onboard select moonshot kimi-k2.5 autodl https://example.test/v1 AUTODL_API_KEY"
+                .into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/onboard key sk-test-secret".into();
+        assert!(store.compose_command().is_none());
+
+        store.state.composer = "/onboard save".into();
+        assert!(
+            store.compose_command().is_none(),
+            "save must not dispatch an upsert with no profile id"
+        );
+        assert_eq!(
+            store.state.status,
+            t!("status.onboarding_profile_unresolved").into_owned()
+        );
+        assert!(
+            store.state.onboarding.provider_pending.is_none(),
+            "a refused save must not leave the wizard spinning"
+        );
+    }
+
+    /// The fallback (`/provider add-fallback`) save shares the dispatch shape,
+    /// and therefore the same failure.
+    #[test]
+    fn provider_fallback_save_refuses_to_dispatch_without_a_resolved_profile() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT]);
+        store.state.sessions[0].profile_id = None;
+
+        store.state.composer =
+            "/provider select minimax MiniMax-M2.5-highspeed wisemodel https://example.test/v1 WISEMODEL_API_KEY"
+                .into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/provider key sk-fallback-secret".into();
+        assert!(store.compose_command().is_none());
+
+        store.state.composer = "/provider add-fallback".into();
+        assert!(
+            store.compose_command().is_none(),
+            "fallback save must not dispatch an upsert with no profile id"
+        );
+        assert_eq!(
+            store.state.status,
+            t!("status.onboarding_profile_unresolved").into_owned()
+        );
+        assert!(store.state.onboarding.provider_pending.is_none());
     }
 
     #[test]
