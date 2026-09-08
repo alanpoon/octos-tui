@@ -34,7 +34,7 @@ use crate::{
     insert_history::insert_history_lines_with_size,
     menu::preview_layout,
     model::{AppState, AppUiCommand, ApprovalModalAction, FocusPane},
-    store::Store,
+    store::{ClipboardImagePaste, Store},
     theme::Palette,
     transport::{AppUiBackend, build_backend},
     tui_terminal::Terminal as InlineTerminal,
@@ -1141,6 +1141,63 @@ impl KeyAction {
     }
 }
 
+/// The shared Ctrl+V / Alt+V body, in precedence order.
+///
+/// Ctrl+V is not owned by any one feature, so this resolves three claims in a
+/// fixed order rather than letting the newest one win:
+///
+/// 1. **Diff preview open** → the view-mode toggle, unchanged. It is the only
+///    claim that is unambiguous: the overlay is on screen and the user is
+///    looking at it.
+/// 2. **`allow_image_paste` and the clipboard holds a bitmap** → stage it and
+///    consume the key. `Rejected` (over the byte ceiling / at the turn cap)
+///    consumes too: the status line already explains the refusal, and falling
+///    through would open a diff preview the user never asked for on top of it.
+/// 3. **Otherwise** → the pre-existing diff-preview command, byte for byte.
+///
+/// `allow_image_paste` is false for Alt+V. The two chords are aliases for the
+/// diff-preview family only; image paste is Ctrl+V alone, because Alt+V is the
+/// binding users on Linux/Windows terminals reach for the *preview* with, and
+/// silently turning it into a paste would be a different key doing a different
+/// thing depending on what happens to be on the clipboard.
+///
+/// `source` is injected so the fall-through can be tested without a clipboard,
+/// a helper binary, or a terminal.
+fn diff_preview_or_clipboard_image(
+    store: &mut Store,
+    allow_image_paste: bool,
+    source: &dyn crate::clipboard::ClipboardImageSource,
+) -> KeyAction {
+    if store.state.diff_preview.active {
+        store.toggle_diff_view_mode();
+        return KeyAction::Continue;
+    }
+
+    if allow_image_paste {
+        match store.paste_clipboard_image(source) {
+            ClipboardImagePaste::Staged | ClipboardImagePaste::Rejected => {
+                return KeyAction::Continue;
+            }
+            // The clipboard holds no bitmap — by far the common case. The key
+            // was never ours; hand it back untouched.
+            ClipboardImagePaste::FallThroughToText => {}
+        }
+    }
+
+    // `read_diff_preview_command` moves focus to Transcript so the PLAIN
+    // keys become reachable. That is right for the `d` path but wrong
+    // here: the point of the Alt family is that it works without leaving
+    // the composer, and yanking focus mid-typing would strand the draft.
+    // Restore whatever focus the user had.
+    let focus_before = store.state.focus;
+    let command = store.read_diff_preview_command();
+    store.state.focus = focus_before;
+    if let Some(command) = command {
+        return KeyAction::send(command);
+    }
+    KeyAction::Continue
+}
+
 fn handle_terminal_event_with_input_state(
     store: &mut Store,
     event: Event,
@@ -1463,22 +1520,14 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     // Alt+Y/Alt+N (peer approve/deny) get no twin — no slot is left. Reach a
     // peer's approval with Ctrl+S and answer y/n in the modal instead.
     if is_alt_char(&key, 'v') || is_ctrl_char(&key, 'v') {
-        if store.state.diff_preview.active {
-            store.toggle_diff_view_mode();
-            return KeyAction::Continue;
-        }
-        // `read_diff_preview_command` moves focus to Transcript so the PLAIN
-        // keys become reachable. That is right for the `d` path but wrong
-        // here: the point of the Alt family is that it works without leaving
-        // the composer, and yanking focus mid-typing would strand the draft.
-        // Restore whatever focus the user had.
-        let focus_before = store.state.focus;
-        let command = store.read_diff_preview_command();
-        store.state.focus = focus_before;
-        if let Some(command) = command {
-            return KeyAction::send(command);
-        }
-        return KeyAction::Continue;
+        // Ctrl+V additionally carries clipboard-image paste; Alt+V does not.
+        // The chord is SHARED, never taken over — see
+        // `keymap::CLIPBOARD_IMAGE_PASTE_CHORD` for the precedence contract.
+        return diff_preview_or_clipboard_image(
+            store,
+            is_ctrl_char(&key, 'v'),
+            &crate::clipboard::SystemClipboardImageSource,
+        );
     }
 
     // Ctrl+X, not Ctrl+C — Ctrl+C is the interrupt and is claimed at the top.
@@ -8311,6 +8360,104 @@ done
         assert_eq!(params.preview_id, preview_id);
         assert!(store.state.diff_preview.active);
         assert_eq!(store.state.status, "Requested diff preview");
+    }
+
+    /// Ctrl+V gained a second job (clipboard-image paste) on a chord that was
+    /// already spoken for. The regression that job could cause is not "image
+    /// paste is broken" — it is "the diff preview stopped opening", for every
+    /// user who never pastes an image at all. So: no bitmap on the clipboard,
+    /// and Ctrl+V must still yield the byte-for-byte pre-existing behaviour.
+    #[test]
+    fn ctrl_v_without_image_preserves_diff_preview_binding() {
+        struct NoImage;
+        impl crate::clipboard::ClipboardImageSource for NoImage {
+            fn read_png(&self) -> crate::clipboard::ClipboardImage {
+                crate::clipboard::ClipboardImage::Empty
+            }
+        }
+
+        let preview_id = PreviewId::new();
+        let mut store = store_with_sessions(1);
+        // Composer focus: the case the Alt/Ctrl family exists to serve, and the
+        // one where wrongly swallowing the key would be most visible.
+        store.state.focus = FocusPane::Composer;
+        store.state.sessions[0].tasks.push(TaskView {
+            id: TaskId::new(),
+            title: "diff".into(),
+            state: TaskRuntimeState::Running,
+            runtime_detail: Some(format!("preview_id={}", preview_id.0)),
+            output_tail: String::new(),
+            turn_id: None,
+        });
+
+        let action = diff_preview_or_clipboard_image(&mut store, true, &NoImage);
+
+        let AppUiCommand::GetDiffPreview(params) = sent_command(action) else {
+            panic!("Ctrl+V with no clipboard bitmap must still open the diff preview");
+        };
+        assert_eq!(params.preview_id, preview_id);
+        assert!(store.state.diff_preview.active);
+        assert_eq!(store.state.status, "Requested diff preview");
+        // Focus is restored, exactly as before the image path existed.
+        assert_eq!(store.state.focus, FocusPane::Composer);
+        // Nothing was staged, and the status line was not overwritten with a
+        // clipboard message on the ordinary "clipboard holds text" path.
+        assert!(store.state.staged_clipboard_media.is_empty());
+    }
+
+    /// Alt+V is the diff-preview twin only. If it also pasted images, the same
+    /// keypress would do two unrelated things depending on clipboard contents.
+    #[test]
+    fn alt_v_never_triggers_clipboard_image_paste() {
+        struct Bitmap;
+        impl crate::clipboard::ClipboardImageSource for Bitmap {
+            fn read_png(&self) -> crate::clipboard::ClipboardImage {
+                panic!("Alt+V must never read the clipboard for images");
+            }
+        }
+
+        let preview_id = PreviewId::new();
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.sessions[0].tasks.push(TaskView {
+            id: TaskId::new(),
+            title: "diff".into(),
+            state: TaskRuntimeState::Running,
+            runtime_detail: Some(format!("preview_id={}", preview_id.0)),
+            output_tail: String::new(),
+            turn_id: None,
+        });
+
+        // `allow_image_paste: false` is what Alt+V passes.
+        let action = diff_preview_or_clipboard_image(&mut store, false, &Bitmap);
+
+        let AppUiCommand::GetDiffPreview(params) = sent_command(action) else {
+            panic!("Alt+V must open the diff preview");
+        };
+        assert_eq!(params.preview_id, preview_id);
+        assert!(store.state.staged_clipboard_media.is_empty());
+    }
+
+    /// Precedence check: with the overlay up, Ctrl+V is the view-mode toggle
+    /// and must not even consult the clipboard.
+    #[test]
+    fn ctrl_v_with_open_diff_preview_toggles_view_mode_without_reading_clipboard() {
+        struct Exploding;
+        impl crate::clipboard::ClipboardImageSource for Exploding {
+            fn read_png(&self) -> crate::clipboard::ClipboardImage {
+                panic!("an open diff preview must win before any clipboard read");
+            }
+        }
+
+        let mut store = store_with_sessions(1);
+        store.state.diff_preview.open_loading(PreviewId::new());
+        let before = store.state.diff_preview.side_by_side;
+
+        let action = diff_preview_or_clipboard_image(&mut store, true, &Exploding);
+
+        assert!(matches!(action, KeyAction::Continue));
+        assert_ne!(store.state.diff_preview.side_by_side, before);
+        assert!(store.state.staged_clipboard_media.is_empty());
     }
 
     /// The `d` arm must require non-composer focus on BOTH of its paths.

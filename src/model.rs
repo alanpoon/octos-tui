@@ -5385,6 +5385,18 @@ pub struct AppState {
     /// slot or a newer turn/submit supersedes it. Local-only, preserved
     /// across snapshot replays.
     pub pending_interrupt_restores: Vec<PendingInterruptRestore>,
+
+    /// Route-2 image attach: bitmaps pulled off the system clipboard by Ctrl+V
+    /// and staged under `~/.octos/tmp/paste/`, waiting for the next submit.
+    ///
+    /// Route-1 (image PATHS in the prompt text) is derived at submit time from
+    /// the prompt itself and needs no state. A clipboard bitmap has no textual
+    /// trace — the composer text deliberately does not change — so the staged
+    /// file must be remembered here between the keypress and the submit that
+    /// drains it. Bounded by `MAX_TURN_IMAGES`; both routes merge into the same
+    /// `Message.media` channel in `start_prompt_turn`. Local-only and taken (not
+    /// copied) on submit, so a bitmap rides exactly one turn.
+    pub staged_clipboard_media: Vec<octos_core::ui_protocol::FileRef>,
 }
 
 /// See [`AppState::pending_interrupt_restores`].
@@ -7301,6 +7313,7 @@ impl AppState {
             rewind_turns: Vec::new(),
             pending_rewind_prefill: None,
             pending_interrupt_restores: Vec::new(),
+            staged_clipboard_media: Vec::new(),
         }
     }
 

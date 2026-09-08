@@ -25,6 +25,10 @@ estimate: 1.5d
 - 复用 `store.rs` 既有上限，不新增常量：单轮最多 `MAX_TURN_IMAGES` = 4 张图，
   单文件不超过 `MAX_IMAGE_BYTES` = 20 MiB。
 - 剪贴板里没有位图时，Ctrl+V 落回既有文本粘贴路径，按键不被吞掉。
+- Ctrl+V 是**共用**按键，不是本任务独占：它已经是 diff 预览命令的 Alt+V 孪生键。
+  优先级固定为——(1) diff 预览已打开则视图切换胜出；(2) 否则剪贴板有位图则挂载
+  并吞掉按键（含被拒绝的情形，状态栏已给出原因）；(3) 否则原封不动落回既有
+  diff 预览行为。Alt+V 永不触发图片粘贴，图片粘贴只认 Ctrl+V。
 - 外部命令缺失、非零退出或输出为空时降级为文本粘贴，并在状态栏给一行提示；
   任何路径都不 panic、不阻塞事件循环超过 2 秒（读取带超时）。
 
@@ -35,9 +39,13 @@ estimate: 1.5d
 - src/model.rs
 - src/store.rs
 - src/keymap.rs
+- src/event_loop.rs
 - locales/en.yml
 - locales/zh.yml
 - specs/**
+
+> `src/event_loop.rs` 是按键分发的真实所在（`src/keymap.rs` 只有一份 HELP
+> 字符串）。不放开它，Ctrl+V 永远接不上，本任务的逻辑全是死代码。
 
 ### Forbidden
 - 不新增 crate 依赖。
@@ -104,6 +112,16 @@ estimate: 1.5d
   那么 本轮 media 为空
   并且 状态栏显示剪贴板图片读取不可用
   并且 文本粘贴路径收到该按键
+
+场景: 剪贴板无位图时 Ctrl+V 仍然触发既有的 diff 预览命令
+  测试: ctrl_v_without_image_preserves_diff_preview_binding
+  层级: 单元
+  替身: fake `ClipboardImageSource`
+  假设 焦点在 composer 且当前存在可预览的 diff，剪贴板里没有位图
+  当 用户按下 Ctrl+V
+  那么 仍然发出既有的 `GetDiffPreview` 命令
+  并且 焦点保持在 composer
+  并且 本轮没有挂载任何剪贴板图片
 
 场景: 相同位图重复粘贴复用同一临时文件
   测试: identical_clipboard_bitmap_reuses_staged_temp_file

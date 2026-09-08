@@ -17,8 +17,21 @@
 //!  - [`copyable_assistant_text`]: decides *what* gets copied (the last
 //!    assistant reply — the answer / research report / code block the user
 //!    most often wants out of the TUI).
+//!
+//! # Copy IN: clipboard bitmaps (Route-2 image attach)
+//!
+//! The paste direction is the mirror problem. Bracketed paste is **text-only**
+//! — a terminal never hands the app the BYTES of a screenshot on the clipboard
+//! — so "screenshot → Ctrl+V → ask about it" cannot work through the PTY. The
+//! bytes have to be fetched out of band, from the OS clipboard, by an external
+//! helper. [`ClipboardImageSource`] is that seam: [`SystemClipboardImageSource`]
+//! shells out to `osascript` (macOS), `wl-paste` (Wayland) or `xclip` (X11),
+//! and every decision built on top of it (staging path, size validation,
+//! fallback) is a pure function driven by the trait, so the whole feature is
+//! unit-testable with a fake and no real clipboard.
 
 use crate::model::AppState;
+use std::path::{Path, PathBuf};
 
 /// Maximum size, in bytes, of the base64 payload inside the OSC 52 sequence.
 ///
@@ -164,6 +177,317 @@ fn base64_encode(input: &[u8]) -> String {
         });
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Route-2: reading a bitmap OUT of the system clipboard
+// ---------------------------------------------------------------------------
+
+/// Wall-clock ceiling for one clipboard-image read.
+///
+/// The read happens on the UI thread inside the key handler, so an
+/// `osascript`/`xclip` that hangs (a wedged pasteboard server, an X server
+/// that never answers the selection request) would freeze the whole TUI. The
+/// helper is killed past this deadline and the paste degrades to text.
+pub const CLIPBOARD_IMAGE_READ_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(2000);
+
+/// What the OS clipboard turned out to be holding.
+///
+/// The three arms exist because the caller reacts differently to each:
+/// `Png` attaches, `Empty` falls silently back to the text paste (the common
+/// case — the clipboard usually holds text), and `Unavailable` falls back too
+/// but says so in the status line, because the user pressed Ctrl+V expecting
+/// an image and the machine could not even look.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardImage {
+    /// The clipboard holds a bitmap; these are its PNG bytes.
+    Png(Vec<u8>),
+    /// The clipboard holds no bitmap (text, nothing, an unsupported flavour).
+    Empty,
+    /// The read could not be performed: helper binary missing, non-zero exit,
+    /// timeout, or a zero-byte payload from a "successful" helper.
+    ///
+    /// The payload is a short diagnostic reason. It NEVER contains clipboard
+    /// bytes — the contract forbids clipboard content reaching logs.
+    Unavailable(String),
+}
+
+/// The seam between "ask the OS for a clipboard bitmap" and everything built
+/// on top of it.
+///
+/// Implemented for real by [`SystemClipboardImageSource`] (external helper
+/// processes) and by fakes in tests, so staging, size validation, the turn-image
+/// cap and the text-paste fallback are all verifiable without a clipboard, a
+/// terminal, or a platform.
+pub trait ClipboardImageSource {
+    /// Read the clipboard's bitmap as PNG bytes. Must never panic and must
+    /// return within roughly [`CLIPBOARD_IMAGE_READ_TIMEOUT`].
+    fn read_png(&self) -> ClipboardImage;
+}
+
+/// Real clipboard reader: shells out to the platform's helper.
+///
+/// No crate dependency is added for this (contract: 不新增 crate 依赖); the
+/// helpers are the same ones a user would type by hand.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemClipboardImageSource;
+
+impl ClipboardImageSource for SystemClipboardImageSource {
+    fn read_png(&self) -> ClipboardImage {
+        read_system_clipboard_png()
+    }
+}
+
+/// Probe order is fixed per platform, first available helper wins:
+/// macOS → `osascript`; Linux/BSD → Wayland `wl-paste`, then X11 `xclip`.
+/// Windows clipboard bitmaps are explicitly out of scope.
+fn read_system_clipboard_png() -> ClipboardImage {
+    #[cfg(target_os = "macos")]
+    {
+        read_via_osascript()
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        match read_via_wl_paste() {
+            ClipboardImage::Unavailable(wayland) => match read_via_xclip() {
+                ClipboardImage::Unavailable(x11) => {
+                    ClipboardImage::Unavailable(format!("{wayland}; {x11}"))
+                }
+                other => other,
+            },
+            other => other,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ClipboardImage::Unavailable("clipboard image read unsupported on this platform".into())
+    }
+}
+
+/// A scratch file the helper writes its PNG into.
+///
+/// Helpers are given a FILE for stdout rather than a pipe on purpose: a 20 MiB
+/// screenshot overruns the ~64 KiB pipe buffer, and a parent that polls
+/// `try_wait` (which it must, to honour the timeout) instead of draining the
+/// pipe would deadlock the child forever. A file has no such backpressure.
+fn helper_scratch_path() -> PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "octos-clipboard-{}-{unique}.png",
+        std::process::id()
+    ))
+}
+
+/// Run `command` with `args`, its stdout redirected to a fresh scratch file,
+/// under [`CLIPBOARD_IMAGE_READ_TIMEOUT`]. Returns the scratch file's bytes on
+/// a zero exit. The scratch file is always removed.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn run_helper_to_bytes(command: &str, args: &[&str]) -> Result<Vec<u8>, String> {
+    let scratch = helper_scratch_path();
+    let sink = std::fs::File::create(&scratch)
+        .map_err(|err| format!("{command}: cannot create scratch file: {err}"))?;
+    let result = run_helper_with_stdout(command, args, sink);
+    let bytes = match result {
+        Ok(()) => std::fs::read(&scratch).map_err(|err| format!("{command}: {err}")),
+        Err(err) => Err(err),
+    };
+    let _ = std::fs::remove_file(&scratch);
+    bytes
+}
+
+/// Spawn, wait with a deadline, kill on timeout. Stderr is discarded — a
+/// helper's chatter about the clipboard is not something to log.
+fn run_helper_with_stdout(
+    command: &str,
+    args: &[&str],
+    stdout: std::fs::File,
+) -> Result<(), String> {
+    let mut child = std::process::Command::new(command)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(stdout))
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => format!("{command} not found"),
+            _ => format!("{command}: {err}"),
+        })?;
+
+    let deadline = std::time::Instant::now() + CLIPBOARD_IMAGE_READ_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("{command} exited with {status}"))
+                };
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("{command} timed out"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(err) => return Err(format!("{command}: {err}")),
+        }
+    }
+}
+
+/// True when `list` (a helper's newline-separated flavour list) advertises PNG.
+///
+/// Split out as a pure helper so the "clipboard simply has no image" branch —
+/// the one that must stay SILENT and fall through to text — is testable.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn advertises_png(list: &str) -> bool {
+    list.lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("image/png"))
+}
+
+/// Read the flavour list a helper prints on stdout (small; a pipe is fine).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn helper_stdout_text(command: &str, args: &[&str]) -> Result<String, String> {
+    let bytes = run_helper_to_bytes(command, args)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn read_via_osascript() -> ClipboardImage {
+    // AppleScript is the only dependency-free way to reach the NSPasteboard's
+    // PNG flavour. `«class PNGf»` is the PNG type; the `try` block turns "no
+    // image on the pasteboard" into a distinguishable sentinel rather than an
+    // error, so an image-less clipboard falls through to text SILENTLY while a
+    // genuinely broken helper gets a status line.
+    let scratch = helper_scratch_path();
+    let script = format!(
+        r#"set outPath to "{}"
+try
+    set png to (the clipboard as «class PNGf»)
+on error
+    return "NOIMAGE"
+end try
+set fh to open for access (POSIX file outPath) with write permission
+set eof fh to 0
+write png to fh
+close access fh
+return "OK""#,
+        scratch
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    );
+
+    let outcome = (|| -> Result<String, String> {
+        let sentinel = helper_scratch_path().with_extension("txt");
+        let sink = std::fs::File::create(&sentinel)
+            .map_err(|err| format!("osascript: cannot create scratch file: {err}"))?;
+        let ran = run_helper_with_stdout("osascript", &["-e", script.as_str()], sink);
+        let text = ran.and_then(|()| {
+            std::fs::read_to_string(&sentinel).map_err(|err| format!("osascript: {err}"))
+        });
+        let _ = std::fs::remove_file(&sentinel);
+        text
+    })();
+
+    let image = match outcome {
+        Err(reason) => ClipboardImage::Unavailable(reason),
+        Ok(text) if text.trim() == "NOIMAGE" => ClipboardImage::Empty,
+        Ok(_) => match std::fs::read(&scratch) {
+            Ok(bytes) if !bytes.is_empty() => ClipboardImage::Png(bytes),
+            Ok(_) => ClipboardImage::Unavailable("osascript returned no bytes".into()),
+            Err(err) => ClipboardImage::Unavailable(format!("osascript: {err}")),
+        },
+    };
+    let _ = std::fs::remove_file(&scratch);
+    image
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn read_via_wl_paste() -> ClipboardImage {
+    // Ask what the clipboard holds first: `wl-paste` exits non-zero both when
+    // it is missing a PNG flavour and when it is genuinely broken, and those
+    // two must not produce the same user-visible outcome.
+    match helper_stdout_text("wl-paste", &["--list-types"]) {
+        Err(reason) => ClipboardImage::Unavailable(reason),
+        Ok(list) if !advertises_png(&list) => ClipboardImage::Empty,
+        Ok(_) => match run_helper_to_bytes("wl-paste", &["--type", "image/png"]) {
+            Err(reason) => ClipboardImage::Unavailable(reason),
+            Ok(bytes) if bytes.is_empty() => {
+                ClipboardImage::Unavailable("wl-paste returned no bytes".into())
+            }
+            Ok(bytes) => ClipboardImage::Png(bytes),
+        },
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn read_via_xclip() -> ClipboardImage {
+    match helper_stdout_text("xclip", &["-selection", "clipboard", "-t", "TARGETS", "-o"]) {
+        Err(reason) => ClipboardImage::Unavailable(reason),
+        Ok(list) if !advertises_png(&list) => ClipboardImage::Empty,
+        Ok(_) => match run_helper_to_bytes(
+            "xclip",
+            &["-selection", "clipboard", "-t", "image/png", "-o"],
+        ) {
+            Err(reason) => ClipboardImage::Unavailable(reason),
+            Ok(bytes) if bytes.is_empty() => {
+                ClipboardImage::Unavailable("xclip returned no bytes".into())
+            }
+            Ok(bytes) => ClipboardImage::Png(bytes),
+        },
+    }
+}
+
+/// Staging file name for a clipboard bitmap: `paste-<sha256[..16]>.png`.
+///
+/// CONTENT-ADDRESSED on purpose. Pasting the same screenshot twice (a common
+/// "did that go through?" reflex) must not fill `~/.octos/tmp/paste/` with
+/// byte-identical copies, and the same paste across two turns should resolve to
+/// one file the server can cache on. 16 hex chars (64 bits) is far past any
+/// realistic collision risk for a scratch directory.
+pub fn staged_paste_file_name(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let hex: String = digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("paste-{hex}.png")
+}
+
+/// Default staging directory for clipboard pastes: `~/.octos/tmp/paste/`.
+///
+/// Returns `None` when the home directory cannot be resolved, so the caller
+/// degrades to a text paste instead of writing somewhere unexpected. Tests
+/// always pass an explicit temp directory and never touch the real one.
+pub fn default_paste_staging_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
+    Some(PathBuf::new().join(home).join(".octos/tmp/paste"))
+}
+
+/// Write `bytes` to `<dir>/paste-<sha256[..16]>.png`, reusing the file when it
+/// already holds the same content.
+///
+/// Content addressing makes the reuse check cheap and safe: same name implies
+/// same bytes, so a matching length is enough to skip the write. A stale/truncated
+/// file (interrupted earlier write) is rewritten rather than attached as-is.
+pub fn stage_clipboard_png(dir: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(staged_paste_file_name(bytes));
+    let already_staged = std::fs::metadata(&path)
+        .map(|meta| meta.is_file() && meta.len() == bytes.len() as u64)
+        .unwrap_or(false);
+    if !already_staged {
+        std::fs::write(&path, bytes)?;
+    }
+    Ok(path)
 }
 
 #[cfg(test)]
