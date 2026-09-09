@@ -43,6 +43,14 @@ satisfies: [REQ-OLP-REVIEW-EVIDENCE]
   有效性校验必须比对**报告外部信号**(frontmatter 声称 completed 而 native
   result-N.md 为 errored → 拒绝;旧完成报告 + 当前新 running → 拒绝),
   不得只检查报告自己声明的 outcome。
+  **外部权威 fail-closed(外层实测反例补入)**: freeze/cross 采信一份初审或
+  交叉报告时,该 slug 必须有至少一种外部终止权威 — native `<root>/<slug>/`
+  最高编号 result-N.md(slug 匹配,含 turns.txt)或 runtime-evidence 终止快照
+  (该 slug 无 active_thread);两者皆缺 → `peer-authority-missing` 拒绝,
+  仅自报 outcome:completed 不得冻结。native 收据 slug 与报告 slug 不符
+  (跨 runtime 同名目录冒充)→ `peer-authority-mismatch` 拒绝。冻结后初审
+  文件被删除与被改写同罪 → `first-review-tampered`(verify fail-closed,
+  不得因文件缺失静默通过)。
 - **判词状态机(两层词表)**:
   - claim 级: `approve` / `flipped` / `blocked-on-evidence` /
     `pending-behavioral-evidence`(暂态,流程进行中等行为证据)/
