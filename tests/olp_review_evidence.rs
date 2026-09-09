@@ -587,7 +587,7 @@ fn olp_review_cross_requires_frozen_and_challenged() {
     ]);
     assert!(ok);
     let cross = write_cross_report(&d, "cross-k3", "4", "completed", "X: 采纳");
-    let (ok2, so2, _) = run(&[
+    let (ok2, _so2, _) = run(&[
         "cross",
         d.to_str().unwrap(),
         "--cross-report",
@@ -772,6 +772,52 @@ fn olp_review_agreement_without_evidence_stays_pending() {
 // ---------------------------------------------------------------------------
 // review-regression + 双输出
 // ---------------------------------------------------------------------------
+
+/// 外层反馈: 至少一条集成测试必须调用真实运行入口执行历史生产渲染/事件
+/// 反例(真实 cargo test + 生产 Store/transport 源),不是 Python 打印的
+/// cargo 样式文本。本测试在临时 clone 里 include! 外层诊断反例源码,
+/// 真实编译执行 store-repros.rs 的 7 条负向探针(独立昂贵验收,单独运行)。
+/// Reproduce 流程与 fixtures/review-evidence/evidence/reproduce.sh 一致。
+#[test]
+fn olp_review_real_store_harness_executes_historical_negative_probes() {
+    let t = TmpDir::new("realharness");
+    let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let evidence = repo.join("fixtures/review-evidence/evidence");
+    // 断言反例源码存在且含 7 个 store 探针(不依赖 clone 成功也能给出清晰失败)
+    let store_src = std::fs::read_to_string(evidence.join("store-repros.rs")).unwrap();
+    assert_eq!(
+        store_src.matches("fn outer_review_").count(),
+        7,
+        "store-repros 应含 7 个负向探针函数"
+    );
+    // Clone 源: 若固定 PR 对象缺失(浅仓),降级为标记 ignored-by-environment
+    // 并在断言消息中显式说明,不得静默通过。
+    let clone = t.path().join("review-clone");
+    let out = Command::new("bash")
+        .arg(evidence.join("reproduce.sh"))
+        .arg(&repo)
+        .arg(&clone)
+        .output()
+        .expect("spawn reproduce.sh");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if !out.status.success() {
+        // 唯一允许的失败: 源仓缺少 pinned PR 对象(环境缺资源),此时必须
+        // 显式 panic 说明,不允许静默当作通过
+        panic!(
+            "真实 store harness 未复现 8 failed(exit={}): {}",
+            out.status, combined
+        );
+    }
+    assert!(
+        combined.contains("All eight negative probes reproduced"),
+        "reproduce.sh 应报告 8 探针复现: {}",
+        &combined[combined.len().saturating_sub(400)..]
+    );
+}
 
 // --- 外层实测反例回归(../outer-evidence-probe-results.json,先 RED 后修) ---
 
