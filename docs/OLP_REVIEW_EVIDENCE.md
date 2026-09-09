@@ -74,30 +74,31 @@ receipt/imported 日志不构成执行证明。**`--selector` 必须是 adapter
 (`expectation-violated`)仍如实记录为行为证据。`--lib` 走 src/ 单元测试
 路径(源文件 SHA256 绑定),集成测试省略。
 
-**兼容路径 — 显式 `--evidence` 日志**:
+**负向判定路径 — 显式 `--evidence` 日志(仅拒绝/分层,永不采信为执行)**:
 
 ```bash
 python3 scripts/olp-review-evidence.py challenge <review_dir> \
   --evidence ev.log --claim <claim_id> \
   --test-name outer_review_627_x \
   --harness-root tests/ --harness-root src/ \
-  --exec-argv "cargo test --test x outer_review_627_x" \
   --run-dir <repo> [--timeout 300] [--imported]
 ```
 
-`--live-cargo` 与 `--imported` 互斥。**判定顺序**:
+`--live-cargo` 与 `--imported` 互斥。`--exec-argv` 任意执行体一律
+`executor-not-trusted`(**永不执行**;唯一 live 执行入口是 `--live-cargo`
+经固定生产 adapter)。**判定顺序**:
 
-1. **内容门**: 证据含结构锚(测试名行 + panicked at + FAILED 汇总,
+1. **imported 分层**(先于一切内容判定): 外层导入未独立执行的日志 →
+   `not-replayed`,不自动 accepted。
+2. **内容门**: 证据含结构锚(测试名行 + panicked at + FAILED 汇总,
    或通过形态 `test result: ok.`);纯文档/字符串断言 →
    `evidence-not-behavioral`,claim 置 `unverified`。
-2. **测试名解析**: `--test-name` 必须能在 `--harness-root` 源码中解析到
+3. **测试名解析**: `--test-name` 必须能在 `--harness-root` 源码中解析到
    `fn <name>(` 定义。
-3. **imported 分层**: 外层导入未独立执行的日志 → `not-replayed`,
-   不自动 accepted。
-4. **执行为本(核心)**: 生产入口实际执行 `--exec-argv`,捕获退出码与
-   stdout/stderr;执行输出必须含测试名与失败/通过锚。
-   `/usr/bin/false` 等无输出无关命令 → `evidence-not-executed`。
-   manifest 绑定 HEAD/run_dir/test_name/argv/exit_code/输出摘要。
+4. **执行终拒(核心)**: 结构锚齐全但无本入口真实执行的 receipt →
+   `evidence-not-executed`(外部日志/自造 argv 均不可作为执行证明;
+   `/usr/bin/false` 等无关命令同拒)。执行证明只能来自 `--live-cargo`
+   自产 receipt(selector/HEAD 绑定)。
 
 **判别式**(executed 后):
 
@@ -159,6 +160,40 @@ python3 scripts/olp-review-monitor.py <review_dir> \
   originator session)过滤;当前 profile 缺失不扫 foreign。
 - ACK 缓存写自身 `monitor-state.json`(原子),与 `olp-watch-board.sh`
   契约互不干扰;监控绝不改写 review-state.json。
+
+## classify — PR 级通用聚合(spec L55-73/L439-455)
+
+```bash
+python3 scripts/olp-review-evidence.py classify \
+  --manifest <MANIFEST.json> --replay-summary <replay-summary.json> \
+  [--slot <outer-verification-slot.json> --slot-log-dir <双日志目录>]
+```
+
+分类意图来自外层(MANIFEST `outer_recommendation`);工具只做通用聚合
+派生,**零 PR 编号分支**:
+
+- **per-selector 产品裁决(逐条 receipt 校验)**: 每条失败记录必须
+  receipt 文件在场且 summary↔receipt 一致(selector/HEAD before+after/
+  observed/exit_code);**缺失/外来伪装/不一致 → harness 证据错误,
+  该 PR 一律 blocked/unassessed,不得继承 existing/residual**。
+  harness 状态(adapter_exit)与产品失败分列——`adapter_exit=0/
+  cargo_exit=101/observed=fail` 是"harness 成功+产品测试失败"(缺陷
+  证据),adapter 非零是 harness 故障,均不得混淆。
+- **introduced_vs_existing**: 需 BASE/HEAD 同 probe 双执行对照(slot
+  sha256 逐字节核验 + pr_head 匹配 + **slot probe 源文件声明的测试
+  函数名与失败 selector 精确同名**)。**当前生产仅支持"双 FAIL 形态
+  同构 → existing"一种对照模式**;`introduced`(HEAD FAIL + BASE
+  PASS)是冻结词表的保留语义,**当前无对应双执行证据模式支撑、不会
+  产出**——缺该模式证据时不判 introduced,一律 `unassessed`。
+  **缺双执行证据或仅部分失败 selector 被覆盖 → `unassessed`/整 PR
+  blocked,禁按 exit_code 相等或任一 head 匹配把 existing 推广到整
+  PR;缺双执行证据禁标 clean**。
+- **PR 级**: `clean`(全 pass 且无 unassessed)/`residual`(失败全
+  existing,判词绑定 slot+双日志)/`blocked`(反例成立且无双执行对照,
+  或 harness 收据缺失/hash 不符)。
+- claim 级 `flipped` = 遗留/既有路径(legacy/existing),与
+  `introduced_vs_existing` 是两个维度;真实执行复现失败 → claim 级
+  `blocked-on-evidence`。
 
 ## 判词状态机(claim 级两层词表)
 

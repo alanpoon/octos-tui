@@ -2132,7 +2132,7 @@ fn olp_review_k3_full_happy_path_accepted() {
         &d,
         "glm",
         "cross-glm.md",
-        "2",
+        "3",
         "completed",
         r#"[{"id": "X", "verdict": "accept"}]"#,
     );
@@ -2212,8 +2212,10 @@ fn sha256_hex(p: &Path) -> String {
 // 由 make_cargo_fixture + FIXTURE_PASS_TEST/FIXTURE_FAIL_TEST 替代 — 无依赖
 // 真实编译真实断言,行为门不降低,见 olp_review_k3_cargo_adapter_rejects_*。
 
-/// 场景: 八反例回归数据集 — fixtures 完整性(逐字节 SHA256 清单)。
-/// (完整 freeze→challenge→cross 流程在 olp_review_regression_dataset_classifies_four_prs)
+/// 场景: 八反例回归数据集 — fixtures 完整性(逐字节 SHA256 清单)+
+/// M1 收口(ROOT 授权例外): 真实 tiny Cargo fixture 经生产 adapter 走
+/// 完整 freeze→challenge→cross→classify 链路,聚合判词 627/628/630=
+/// blocked、629=residual。链路证据全部真实执行,无手写 JSON/日志冒充。
 #[test]
 fn olp_review_regression_dataset_classifies_four_prs() {
     let fx = fixtures();
@@ -2254,6 +2256,238 @@ fn olp_review_regression_dataset_classifies_four_prs() {
         !script_src.contains("\"629\"") && !script_src.contains("'629'"),
         "禁止按 PR 编号硬编码 residual"
     );
+
+    // ---- M1 收口: 真实 tiny fixture 全链路 → classify 聚合判词 ----
+    // (0) 629 真双执行: 同一 tiny repo 两个真实 commit(BASE/HEAD,测试源
+    //     逐字节不变)分别真实 adapter 执行;HEAD commit 即全链路评审 HEAD,
+    //     classify 的 629 receipt 直接消费 review-state.json 记录的
+    //     production challenge 落盘 receipt 原件(真贯通,非旁跑)。
+    let (ft629, fx_repo0, base629) = make_cargo_fixture("m1crit-629", FIXTURE_FAIL_TEST);
+    let td = TmpDir::new("m1-critical-chain");
+    let d = td.path().to_path_buf();
+    let ev629 = ft629.path().join("dual-evidence");
+    std::fs::create_dir_all(&ev629).unwrap();
+    // BASE 侧真实 adapter 执行(首 commit,同 probe 同 selector)。
+    let base_receipt = ev629.join("base.receipt.json");
+    let (okb, sob) = run_adapter(
+        &fx_repo0,
+        &[
+            "--selector",
+            "fixture_probe_fails",
+            "--expect",
+            "fail",
+            "--receipt",
+            base_receipt.to_str().unwrap(),
+            "--artifact-dir",
+            ev629.to_str().unwrap(),
+        ],
+        None,
+        300,
+    );
+    assert!(okb, "BASE 侧真实执行失败: {sob}");
+    let rc_base: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&base_receipt).unwrap()).unwrap();
+    assert_eq!(rc_base["observed"].as_str(), Some("fail"));
+    assert_eq!(rc_base["head_before"].as_str(), Some(base629.as_str()));
+    // HEAD commit(非测试源)→ 全链路评审 HEAD。
+    let head629 = bump_fixture_head(&fx_repo0, "m1crit-629");
+    assert_ne!(head629, base629);
+    // (1) 完整 freeze→challenge→cross 链路,HEAD 绑定 head629。
+    let t = TmpDir::new("m1-critical-review");
+    let rd = t.path().to_path_buf();
+    let h = review_head(&rd, &fx_repo0);
+    assert_eq!(h, head629, "init --repo 应解析 fixture 真实 HEAD");
+    write_authority(&rd, "glm", "1", "completed");
+    write_authority(&rd, "k3", "1", "completed");
+    let glm = write_review_full(
+        &rd,
+        "glm.md",
+        "glm",
+        "completed",
+        "1",
+        Some(&h),
+        Some(&["X"]),
+        "glm 初审",
+    );
+    let k3 = write_review_full(
+        &rd,
+        "k3.md",
+        "k3",
+        "completed",
+        "1",
+        Some(&h),
+        Some(&["X"]),
+        "k3 初审",
+    );
+    let (okf, sof, sef) = run(&[
+        "freeze",
+        rd.to_str().unwrap(),
+        "--glm-review",
+        glm.to_str().unwrap(),
+        "--k3-review",
+        k3.to_str().unwrap(),
+        "--native-root",
+        native_root(&rd).to_str().unwrap(),
+        "--head",
+        &h,
+    ]);
+    assert!(okf, "freeze failed: {sof} {sef}");
+    let (okc, soc, sec) = live_challenge(
+        &rd,
+        &fx_repo0,
+        "X",
+        "fixture_probe_fails",
+        "fail",
+        &ft629.path().join("target"),
+    );
+    assert!(okc, "live challenge(FAIL) failed: {soc} {sec}");
+    for (slug, file) in [("glm", "cross-glm.md"), ("k3", "cross-k3.md")] {
+        let cross = write_cross_structured(
+            &rd,
+            slug,
+            file,
+            "2",
+            "completed",
+            r#"[{"id": "X", "verdict": "accept"}]"#,
+        );
+        let (okx, sox, sex) = run(&[
+            "cross",
+            rd.to_str().unwrap(),
+            "--cross-report",
+            cross.to_str().unwrap(),
+            "--cross-slug",
+            slug,
+            "--native-root",
+            native_root(&rd).to_str().unwrap(),
+        ]);
+        assert!(okx, "cross {slug} failed: {sox} {sex}");
+    }
+    let (oks, sos, _) = run(&["status", rd.to_str().unwrap()]);
+    assert!(oks);
+    let vst: serde_json::Value = serde_json::from_str(sos.trim()).unwrap();
+    assert_eq!(
+        vst["review_accepted"].as_bool(),
+        Some(true),
+        "链路应收口: {sos}"
+    );
+    // (2) 629 HEAD receipt = review-state.json 记录的 production challenge
+    //     落盘 receipt 原件(贯通链);627/628 各自独立真实执行;630 故意缺
+    //     收据(metadata 保留)。每 PR fixture 各自唯一 commit(bump 内容
+    //     含 tag)→ HEAD 全局唯一,629 slot 不会覆盖 627/628。
+    let src_prs = outer["prs"].as_object().unwrap();
+    let st: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(rd.join("review-state.json")).unwrap())
+            .unwrap();
+    let receipt629 = PathBuf::from(
+        st["challenges"]["X"]["latest"]["receipt"]
+            .as_str()
+            .expect("challenge receipt 原件"),
+    );
+    assert!(receipt629.is_file(), "challenge receipt 原件缺失");
+    let rc629v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&receipt629).unwrap()).unwrap();
+    assert_eq!(rc629v["head_before"].as_str(), Some(head629.as_str()));
+    assert_eq!(
+        rc629v["test_target_sha256"], rc_base["test_target_sha256"],
+        "同 probe 绑定"
+    );
+    let mut receipts: std::collections::BTreeMap<String, PathBuf> = Default::default();
+    let mut temp_prs = serde_json::Map::new();
+    let mut keep_alive: Vec<TmpDir> = Vec::new();
+    for (pr, meta) in src_prs {
+        let mut m = meta.clone();
+        if pr == "629" {
+            receipts.insert(pr.clone(), receipt629.clone());
+            m["head"] = serde_json::json!(head629);
+            m["base"] = serde_json::json!(base629);
+        } else {
+            let (rc_path, fx_head, ft) =
+                run_real_tiny_execution(&format!("m1crit-{pr}"), "fixture_probe_fails");
+            if pr != "630" {
+                receipts.insert(pr.clone(), rc_path);
+            }
+            m["head"] = serde_json::json!(fx_head);
+            keep_alive.push(ft); // fixture 目录保活: receipt artifacts/test_source 引用其中文件
+        }
+        temp_prs.insert(pr.clone(), m);
+    }
+    let manifest = d.join("MANIFEST.json");
+    std::fs::write(
+        &manifest,
+        serde_json::to_string(&serde_json::json!({
+            "protocol": outer["protocol"], "prs": temp_prs
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // (3) classify: slot 全部由真实执行产物构成——BASE 日志=BASE 侧真实
+    //     stdout 工件、HEAD 日志=challenge receipt 真实 stdout 工件、真实
+    //     退出码/commit/probe sha;经生产 classify CLI 聚合。
+    let rc_head: &serde_json::Value = &rc629v;
+    let base_log = d.join("629-base.log");
+    let head_log = d.join("629-head.log");
+    std::fs::copy(rc_base["artifacts"]["stdout"].as_str().unwrap(), &base_log).unwrap();
+    std::fs::copy(rc_head["artifacts"]["stdout"].as_str().unwrap(), &head_log).unwrap();
+    let probe629 = d.join("probe-629.rs");
+    std::fs::copy(rc_head["test_source"].as_str().unwrap(), &probe629).unwrap();
+    let dual629 = (
+        base629.clone(),
+        head629.clone(),
+        probe629,
+        sha256_hex(&d.join("probe-629.rs")),
+        base_log,
+        sha256_hex(&d.join("629-base.log")),
+        rc_base["exit_code"].as_i64().unwrap(),
+        head_log,
+        sha256_hex(&d.join("629-head.log")),
+        rc_head["exit_code"].as_i64().unwrap(),
+        receipt629.clone(),
+        TmpDir::new("crit629-keepalive"),
+    );
+    let manifest_v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    let (summary, slot) =
+        write_classify_fixture(&d, &manifest_v, &receipts, "fixture_probe_fails", &dual629);
+    keep_alive.push(ft629); // 双执行 fixture 保活到 classify 之后
+    let out = Command::new("python3")
+        .arg(script())
+        .arg("classify")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--replay-summary")
+        .arg(&summary)
+        .arg("--slot")
+        .arg(&slot)
+        .arg("--slot-log-dir")
+        .arg(&d)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "classify 失败: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let prs = v["prs"].as_object().expect("prs 对象");
+    assert_eq!(prs.len(), 4, "应覆盖 MANIFEST 全部 4 个 PR: {prs:?}");
+    for (pr, class, intro) in [
+        ("627", "blocked", "unassessed"),
+        ("628", "blocked", "unassessed"),
+        ("629", "residual", "existing"),
+        ("630", "blocked", "unassessed"),
+    ] {
+        let entry = prs.get(pr).unwrap_or_else(|| panic!("prs 缺 {pr}"));
+        assert_eq!(
+            entry["classification"].as_str(),
+            Some(class),
+            "{pr} 判词错误: {entry}"
+        );
+        assert_eq!(
+            entry["introduced_vs_existing"].as_str(),
+            Some(intro),
+            "{pr} introduced_vs_existing 错误: {entry}"
+        );
+    }
 }
 
 /// 场景: JSON 与人读双输出 + 错误输出可解析。
@@ -2554,6 +2788,8 @@ fn k3_rescue_cross_prose_and_unchallenged_claim_not_accepted() {
     assert!(okc, "live challenge failed: {soc} {sec}");
     // 两份 cross 仅"XY 人工裁决"文字 → 拒绝(无结构化覆盖)
     // (文件名与冻结初审解耦;覆盖 glm.md/k3.md 会触发 first-review-tampered)
+    // prose 尝试(turn2 带权威,拒绝于缺结构化覆盖,权威行已消耗);
+    // structured 重试用新轮 turn3,避免同轮重复(M6 fail-closed 轮次索引)。
     for slug in ["glm", "k3"] {
         let cross = write_cross_prose(
             &d2,
@@ -2591,7 +2827,7 @@ fn k3_rescue_cross_prose_and_unchallenged_claim_not_accepted() {
             &d2,
             slug,
             &format!("cross-{slug}.md"),
-            "2",
+            "3",
             "completed",
             r#"[{"id": "X", "verdict": "accept"}, {"id": "Y", "verdict": "pending"}]"#,
         );
@@ -2645,11 +2881,12 @@ fn olp_review_cross_refutation_reverts_flip() {
     let (t, _glm) = challenged_dir("k3r-refutebasis");
     let d = t.path().to_path_buf();
     // (a) 伪造 executed-evidence 引用 → refutation-unsubstantiated
+    // (拒绝仍消耗该轮权威行: 置于 operator 尝试(turn2)之后的 turn4)
     let cross = write_cross_structured(
         &d,
         "k3",
         "cross-k3-bad.md",
-        "2",
+        "3",
         "completed",
         r#"[{"id": "X", "verdict": "refute", "reference": {"kind": "executed-evidence", "ref": "deadbeef"}}]"#,
     );
@@ -2671,7 +2908,7 @@ fn olp_review_cross_refutation_reverts_flip() {
         &d,
         "k3",
         "cross-k3-op.md",
-        "2",
+        "4",
         "completed",
         r#"[{"id": "X", "verdict": "refute", "reference": {"kind": "operator-decision", "operator": "zhangalex", "note": "反例针对旧 base,HEAD 已修复,人工裁决不阻塞"}}]"#,
     );
@@ -2771,7 +3008,7 @@ fn k3_rescue_reexecution_refutes_reproduced_failure() {
         &d,
         "glm",
         "cross-glm-bad.md",
-        "2",
+        "3",
         "completed",
         r#"[{"id": "X", "verdict": "refute", "reference": {"kind": "executed-evidence", "ref": "cafe"}}]"#,
     );
@@ -2791,7 +3028,7 @@ fn k3_rescue_reexecution_refutes_reproduced_failure() {
         &d,
         "glm",
         "cross-glm.md",
-        "2",
+        "4",
         "completed",
         &format!(
             r#"[{{"id": "X", "verdict": "refute", "reference": {{"kind": "executed-evidence", "ref": "{pass_sha}"}}}}]"#
@@ -2812,7 +3049,7 @@ fn k3_rescue_reexecution_refutes_reproduced_failure() {
         &d,
         "k3",
         "cross-k3.md",
-        "2",
+        "3",
         "completed",
         r#"[{"id": "X", "verdict": "accept"}]"#,
     );
@@ -2832,4 +3069,984 @@ fn k3_rescue_reexecution_refutes_reproduced_failure() {
     let v5: serde_json::Value = serde_json::from_str(so5.trim()).unwrap();
     assert_eq!(v5["review_accepted"].as_bool(), Some(true), "{so5}");
     assert_eq!(v5["verdicts"]["X"]["state"], "challenge-refuted");
+}
+
+/// M2 回归组(外层真实反例 ../outer-runtime-authority-current-red.json):
+/// runtime-evidence 终止快照权威必须与 native 路径同等严格 ——
+/// (a) status=terminated 但 outcome=errored → 拒;
+/// (b) source=result-2.md 而报告 turn=1(旧轮) → stale-turn;
+/// (c) 报告 turn=999(未来轮) → turn-mismatch;
+/// (d) turn 非数字 → 拒(两条权威分支统一);
+/// (e) 正向对照: completed + source=result-2.md + 报告 turn=2 → 采信。
+/// M2 组基线: 完整有效初审(真 frontmatter + claims 块 + HEAD 锚)两份,
+/// glm lane 权威用 runtime-evidence 终止快照,k3 lane 权威用 native
+/// result-2(与快照同轮,避免 k3 因缺权威先报 peer-authority-missing
+/// 掩盖 glm 被测错误码)。返回 (报告路径, 快照路径)。
+fn m2_evidence_baseline(d: &Path, h: &str, glm_outcome: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let glm = write_review_full(
+        d,
+        "glm.md",
+        "glm",
+        "completed",
+        "2",
+        Some(h),
+        Some(&["X"]),
+        "glm 初审",
+    );
+    let k3 = write_review_full(
+        d,
+        "k3.md",
+        "k3",
+        "completed",
+        "2",
+        Some(h),
+        Some(&["X"]),
+        "k3 初审",
+    );
+    // k3 侧 native 权威与快照同轮(turn 2),保证被测面聚焦 glm。
+    write_authority(d, "k3", "2", "completed");
+    let ev = d.join("runtime-evidence.json");
+    std::fs::write(
+        &ev,
+        format!(
+            r#"{{"peers":[{{"slug":"glm","status":"terminated","session":"sess-1",
+            "goal":"goal_01","outcome":"{glm_outcome}","source":"result-2.md",
+            "active_thread":null}}]}}"#
+        ),
+    )
+    .unwrap();
+    (glm, k3, ev)
+}
+
+/// 以 M2 基线发起 freeze(绝对路径,显式双 slug)。
+fn m2_freeze(d: &Path, h: &str, glm: &Path, k3: &Path, ev: &Path) -> (bool, String, String) {
+    run(&[
+        "freeze",
+        d.to_str().unwrap(),
+        "--glm-review",
+        glm.to_str().unwrap(),
+        "--k3-review",
+        k3.to_str().unwrap(),
+        "--glm-slug",
+        "glm",
+        "--k3-slug",
+        "k3",
+        "--head",
+        h,
+        "--native-root",
+        native_root(d).to_str().unwrap(),
+        "--runtime-evidence",
+        ev.to_str().unwrap(),
+    ])
+}
+
+#[test]
+fn olp_review_runtime_authority_errored_outcome_rejected() {
+    let t = TmpDir::new("m2-errored");
+    let d = t.path().to_path_buf();
+    let h = head();
+    init_review(&d, &h);
+    // 正向对照先行: completed 终止快照应通过(同轮 turn=2)。
+    let (glm, k3, ev) = m2_evidence_baseline(&d, &h, "completed");
+    let (ok0, so0, se0) = m2_freeze(&d, &h, &glm, &k3, &ev);
+    assert!(ok0, "正向对照 completed 快照应采信: {so0} {se0}");
+    // 独立目录负向: 快照 outcome=errored → peer-outcome-invalid。
+    let t2 = TmpDir::new("m2-errored-neg");
+    let d2 = t2.path().to_path_buf();
+    init_review(&d2, &h);
+    let (glm2, k32, ev2) = m2_evidence_baseline(&d2, &h, "errored");
+    let (ok, so, _) = m2_freeze(&d2, &h, &glm2, &k32, &ev2);
+    assert!(!ok, "errored 终止快照不得作权威: {so}");
+    assert!(
+        so.contains("peer-outcome-invalid"),
+        "应报 peer-outcome-invalid: {so}"
+    );
+}
+
+#[test]
+fn olp_review_runtime_authority_report_turn_bound_to_source_round() {
+    let h = head();
+    // 正向对照: 同轮 turn=2(快照 source=result-2.md)→ 采信。
+    let tp = TmpDir::new("m2-turn-pos");
+    let dp = tp.path().to_path_buf();
+    init_review(&dp, &h);
+    let (glmp, k3p, evp) = m2_evidence_baseline(&dp, &h, "completed");
+    let (ok3, so3, se3) = m2_freeze(&dp, &h, &glmp, &k3p, &evp);
+    assert!(ok3, "同轮 completed 快照应采信: {so3} {se3}");
+
+    // 负向 1(独立目录): glm 报告 turn=1 旧轮(< 快照来源轮 2)→ stale-turn。
+    let t1 = TmpDir::new("m2-turn-stale");
+    let d1 = t1.path().to_path_buf();
+    init_review(&d1, &h);
+    let (_g, k31, ev1) = m2_evidence_baseline(&d1, &h, "completed");
+    let glm_stale = write_review_full(
+        &d1,
+        "glm.md",
+        "glm",
+        "completed",
+        "1",
+        Some(&h),
+        Some(&["X"]),
+        "glm 旧轮初审",
+    );
+    let (ok1, so1, _) = m2_freeze(&d1, &h, &glm_stale, &k31, &ev1);
+    assert!(!ok1, "旧轮报告不得过快照权威: {so1}");
+    assert!(so1.contains("stale-turn"), "应报 stale-turn: {so1}");
+
+    // 负向 2(独立目录): glm 报告 turn=999 未来轮 → turn-mismatch。
+    let t2 = TmpDir::new("m2-turn-future");
+    let d2 = t2.path().to_path_buf();
+    init_review(&d2, &h);
+    let (_g2, k32, ev2) = m2_evidence_baseline(&d2, &h, "completed");
+    let glm_future = write_review_full(
+        &d2,
+        "glm.md",
+        "glm",
+        "completed",
+        "999",
+        Some(&h),
+        Some(&["X"]),
+        "glm 未来轮初审",
+    );
+    let (ok2, so2, _) = m2_freeze(&d2, &h, &glm_future, &k32, &ev2);
+    assert!(!ok2, "未来轮报告不得过快照权威: {so2}");
+    assert!(so2.contains("turn-mismatch"), "应报 turn-mismatch: {so2}");
+}
+
+#[test]
+fn olp_review_report_turn_nondigit_rejected_any_authority() {
+    let h = head();
+    // 负向(独立目录): glm 报告 turn=abc 非数字 → peer-outcome-invalid
+    // (与权威分支无关,统一先拒;原生初审 frontmatter 解析留原样)。
+    let t = TmpDir::new("m2-nondigit");
+    let d = t.path().to_path_buf();
+    init_review(&d, &h);
+    let (_g, k3, ev) = m2_evidence_baseline(&d, &h, "completed");
+    let glm_bad = write_review_full(
+        &d,
+        "glm.md",
+        "glm",
+        "completed",
+        "abc",
+        Some(&h),
+        Some(&["X"]),
+        "glm 非数字轮次初审",
+    );
+    let (ok, so, _) = m2_freeze(&d, &h, &glm_bad, &k3, &ev);
+    assert!(!ok, "非数字 turn 不得过任何权威: {so}");
+    assert!(so.contains("peer-outcome-invalid"), "应报 turn 非法: {so}");
+}
+
+/// M3 回归: native result-N frontmatter 缺 slug 键 → 外来/不可归属收据
+/// 一律 peer-authority-mismatch(此前 `if native_slug and ...` 缺键短路)。
+/// M3/M5 基线: 完整有效初审两份(turn=2)+ k3 native 权威 + glm native
+/// result-2(turns.txt 同轮)。originator/goal 由调用方按场景覆写。
+fn m35_native_baseline(d: &Path, h: &str) -> (PathBuf, PathBuf, PathBuf) {
+    m35_native_baseline_with_k3_originator(d, h, "sess-1")
+}
+
+/// M3/M5 基线(k3 originator 可指定): 完整初审两份 + 双 lane native
+/// result-2 权威(turns.txt 各一行,无同轮重复)。
+fn m35_native_baseline_with_k3_originator(
+    d: &Path,
+    h: &str,
+    k3_originator: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let glm = write_review_full(
+        d,
+        "glm.md",
+        "glm",
+        "completed",
+        "2",
+        Some(h),
+        Some(&["X"]),
+        "glm 初审",
+    );
+    let k3 = write_review_full(
+        d,
+        "k3.md",
+        "k3",
+        "completed",
+        "2",
+        Some(h),
+        Some(&["X"]),
+        "k3 初审",
+    );
+    // glm 权威手工落盘(originator 由调用方覆写),避免 write_authority 的
+    // 默认 originator(sess-1)与 wire 形状视角冲突。
+    let gdir = d.join("native").join("glm");
+    std::fs::create_dir_all(&gdir).unwrap();
+    std::fs::write(
+        gdir.join("result-2.md"),
+        "---\nslug: glm\noutcome: completed\nturn: 2\n---\nbody\n",
+    )
+    .unwrap();
+    std::fs::write(gdir.join("turns.txt"), "2 completed 100\n").unwrap();
+    std::fs::write(gdir.join("originator"), "sess-1\n").unwrap();
+    std::fs::write(gdir.join("goal"), "goal_01\n").unwrap();
+    // k3 权威手工落盘(originator 可指定 wire 形状)。
+    let kdir = d.join("native").join("k3");
+    std::fs::create_dir_all(&kdir).unwrap();
+    std::fs::write(
+        kdir.join("result-2.md"),
+        "---\nslug: k3\noutcome: completed\nturn: 2\n---\nbody\n",
+    )
+    .unwrap();
+    std::fs::write(kdir.join("turns.txt"), "2 completed 100\n").unwrap();
+    std::fs::write(kdir.join("originator"), format!("{k3_originator}\n")).unwrap();
+    std::fs::write(kdir.join("goal"), "goal_01\n").unwrap();
+    (glm, k3, gdir)
+}
+
+/// M3/M5 共用 freeze 调用(绝对路径,native 权威)。
+fn m35_freeze(d: &Path, h: &str, glm: &Path, k3: &Path) -> (bool, String, String) {
+    run(&[
+        "freeze",
+        d.to_str().unwrap(),
+        "--glm-review",
+        glm.to_str().unwrap(),
+        "--k3-review",
+        k3.to_str().unwrap(),
+        "--glm-slug",
+        "glm",
+        "--k3-slug",
+        "k3",
+        "--head",
+        h,
+        "--native-root",
+        native_root(d).to_str().unwrap(),
+    ])
+}
+
+#[test]
+fn olp_review_native_missing_slug_key_rejected() {
+    let h = head();
+    // 正向对照先行: 完整 slug 键 → 采信。
+    let tp = TmpDir::new("m3-slug-pos");
+    let dp = tp.path().to_path_buf();
+    init_review(&dp, &h);
+    let (glmp, k3p, gdirp) = m35_native_baseline(&dp, &h);
+    std::fs::write(
+        gdirp.join("result-2.md"),
+        "---\nslug: glm\noutcome: completed\nturn: 2\n---\nbody\n",
+    )
+    .unwrap();
+    let (ok0, so0, se0) = m35_freeze(&dp, &h, &glmp, &k3p);
+    assert!(ok0, "正向对照完整 slug 键应采信: {so0} {se0}");
+    // 负向(独立目录): result-2 frontmatter 缺 slug 键 → 外来/不可归属。
+    let t = TmpDir::new("m3-slug-neg");
+    let d = t.path().to_path_buf();
+    init_review(&d, &h);
+    let (glm, k3, gdir) = m35_native_baseline(&d, &h);
+    std::fs::write(
+        gdir.join("result-2.md"),
+        "---\noutcome: completed\nturn: 2\n---\nbody(no slug key)",
+    )
+    .unwrap();
+    let (ok, so, _) = m35_freeze(&d, &h, &glm, &k3);
+    assert!(!ok, "缺 slug 键的 native 收据不得作权威: {so}");
+    assert!(
+        so.contains("peer-authority-mismatch"),
+        "应报 mismatch: {so}"
+    );
+}
+
+/// M5 回归: originator 文件无 cwd 后缀 vs 当前 session 带 NUL~cwd-hash
+/// → 主干一致即同源(此前字节精确比较误拒真实 wire 形状);不同 master
+/// leaf 仍拒。
+#[test]
+fn olp_review_identity_cwd_trunk_normalization() {
+    let h = head();
+    // 正向: originator 文件无 cwd 后缀 vs 当前 session 带 NUL~cwd-hash,
+    // 主干一致 → 同源采信。身份写入顺序: 先 init、改 state.session 为
+    // wire 形状,再写初审(identity_lines 从 state 读取真实 session,
+    // 报告身份行与视角一致,才能走到 originator 主干归一检查)。
+    let tp = TmpDir::new("m5-cwd-pos");
+    let dp = tp.path().to_path_buf();
+    init_review(&dp, &h);
+    let state = dp.join("review-state.json");
+    let mut st: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    st["session"] = serde_json::json!("octosfix:local:tui#coding\u{0}~cwd-abc");
+    std::fs::write(&state, serde_json::to_string(&st).unwrap()).unwrap();
+    // 双 lane originator 均为真实 wire 形状(glm 无 cwd 后缀;k3 带后缀)。
+    let (glmp, k3p, gdirp) =
+        m35_native_baseline_with_k3_originator(&dp, &h, "octosfix:local:tui#coding\u{0}~cwd-abc");
+    // 真实 native 形状: originator 无 cwd 后缀。
+    std::fs::write(gdirp.join("originator"), "octosfix:local:tui#coding\n").unwrap();
+    let (ok, so, se) = m35_freeze(&dp, &h, &glmp, &k3p);
+    assert!(ok, "cwd 主干归一: 真实 wire 形状应通过: {so} {se}");
+
+    // 负向(独立目录): 不同 master leaf → peer-authority-mismatch。
+    let tn = TmpDir::new("m5-cwd-neg");
+    let dn = tn.path().to_path_buf();
+    init_review(&dn, &h);
+    let state2 = dn.join("review-state.json");
+    let mut st2: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state2).unwrap()).unwrap();
+    st2["session"] = serde_json::json!("octosfix:local:tui#coding\u{0}~cwd-abc");
+    std::fs::write(&state2, serde_json::to_string(&st2).unwrap()).unwrap();
+    let (glmn, k3n, gdirn) =
+        m35_native_baseline_with_k3_originator(&dn, &h, "octosfix:local:tui#coding\u{0}~cwd-abc");
+    std::fs::write(
+        gdirn.join("originator"),
+        "octosfix:local:tui#other-master\n",
+    )
+    .unwrap();
+    let (ok2, so2, _) = m35_freeze(&dn, &h, &glmn, &k3n);
+    assert!(!ok2, "不同 master leaf 不得通过: {so2}");
+    assert!(
+        so2.contains("peer-authority-mismatch"),
+        "应报 peer-authority-mismatch: {so2}"
+    );
+}
+
+/// M1 回归: classify 通用 PR 级聚合 —— 遍历 MANIFEST,无 PR 编号分支;
+/// blocked/unassessed 与 residual/existing 判别、harness/产品分列。
+/// M1 回归: classify 通用 PR 级聚合 —— 遍历 MANIFEST,无 PR 编号分支;
+/// blocked/unassessed 与 residual/existing 判别、harness/产品分列。
+/// 仓内便携数据: MANIFEST 真值 + 测试内生成的 tiny 真实 receipt/slot 证据
+/// (全部落盘 temp,绝对路径传入),干净 checkout 可跑,无静默早退。
+#[test]
+fn olp_review_classify_pr_aggregation_production_cli() {
+    // 便携 temp MANIFEST: prs 元数据(含 outer_recommendation)继承仓内
+    // MANIFEST 真值,仅 head 绑定到本测试真实 tiny fixture 仓库(每 PR
+    // 独立真实执行,杜绝一份 receipt 冒充多个不同 HEAD)。
+    let src_manifest = fixtures().join("MANIFEST.json");
+    assert!(
+        src_manifest.is_file(),
+        "MANIFEST 缺失: {}",
+        src_manifest.display()
+    );
+    let src: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&src_manifest).unwrap()).unwrap();
+    let src_prs = src["prs"].as_object().expect("MANIFEST prs 对象");
+    assert!(
+        ["627", "628", "629", "630"]
+            .iter()
+            .all(|p| src_prs.contains_key(*p)),
+        "MANIFEST 应含 627/628/629/630: {src_prs:?}"
+    );
+    let t = TmpDir::new("m1-classify-pos");
+    let d = t.path().to_path_buf();
+    let manifest = d.join("MANIFEST.json");
+    // 629: 真双执行(BASE/HEAD 两真实 commit,同一 probe 真实 adapter 执行)。
+    let dual629 = real_dual_execution_slot(&d, "m1pos-629", "fixture_probe_fails");
+    let mut receipts: std::collections::BTreeMap<String, PathBuf> = Default::default();
+    let mut temp_manifest_prs = serde_json::Map::new();
+    let mut keep_alive: Vec<TmpDir> = Vec::new();
+    for (pr, meta) in src_prs {
+        let mut m = meta.clone();
+        if pr == "629" {
+            // HEAD receipt 直接消费真双执行 HEAD 侧落盘原件;MANIFEST
+            // head/base 绑双执行的两个真实 commit。
+            receipts.insert(pr.clone(), dual629.10.clone());
+            m["head"] = serde_json::json!(dual629.1);
+            m["base"] = serde_json::json!(dual629.0);
+        } else if pr == "630" {
+            // 630 故意缺收据(harness 故障): metadata 保留,不插入 receipt。
+            let (_rc, fx_head, ft) = run_real_tiny_execution("m1pos-630", "fixture_probe_fails");
+            m["head"] = serde_json::json!(fx_head);
+            keep_alive.push(ft);
+        } else {
+            // 627/628: 各自独立真实 tiny 执行。
+            let (rc_path, fx_head, ft) =
+                run_real_tiny_execution(&format!("m1pos-{pr}"), "fixture_probe_fails");
+            receipts.insert(pr.clone(), rc_path);
+            m["head"] = serde_json::json!(fx_head);
+            keep_alive.push(ft); // fixture 目录保活: receipt artifacts/test_source 引用其中文件
+        }
+        temp_manifest_prs.insert(pr.clone(), m);
+    }
+    std::fs::write(
+        &manifest,
+        serde_json::to_string(&serde_json::json!({
+            "protocol": src["protocol"], "prs": temp_manifest_prs
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let manifest_v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    let (summary, slot) =
+        write_classify_fixture(&d, &manifest_v, &receipts, "fixture_probe_fails", &dual629);
+    // 真双执行 fixture 目录保活到 classify 结束(receipt artifacts 引用)
+    keep_alive.push(dual629.11);
+    let out = Command::new("python3")
+        .arg(script())
+        .arg("classify")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--replay-summary")
+        .arg(&summary)
+        .arg("--slot")
+        .arg(&slot)
+        .arg("--slot-log-dir")
+        .arg(&d)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "classify 失败: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let prs = v["prs"].as_object().expect("prs 对象");
+    assert_eq!(prs.len(), 4, "应覆盖 MANIFEST 全部 4 个 PR: {prs:?}");
+    // 通用语义断言(不 hardcode 生产数值,只断言由 fixture 决定的判词):
+    // 627/628: 真实产品失败 + 无 slot 覆盖 → blocked/unassessed;
+    // 629: 失败 selector 被 same-probe 双执行覆盖 → residual/existing;
+    // 630: harness 证据错误(收据缺失)→ blocked/unassessed(不继承 existing)。
+    for (pr, class, intro) in [
+        ("627", "blocked", "unassessed"),
+        ("628", "blocked", "unassessed"),
+        ("629", "residual", "existing"),
+        ("630", "blocked", "unassessed"),
+    ] {
+        let entry = prs.get(pr).unwrap_or_else(|| panic!("prs 缺 {pr}"));
+        assert_eq!(
+            entry["classification"].as_str(),
+            Some(class),
+            "{pr} 判词错误: {entry}"
+        );
+        assert_eq!(
+            entry["introduced_vs_existing"].as_str(),
+            Some(intro),
+            "{pr} introduced_vs_existing 错误: {entry}"
+        );
+    }
+    // 有产品失败证据的 PR 不得 clean;harness 故障 PR 列出 fault selector。
+    assert_eq!(
+        prs["630"]["harness_fault_selectors"][0],
+        "fixture_probe_fails"
+    );
+    assert!(
+        prs["629"]["dual_execution_evidence"].is_object(),
+        "629 应绑定双执行证据"
+    );
+    // 源码零 PR 编号分支(通用聚合红线)
+    let src = std::fs::read_to_string(script()).unwrap();
+    for pr in prs.keys() {
+        assert!(
+            !src.contains(&format!("\"{pr}\"")),
+            "classify 不得按 PR 编号硬编码: 发现 \"{pr}\""
+        );
+    }
+}
+
+/// classify 聚合负向: (a) receipt 路径不存在 → 归 harness 证据错误,
+/// PR blocked/unassessed;(b) 外来 receipt 伪装(selector/HEAD 与
+/// summary 不一致) → 同样 blocked/unassessed,不得继承 residual/existing。
+/// 全部证据在 temp 内真实落盘,无外层路径依赖、无静默早退。
+#[test]
+fn olp_review_classify_missing_and_foreign_receipt_rejected() {
+    let manifest = fixtures().join("MANIFEST.json");
+    let heads = manifest_pr_heads(&manifest);
+    let (sel_missing, sel_foreign) = ("store::replay_neg", "store::foreign_neg");
+
+    // (a) receipt 文件不存在 → harness 证据错误。
+    let ta = TmpDir::new("m1-classify-missing");
+    let da = ta.path().to_path_buf();
+    let sum_a = da.join("summary.json");
+    let results_a = serde_json::json!([{
+        "pr": "629", "selector": sel_missing, "observed": "fail",
+        "adapter_exit": 0, "cargo_exit": 101, "head": heads["629"],
+        "receipt": da.join("no-such-receipt.json").to_str().unwrap()
+    }]);
+    std::fs::write(
+        &sum_a,
+        serde_json::to_string(&serde_json::json!({"results": results_a})).unwrap(),
+    )
+    .unwrap();
+    let out_a = Command::new("python3")
+        .arg(script())
+        .arg("classify")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--replay-summary")
+        .arg(&sum_a)
+        .output()
+        .unwrap();
+    assert!(
+        out_a.status.success(),
+        "missing-receipt classify 失败: {}",
+        String::from_utf8_lossy(&out_a.stderr)
+    );
+    let va: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out_a.stdout)).unwrap();
+    let e = &va["prs"]["629"];
+    assert_eq!(
+        e["classification"].as_str(),
+        Some("blocked"),
+        "收据缺失不得 residual: {e}"
+    );
+    assert_eq!(
+        e["introduced_vs_existing"].as_str(),
+        Some("unassessed"),
+        "收据缺失不得 existing: {e}"
+    );
+    assert_eq!(e["harness_fault_selectors"][0], sel_missing);
+
+    // (b) 外来 receipt 伪装: receipt.selector/HEAD 与 summary 不一致 → 拒。
+    let tb = TmpDir::new("m1-classify-foreign");
+    let db = tb.path().to_path_buf();
+    let receipt_b = db.join("foreign.json");
+    std::fs::write(
+        &receipt_b,
+        serde_json::to_string(&serde_json::json!({
+            "receipt_kind": "cargo-test-execution",
+            "selector": "other::selector",
+            "selector_qualified": "other::selector",
+            "observed": "fail",
+            "head_before": heads["627"],
+            "head_after": heads["627"],
+            "exit_code": 101,
+            "matched_tests": ["other::selector"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let sum_b = db.join("summary.json");
+    let results_b = serde_json::json!([{
+        "pr": "629", "selector": sel_foreign, "observed": "fail",
+        "adapter_exit": 0, "cargo_exit": 101, "head": heads["629"],
+        "receipt": receipt_b.to_str().unwrap()
+    }]);
+    std::fs::write(
+        &sum_b,
+        serde_json::to_string(&serde_json::json!({"results": results_b})).unwrap(),
+    )
+    .unwrap();
+    let out_b = Command::new("python3")
+        .arg(script())
+        .arg("classify")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--replay-summary")
+        .arg(&sum_b)
+        .output()
+        .unwrap();
+    assert!(
+        out_b.status.success(),
+        "foreign-receipt classify 失败: {}",
+        String::from_utf8_lossy(&out_b.stderr)
+    );
+    let vb: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out_b.stdout)).unwrap();
+    let e2 = &vb["prs"]["629"];
+    assert_eq!(
+        e2["classification"].as_str(),
+        Some("blocked"),
+        "外来伪装不得 residual: {e2}"
+    );
+    assert_eq!(
+        e2["introduced_vs_existing"].as_str(),
+        Some("unassessed"),
+        "外来伪装不得 existing: {e2}"
+    );
+    assert_eq!(e2["harness_fault_selectors"][0], sel_foreign);
+}
+
+/// 从 MANIFEST 读取 {pr: head} 映射(classify slot pr_head 绑定真值)。
+/// 真实 tiny 执行: 独立 Cargo fixture(FIXTURE_FAIL_TEST,真实 git 仓库),
+/// 经生产 adapter 真实 `cargo test`(真失败真断言),返回 (adapter 真实
+/// receipt 路径, fixture HEAD commit, fixture 句柄(保活))。
+/// 每 fixture 在首个 commit 上追加一个真实非测试源 commit,保证多次调用
+/// 各自 HEAD 唯一(不靠提交秒/路径差异),且 BASE=首 commit / HEAD=次
+/// commit 的双执行场景里测试源逐字节不变。
+fn run_real_tiny_execution(tag: &str, selector: &str) -> (PathBuf, String, TmpDir) {
+    let (ft, repo, _head0) = make_cargo_fixture(tag, FIXTURE_FAIL_TEST);
+    let head = bump_fixture_head(&repo, tag);
+    let ev_dir = ft.path().join("evidence");
+    std::fs::create_dir_all(&ev_dir).unwrap();
+    let receipt = ev_dir.join("receipt.json");
+    let (ok, so) = run_adapter(
+        &repo,
+        &[
+            "--selector",
+            selector,
+            "--expect",
+            "fail",
+            "--receipt",
+            receipt.to_str().unwrap(),
+            "--artifact-dir",
+            ev_dir.to_str().unwrap(),
+        ],
+        None,
+        300,
+    );
+    assert!(ok, "真实 tiny 执行失败: {so}");
+    assert!(receipt.is_file(), "adapter 未落 receipt: {so}");
+    let rc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&receipt).unwrap()).unwrap();
+    assert_eq!(
+        rc["observed"].as_str(),
+        Some("fail"),
+        "fixture 应真实失败: {so}"
+    );
+    assert_eq!(rc["head_before"].as_str(), Some(head.as_str()));
+    assert_eq!(rc["head_after"].as_str(), Some(head.as_str()));
+    (receipt, head, ft)
+}
+
+/// 在 fixture 首个 commit 之上追加真实非测试源最小 commit(NOTES.md,
+/// 内容含 tag → 全工作区唯一 HEAD),返回新 HEAD。
+fn bump_fixture_head(repo: &Path, tag: &str) -> String {
+    std::fs::write(
+        repo.join("NOTES.md"),
+        format!("unique commit marker for {tag}\n"),
+    )
+    .unwrap();
+    for args in [
+        vec!["add", "NOTES.md"],
+        vec!["commit", "--quiet", "-m", &format!("notes {tag}")],
+    ] {
+        let out = run_deadline(
+            Command::new("git").args(&args).current_dir(repo),
+            30,
+            &format!("git {}", args[0]),
+        );
+        assert!(out.status.success(), "git {:?} failed", args);
+    }
+    fixture_head(repo)
+}
+
+/// 真同 probe BASE/HEAD 双执行: 同一 tiny repo 的两个真实 commit
+/// (BASE=首个 commit,HEAD=追加的非测试源 commit,测试源逐字节不变),
+/// 对同一 tests/fixture.rs、同一 qualified selector 分别真实调用生产
+/// adapter;BASE/HEAD receipt 的真实 stdout 工件复制为 slot 日志,真实
+/// 退出码/真实 commit/probe sha 构成 slot 字段。执行后恢复 HEAD commit,
+/// 测试源 hash 全程不变。
+/// 返回 (base_commit, head_commit, probe 路径, probe_sha256,
+///        base_log, base_log_sha256, base_exit,
+///        head_log, head_log_sha256, head_exit, head_receipt)。
+#[allow(clippy::type_complexity)]
+/// 真双执行证据 tuple: (base_commit, head_commit, probe 路径, probe
+/// sha256, base_log, base_log_sha, base_exit, head_log, head_log_sha,
+/// head_exit, head_receipt 原件, fixture TmpDir 保活)。
+type DualExecutionSlot = (
+    String,
+    String,
+    PathBuf,
+    String,
+    PathBuf,
+    String,
+    i64,
+    PathBuf,
+    String,
+    i64,
+    PathBuf,
+    TmpDir,
+);
+
+#[allow(clippy::type_complexity)]
+fn real_dual_execution_slot(d: &Path, tag: &str, selector: &str) -> DualExecutionSlot {
+    let (ft, repo, base_commit) = make_cargo_fixture(tag, FIXTURE_FAIL_TEST);
+    let ev = ft.path().join("dual-evidence");
+    std::fs::create_dir_all(&ev).unwrap();
+    let run_at = |label: &str| -> (serde_json::Value, PathBuf, i64) {
+        let receipt = ev.join(format!("{label}.receipt.json"));
+        let (ok, so) = run_adapter(
+            &repo,
+            &[
+                "--selector",
+                selector,
+                "--expect",
+                "fail",
+                "--receipt",
+                receipt.to_str().unwrap(),
+                "--artifact-dir",
+                ev.to_str().unwrap(),
+            ],
+            None,
+            300,
+        );
+        assert!(ok, "双执行 {label} 真实执行失败: {so}");
+        let rc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&receipt).unwrap()).unwrap();
+        assert_eq!(
+            rc["observed"].as_str(),
+            Some("fail"),
+            "{label} 应真实失败: {so}"
+        );
+        let stdout = PathBuf::from(rc["artifacts"]["stdout"].as_str().expect("stdout 工件"));
+        assert!(stdout.is_file(), "{label} stdout 工件缺失");
+        let exit = rc["exit_code"].as_i64().expect("exit_code");
+        (rc, stdout, exit)
+    };
+    // BASE 侧真实执行(首 commit)。
+    let (rc_base, base_stdout, base_exit) = run_at("base");
+    assert_eq!(rc_base["head_before"].as_str(), Some(base_commit.as_str()));
+    // 追加 HEAD commit(非测试源),HEAD 侧真实执行。
+    let head_commit = bump_fixture_head(&repo, tag);
+    assert_ne!(
+        head_commit, base_commit,
+        "BASE/HEAD 必须为两个不同真实 commit"
+    );
+    let (rc_head, head_stdout, head_exit) = run_at("head");
+    assert_eq!(rc_head["head_before"].as_str(), Some(head_commit.as_str()));
+    // 同 probe 绑定: 双侧 test_source 与 sha256 必须逐字节一致。
+    assert_eq!(rc_base["test_target_sha256"], rc_head["test_target_sha256"]);
+    let probe = d.join(format!("probe-{tag}.rs"));
+    std::fs::copy(rc_head["test_source"].as_str().unwrap(), &probe).unwrap();
+    let probe_sha = sha256_hex(&probe);
+    assert_eq!(
+        Some(probe_sha.as_str()),
+        rc_head["test_target_sha256"].as_str(),
+        "slot probe 必须与真实 test_target 逐字节一致"
+    );
+    // slot 日志 = 两侧真实 stdout 工件原件复制(非字符串合成);HEAD 轮
+    // receipt 原件复制保活(classify 三方绑定直接消费)。
+    let base_log = d.join(format!("{tag}-base.log"));
+    let head_log = d.join(format!("{tag}-head.log"));
+    std::fs::copy(&base_stdout, &base_log).unwrap();
+    std::fs::copy(&head_stdout, &head_log).unwrap();
+    let head_receipt = d.join(format!("{tag}-head.receipt.json"));
+    std::fs::copy(ev.join("head.receipt.json"), &head_receipt).unwrap();
+    // fixture 目录随 tuple 返回调用方保活: head receipt 的 artifacts/
+    // test_source 仍指向其中文件,classify 校验在场+sha256 需要;
+    // 复制 receipt JSON 本身不保活其引用工件(不 drop,不泄漏——
+    // 调用方 keep_alive 持有至测试结束)。
+    (
+        base_commit,
+        head_commit,
+        probe,
+        probe_sha,
+        base_log.clone(),
+        sha256_hex(&base_log),
+        base_exit,
+        head_log.clone(),
+        sha256_hex(&head_log),
+        head_exit,
+        head_receipt,
+        ft,
+    )
+}
+
+fn manifest_pr_heads(manifest: &Path) -> std::collections::BTreeMap<String, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(manifest).unwrap()).unwrap();
+    v["prs"]
+        .as_object()
+        .expect("MANIFEST prs 对象")
+        .iter()
+        .map(|(k, m)| (k.clone(), m["head"].as_str().unwrap_or("").to_string()))
+        .collect()
+}
+
+/// 生成 classify 正向 fixture(严格 classifier 完整绑定):
+///   - 每 PR 一条 per-selector 失败记录,各绑定 `receipts[pr]` 真实执行
+///     receipt(三方 HEAD 绑定: receipt.head_before/after == summary.head
+///     == MANIFEST 该 PR head);630 receipt 路径不存在 → harness 证据错误。
+///   - 629 附 same-probe BASE/HEAD 双执行 slot: slot.pr_head/base 精确
+///     绑定 MANIFEST 629 真值,probe 源 + probe_sha256 == receipt.
+///     test_target_sha256(同 probe 绑定),hash-bound 双日志含 qualified
+///     selector 确切 `test <q> ... FAILED` 行 + `test result: FAILED.` 锚。
+///
+/// 返回 (summary 路径, slot 路径)。
+fn write_classify_fixture(
+    d: &Path,
+    manifest: &serde_json::Value,
+    receipts: &std::collections::BTreeMap<String, PathBuf>,
+    selector: &str,
+    dual: &DualExecutionSlot,
+) -> (PathBuf, PathBuf) {
+    let prs = manifest["prs"].as_object().expect("MANIFEST prs 对象");
+    let (
+        base_c,
+        head_c,
+        probe,
+        probe_sha,
+        base_log,
+        base_sha,
+        base_exit,
+        head_log,
+        head_sha,
+        head_exit,
+        _head_rc,
+        _ft_keepalive,
+    ) = dual;
+    // slot 的 HEAD commit 必须等于 629 receipt 的真实 head(同 probe 同轮)。
+    let rc629: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&receipts["629"]).unwrap()).unwrap();
+    assert_eq!(
+        rc629["head_before"].as_str(),
+        Some(head_c.as_str()),
+        "slot HEAD 必须等于 629 receipt 的真实执行 HEAD"
+    );
+    assert_eq!(
+        rc629["test_target_sha256"].as_str(),
+        Some(probe_sha.as_str()),
+        "slot probe 必须等于 629 receipt 的真实 test_target(同 probe)"
+    );
+    let mut results = Vec::new();
+    for (pr, meta) in prs {
+        // 630: receipt 路径指向不存在文件 → harness 证据错误(blocked/unassessed)。
+        let receipt = receipts
+            .get(pr)
+            .map(|p| p.to_str().unwrap().to_string())
+            .unwrap_or_else(|| {
+                d.join(format!("receipt-{pr}-absent.json"))
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            });
+        // cargo_exit 必须与该 PR 真实 receipt 的 exit_code 精确一致
+        // (严格 classifier: receipt-exit-mismatch 归 harness 故障)。
+        let cargo_exit = receipts
+            .get(pr)
+            .map(|rp| {
+                let rc: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(rp).unwrap()).unwrap();
+                rc["exit_code"].as_i64().expect("receipt exit_code")
+            })
+            .unwrap_or(101);
+        results.push(serde_json::json!({
+            "pr": pr, "selector": selector, "observed": "fail",
+            "adapter_exit": 0, "cargo_exit": cargo_exit,
+            "head": meta["head"].as_str().unwrap(),
+            "receipt": receipt
+        }));
+    }
+    let summary = d.join("replay-summary.json");
+    std::fs::write(
+        &summary,
+        serde_json::to_string(&serde_json::json!({"results": results})).unwrap(),
+    )
+    .unwrap();
+    // slot: 全部由真双执行产物构成(真实 commit/日志/退出码/hash)。
+    let slot = d.join("slot.json");
+    std::fs::write(
+        &slot,
+        serde_json::to_string(&serde_json::json!({
+            "pr_head": head_c,
+            "base": base_c,
+            "probe": probe.to_str().unwrap(),
+            "probe_sha256": probe_sha,
+            "classification": "existing-behavior",
+            "base_exit": base_exit,
+            "head_exit": head_exit,
+            "base_log_sha256": base_sha,
+            "head_log_sha256": head_sha
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let _ = (base_log, head_log);
+    (summary, slot)
+}
+
+/// helper 边界回归 1(ROOT ../behavior-last-two-helper-probes/receipt.json
+/// duplicate-turn-followed-by-new-valid-row case,结构校验数据 fixture,
+/// 非产品执行证据): `1 completed/1 errored/2 completed` 中同轮 1 冲突后,
+/// 后续 valid 轮 2 不得恢复可信 —— rows 必须为空且含 duplicate note。
+#[test]
+fn olp_review_helper_turns_duplicate_then_valid_stays_untrusted() {
+    let t = TmpDir::new("dupthenvalid");
+    let d = t.path().to_path_buf();
+    let turns = d.join("turns.txt");
+    std::fs::write(&turns, "1 completed 100\n1 errored 200\n2 completed 300\n").unwrap();
+    let out = Command::new("python3")
+        .arg("-B")
+        .arg("-c")
+        .arg(concat!(
+            "import importlib.util, json, sys;\n",
+            "spec = importlib.util.spec_from_file_location('mon', 'scripts/olp-review-monitor.py');\n",
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m);\n",
+            "rows, notes = m.parse_turns_txt(__import__('pathlib').Path(sysargv));\n",
+            "print(json.dumps({'rows': rows, 'notes': notes}))"
+        ).replace("sysargv", "sys.argv[1]"))
+        .arg(&turns)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "helper 调用失败: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let rows = v["rows"].as_array().expect("rows 数组");
+    assert!(rows.is_empty(), "重复后新 valid 行不得恢复可信: {v}");
+    assert!(
+        v["notes"].to_string().contains("turns-duplicate-row"),
+        "应含 duplicate note: {v}"
+    );
+    // 正常多轮不受影响
+    std::fs::write(&turns, "1 completed 100\n2 completed 200\n").unwrap();
+    let out2 = Command::new("python3")
+        .arg("-B")
+        .arg("-c")
+        .arg(concat!(
+            "import importlib.util, json, sys;\n",
+            "spec = importlib.util.spec_from_file_location('mon', 'scripts/olp-review-monitor.py');\n",
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m);\n",
+            "rows, notes = m.parse_turns_txt(__import__('pathlib').Path(sysargv));\n",
+            "print(json.dumps({'rows': rows, 'notes': notes}))"
+        ).replace("sysargv", "sys.argv[1]"))
+        .arg(&turns)
+        .output()
+        .unwrap();
+    let v2: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out2.stdout)).unwrap();
+    assert_eq!(
+        v2["rows"].as_array().map(|a| a.len()),
+        Some(2),
+        "正常多轮应保留: {v2}"
+    );
+}
+
+/// helper 边界回归 2(同收据 same-bytes-two-failed-slot-logs case,结构
+/// 校验数据 fixture,非产品执行证据): 两份有效 FAILED 日志字节完全相同
+/// (SHA 相等)时,生产 _verify_slot_evidence 必须双侧绑定成功返回有效
+/// slot —— 两次真实独立执行输出相同字节是合法形态。
+#[test]
+fn olp_review_helper_identical_slot_logs_both_bound() {
+    let t = TmpDir::new("samelogs");
+    let d = t.path().to_path_buf();
+    let probe = d.join("probe-q.rs");
+    std::fs::write(&probe, "fn q() {}\n").unwrap();
+    let log_body = "test tests::q ... FAILED\ntest result: FAILED. 0 passed; 1 failed\n";
+    let base_log = d.join("a.log");
+    let head_log = d.join("b.log");
+    std::fs::write(&base_log, log_body).unwrap();
+    std::fs::write(&head_log, log_body).unwrap(); // 字节完全相同
+    let slot = serde_json::json!({
+        "pr_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "probe": probe.to_str().unwrap(),
+        "probe_sha256": sha256_hex(&probe),
+        "base_log_sha256": sha256_hex(&base_log),
+        "head_log_sha256": sha256_hex(&head_log),
+        "base_exit": 101,
+        "head_exit": 101,
+        "classification": "existing/residual: same probe fails at BASE and HEAD"
+    });
+    let slot_path = d.join("slot.json");
+    std::fs::write(&slot_path, serde_json::to_string(&slot).unwrap()).unwrap();
+    let out = Command::new("python3")
+        .arg("-B")
+        .arg("-c")
+        .arg(concat!(
+            "import importlib.util, json, sys;\n",
+            "spec = importlib.util.spec_from_file_location('ev', 'scripts/olp-review-evidence.py');\n",
+            "ev = importlib.util.module_from_spec(spec); spec.loader.exec_module(ev);\n",
+            "slot = json.loads(open(sys.argv[1]).read());\n",
+            "heads = {'p': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'};\n",
+            "bases = {'p': 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'};\n",
+            "out = ev._verify_slot_evidence(slot, __import__('pathlib').Path(sys.argv[2]), heads, bases, 'tests::q', slot['probe_sha256']);\n",
+            "print(json.dumps({'ok': out is not None, 'base_log': (out or {}).get('base_log'), 'head_log': (out or {}).get('head_log')}))"
+        ))
+        .arg(&slot_path)
+        .arg(&d)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "helper 调用失败: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(v["ok"].as_bool(), Some(true), "同字节双日志应双侧绑定: {v}");
+    assert!(v["base_log"].as_str().is_some(), "base_log 应绑定: {v}");
+    assert!(v["head_log"].as_str().is_some(), "head_log 应绑定: {v}");
 }

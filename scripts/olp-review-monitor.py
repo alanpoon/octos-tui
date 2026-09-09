@@ -603,20 +603,37 @@ def ui_protocol_threads(runtime_dir: Path, session: str | None) -> list[dict]:
 
 
 def parse_turns_txt(path: Path) -> tuple[list[tuple[int, str]], list[str]]:
-    """Parse '<round> <outcome> <ts>' rows; bad rows collected, not fatal."""
+    """Parse '<round> <outcome> <ts>' rows; bad rows collected, not fatal.
+
+    M6 fail-closed: 同一轮次多行(冲突或重复)→ 整个索引不可信: 标记
+    duplicate 后**整个解析结束统一返回空 rows**+notes,后续 valid 行
+    不得重新 append 恢复可信(RED 实测: `1 completed/1 errored/2
+    completed` 曾被后续 append 恢复为 [(2,completed)],违背 M6 语义)。
+    """
     rows: list[tuple[int, str]] = []
     bad: list[str] = []
     raw = _read_regular_file(path)
     if raw is None:
         return rows, ["turns-txt-missing"]
+    seen: dict[int, str] = {}
+    duplicate = False
     for i, line in enumerate(raw.splitlines(), 1):
         if not line.strip():
             continue
         parts = line.split()
         if len(parts) >= 2 and parts[0].isdigit():
-            rows.append((int(parts[0]), parts[1]))
+            turn_n = int(parts[0])
+            if turn_n in seen:
+                bad.append(f"turns-duplicate-row:{i}")
+                duplicate = True
+                continue
+            seen[turn_n] = parts[1]
+            rows.append((turn_n, parts[1]))
         else:
             bad.append(f"turns-txt-bad-row:{i}")
+    if duplicate:
+        # 任意重复 → 全体不可信,空 rows(后续 valid 行不得恢复可信)
+        return [], bad
     return rows, bad
 
 
@@ -675,18 +692,19 @@ def latest_terminated(native_dir: Path, expected_slug: str | None = None) -> dic
     #     (completed/errored/interrupted/rate_limited)如实显示,不折叠成
     #     unknown;旧失败不改判,也永不晋升为 completed。
     #   * review-freeze 准入层(另一处): 只有 completed 算有效终止初审。
-    # 非终止态(pending/running)与伪造值(fabricated 等,即使与 turns.txt
-    # 一致)一律 unknown/拒绝。
-    if outcome != "completed":
-        if outcome in _KNOWN_TERMINAL_OUTCOMES:
-            result["state"] = outcome
-        else:
-            notes.append(f"result-outcome-untrusted:{outcome}")
+    # M7(v3-cross 兑现): 四值终止态**全部**与 turns.txt 交叉核对 ——
+    # 非 completed 终止值(errored/interrupted/rate_limited)此前直接返回,
+    # 缺失/冲突的 turns.txt 不影响显示;现改为: turns.txt 缺失、最新轮
+    # 与 result-N 不一致、或同轮 outcome 冲突 → 降 unknown + note
+    # (与 completed 同一把尺;不支持/冲突的证据不得直接显示终止值)。
+    # 非终止态(pending/running)与伪造值(fabricated 等)仍一律 unknown。
+    if outcome not in _KNOWN_TERMINAL_OUTCOMES:
+        notes.append(f"result-outcome-untrusted:{outcome}")
         return result
     rows, turn_notes = parse_turns_txt(native_dir / "turns.txt")
     notes.extend(turn_notes)
     if not rows:
-        # turns.txt missing/全部坏行 → 不可信,但来源说明
+        # turns.txt missing/全部坏行 → 四值终止一律不可信 → unknown + note
         notes.append("turns-txt-untrusted")
         return result
     last_round, last_outcome = max(rows, key=lambda r: r[0])

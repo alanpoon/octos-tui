@@ -435,6 +435,27 @@ Rule: review-monitor — Herdr 监控:区块分离与身份防混
   当 该行内容被原地修改为 blocked
   那么 监控输出该变更事件(哈希比对,非仅行数)而不是静默
 
+场景: helper 边界 — turns 重复后新 valid 轮不得恢复可信(critical)
+  测试:
+    包: octoscode
+    过滤: olp_review_helper_turns_duplicate_then_valid_stays_untrusted
+  假设 turns.txt 为 `1 completed/1 errored/2 completed`(同轮 1 冲突后
+    跟新 valid 轮 2;纯结构校验数据 fixture,非产品执行证据)
+  当 parse_turns_txt 解析
+  那么 rows 必须为空(任意重复 → 全体不可信,后续 valid 行不得恢复)
+    且 notes 含 turns-duplicate-row;正常多轮路径不受影响
+
+场景: helper 边界 — BASE/HEAD 日志字节完全相同时双侧绑定(critical)
+  测试:
+    包: octoscode
+    过滤: olp_review_helper_identical_slot_logs_both_bound
+  假设 两份有效 FAILED 日志(含 qualified 测试失败锚)字节完全相同、
+    SHA 相等,slot 其余字段(probe/pr_head/base/probe_sha256/exits)齐备
+  当 _verify_slot_evidence 核验
+  那么 返回有效 slot 且 base_log/head_log 双侧绑定 —— 两次真实独立
+    执行输出相同字节是合法形态,不得因 hash 相等误拒;其余冻结门
+    (receipt/HEAD/probe/BASE/selector 锚)不放宽
+
 Rule: review-regression — 前轮八反例回归数据集
 
 场景: 八反例回归分类(critical)

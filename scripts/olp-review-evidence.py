@@ -263,8 +263,13 @@ def latest_result(peer_dir: Path) -> tuple[int, Path] | None:
     return best
 
 
-def turns_index(peer_dir: Path) -> dict[int, str]:
-    """turns.txt 轮次索引: {turn: outcome}(每行 '<turn> <outcome> ...')。"""
+def turns_index(peer_dir: Path) -> dict[int, str] | None:
+    """turns.txt 轮次索引: {turn: outcome}(每行 '<turn> <outcome> ...')。
+
+    M6 fail-closed: 同一轮次出现多行(即使 outcome 相同)→ 冲突,返回
+    None —— 调用方必须按"轮次索引不完整/不可信"拒绝,不得后行覆盖前行
+    (此前 `"1 errored\\n1 completed"` 会以 completed 通过核对)。
+    """
     p = peer_dir / "turns.txt"
     idx: dict[int, str] = {}
     if not p.exists():
@@ -272,8 +277,61 @@ def turns_index(peer_dir: Path) -> dict[int, str]:
     for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
         parts = line.split()
         if parts and parts[0].isdigit():
-            idx[int(parts[0])] = parts[1] if len(parts) > 1 else ""
+            turn_n = int(parts[0])
+            outcome = parts[1] if len(parts) > 1 else ""
+            if turn_n in idx:
+                # 同轮重复(冲突或重复)→ 索引不可信
+                return None
+            idx[turn_n] = outcome
     return idx
+
+
+_CWD_SUFFIX_RE = re.compile(r"(?:\x00|\\x00)~cwd-[0-9A-Za-z]+\Z")
+
+
+def _wire_trunk(session_id: str) -> str:
+    """wire session → 剥 cwd 后缀的主干(channel+leaf),归一比较用。
+
+    真实 native originator 文件通常无 cwd 后缀(`octosfix:local:tui#coding`),
+    而 thread/快照 session 带 `NUL~cwd-hash`;身份比较须按主干归一
+    (与 monitor `_wire_session_same_origin` 同语义),否则真实 wire 形状
+    会因字节不精确被误拒(fail-closed 假阴性)。
+    """
+    if not isinstance(session_id, str):
+        return ""
+    return _CWD_SUFFIX_RE.sub("", session_id)
+
+
+def _wire_trunk_and_cwd(session_id: str) -> tuple[str, str | None]:
+    """wire session → (剥 cwd 后的主干, cwd 后缀或 None)。
+
+    与 monitor `_wire_trunk_and_cwd` 完全同语义。
+    """
+    if not isinstance(session_id, str):
+        return "", None
+    m = _CWD_SUFFIX_RE.search(session_id)
+    cwd = m.group(0) if m else None
+    trunk = _CWD_SUFFIX_RE.sub("", session_id)
+    return trunk, cwd
+
+
+def _wire_session_same_origin(a: str, b: str) -> bool:
+    """两个 wire session 是否同源(channel 主干 + cwd 语义)。
+
+    与 monitor `_wire_session_same_origin` EXACT 语义:
+    - 主干(channel+leaf)必须一致;
+    - **双方都带 cwd 后缀时哈希必须相等**(同 trunk 不同 cwd = 不同
+      工作区,不得匹配——只剥两端会造成跨工作区错误接受);
+    - 只有一方带后缀时以主干为准(该侧不携带 cwd 信息,由 originator
+      文件通常无后缀的真实形状决定)。
+    """
+    trunk_a, cwd_a = _wire_trunk_and_cwd(a)
+    trunk_b, cwd_b = _wire_trunk_and_cwd(b)
+    if not trunk_a or not trunk_b or trunk_a != trunk_b:
+        return False
+    if cwd_a is not None and cwd_b is not None:
+        return cwd_a == cwd_b
+    return True
 
 
 def _identity_file_matches(peer_dir: Path, name: str, expected: str) -> bool:
@@ -281,9 +339,14 @@ def _identity_file_matches(peer_dir: Path, name: str, expected: str) -> bool:
     if not p.exists():
         return False
     try:
-        return p.read_text(encoding="utf-8", errors="replace").strip() == expected
+        got = p.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         return False
+    if got == expected:
+        return True
+    # cwd 语义归一(monitor 同源判定): 双方后缀都在必须相等,
+    # 单侧无后缀以主干为准 —— 不做无脑两端 strip。
+    return _wire_session_same_origin(got, expected)
 
 
 def check_peer_validity(
@@ -317,6 +380,14 @@ def check_peer_validity(
             f"{slug} 自报 outcome={outcome}(非 completed),不得作为有效初审/交叉",
         )
     has_authority = False
+    # 报告 turn 必须是数字(与权威来源无关;非数字无法对账,fail-closed)。
+    fm_turn = fm.get("turn")
+    if fm_turn is None or not str(fm_turn).isdigit():
+        raise fail(
+            "peer-outcome-invalid",
+            f"{slug} 报告 turn={fm_turn!r} 缺失/非数字,无法与权威轮次对账",
+        )
+    fm_turn_n = int(str(fm_turn))
     # External signal 1: runtime-evidence(终止快照须绑定当前 session 视角)
     if runtime_evidence is not None:
         peers = runtime_evidence.get("peers")
@@ -338,6 +409,39 @@ def check_peer_validity(
                             or peer.get("goal") == expected_goal
                         )
                     ):
+                        # 与 native 路径同等严格: 终止快照必须精确 completed
+                        # (errored/interrupted 等失败态不是有效终止初审权威),
+                        # 且轮次必须可核验 —— source=result-N.md 的 N 即最新
+                        # 终止轮,报告 turn 恰等 N(< N 旧轮,> N 未来轮)。
+                        ev_outcome = peer.get("outcome")
+                        if ev_outcome != "completed":
+                            raise fail(
+                                "peer-outcome-invalid",
+                                f"{slug} runtime-evidence 终止快照 outcome="
+                                f"{ev_outcome}(非 completed),不构成终止权威",
+                            )
+                        ev_source = peer.get("source")
+                        src_m = re.match(r"^result-(\d+)\.md$", str(ev_source or ""))
+                        if not src_m:
+                            # 无可核验轮次来源: 快照自报不可当权威(fail-closed)
+                            raise fail(
+                                "peer-outcome-invalid",
+                                f"{slug} runtime-evidence 终止快照缺可核验轮次来源"
+                                f"(source={ev_source!r}),不得当终止权威",
+                            )
+                        src_n = int(src_m.group(1))
+                        if fm_turn_n < src_n:
+                            raise fail(
+                                "stale-turn",
+                                f"{slug} 报告 turn={fm_turn_n} 低于快照来源轮次"
+                                f" {src_n}(result-{src_n}.md)",
+                            )
+                        if fm_turn_n > src_n:
+                            raise fail(
+                                "turn-mismatch",
+                                f"{slug} 报告 turn={fm_turn_n} 超过快照来源轮次"
+                                f" {src_n}(未来轮次)",
+                            )
                         has_authority = True
     # External signal 2: native result-N.md(严格对账)
     if native_dir is not None and native_dir.exists():
@@ -346,10 +450,13 @@ def check_peer_validity(
             n, path = latest
             native_fm = parse_frontmatter(path)
             native_slug = native_fm.get("slug")
-            if native_slug and native_slug != slug:
+            native_slug = native_fm.get("slug")
+            if native_slug != slug:
+                # 缺 slug 键与不匹配同罪: 外来/不可归属收据一律拒
+                # (此前 `if native_slug and ...` 使缺键短路跳过 slug 关)。
                 raise fail(
                     "peer-authority-mismatch",
-                    f"{slug} native {path.name} slug={native_slug} 不匹配",
+                    f"{slug} native {path.name} slug={native_slug!r} 缺失/不匹配",
                 )
             native_outcome = native_fm.get("outcome")
             if native_outcome != "completed":
@@ -368,7 +475,7 @@ def check_peer_validity(
             if not idx:
                 raise fail(
                     "peer-outcome-invalid",
-                    f"{slug} native turns.txt 缺失/为空,轮次索引不完整",
+                    f"{slug} native turns.txt 缺失/为空/同轮重复,轮次索引不完整",
                 )
             mx = max(idx)
             if n < mx:
@@ -1216,6 +1323,583 @@ def review_accepted(state: dict) -> bool:
     return all(claim_evidence_backed(v) for v in verdicts.values())
 
 
+# ---------------------------------------------------------------------------
+# PR-level aggregation (classify) — spec L55-73/L439-455
+# 分类意图来自外层(MANIFEST outer_recommendation);本工具只做通用聚合派生:
+#   * per-selector 产品裁决: observed(pass/fail) + cargo_exit;
+#     harness 状态(adapter_exit)与产品失败分列,永不相混。
+#   * introduced_vs_existing: 需 BASE/HEAD 同 probe 双执行对照
+#     (双 FAIL 形态同构 → existing;HEAD FAIL + BASE PASS → introduced);
+#     缺双执行证据 → "unassessed",该 PR 聚合保守降级,禁标 clean。
+#   * PR 级: clean(全 pass 且无 unassessed) / residual(失败全 existing) /
+#     blocked(反例成立且无双执行对照;或 harness 收据缺失/hash 不符)。
+# 禁止按 PR 编号硬编码: 全部遍历 MANIFEST 条目驱动。
+# ---------------------------------------------------------------------------
+
+PR_CLASS_STATES = {"clean", "residual", "blocked"}
+INTRO_STATES = {"introduced", "existing", "unassessed"}
+
+# cargo test 结果锚(与 adapter scripts/olp-review-evidence-cargo.py 终态判定
+# 语义一致):pass 需该 qualified test 的 `... ok` 行 + `test result: ok.` 汇总
+# + exit 0;fail 需 `... FAILED` 行 + `test result: FAILED.` 汇总 + exit != 0。
+# 汇总文件自报(observed/exit_code)永不足以确立终态,必须核 stdout 实际内容。
+_TEST_LINE_RE = re.compile(r"^test (\S+) \.\.\. (ok|FAILED|ignored)", re.M)
+_PASS_SUMMARY_RE = re.compile(r"^test result: ok\.", re.M)
+_FAIL_SUMMARY_RE = re.compile(r"^test result: FAILED\.", re.M)
+
+
+def _test_statuses(text: str, qualified: str) -> set[str]:
+    """stdout 中该 qualified 测试名的实际逐行结果集合(ok/FAILED/ignored)。
+
+    libtest 可能把状态折到下一行(`test <name> ... \n<panic>\nFAILED`),
+    故先取锚行状态;锚行无状态时,若该测试随后 panic 且文本含独立
+    `FAILED` 状态行则记 FAILED(adapter 终态判定同语义)。"""
+    statuses: set[str] = set()
+    anchored = False
+    for n, s in _TEST_LINE_RE.findall(text):
+        if n == qualified:
+            statuses.add(s)
+            anchored = True
+    if not anchored and f"test {qualified} ..." in text:
+        if "panicked at" in text and re.search(r"^FAILED$", text, re.M):
+            statuses.add("FAILED")
+    return statuses
+
+
+def _load_json_file(path: Path, err_code: str) -> dict:
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise fail(err_code, f"无法读取 {path}: {e}")
+    if not isinstance(obj, dict):
+        raise fail(err_code, f"{path} 顶层不是对象")
+    return obj
+
+
+def _verify_slot_evidence(
+    slot: dict,
+    log_dir: Path,
+    manifest_heads: dict[str, str],
+    manifest_bases: dict[str, str] | None = None,
+    qualified_selector: str | None = None,
+    probe_sha256: str | None = None,
+) -> dict | None:
+    """BASE/HEAD 双执行对照核验(sha256 逐字节),不通过 → None(unassessed)。
+
+    slot 必须含 base_exit/head_exit/classification/base_log_sha256/
+    head_log_sha256,且 base/head 日志文件在场、hash 相符;**pr_head 必须
+    与 MANIFEST 声明的该 PR head 精确一致**(外来 head 或**另一个真实
+    MANIFEST PR 的 head** 均不得作对照);**slot.base 若声明必须精确等于
+    该 PR 的 MANIFEST base**(外来 → None);**probe 源文件必须存在且其
+    sha256 与 slot.probe_sha256 相符**,且 probe_sha256 == probe_sha256
+    参数(= 本 PR receipt 的 test_target_sha256,同 probe 绑定);任何
+    缺失/不符 → None(缺双执行证据,fail-closed,不抛异常)。
+    manifest_heads/manifest_bases: {pr_key: head/base}(由调用方逐 PR
+    传入本 PR 锚;**禁**"等于任一 MANIFEST head"的跨 PR 推广)。
+    qualified_selector: 该失败 selector 的 qualified 测试名;hash-bound
+    日志必须含该 qualified test 的 `... FAILED` 行 + `test result: FAILED.`
+    汇总锚(probe 文件名 stem 模糊匹配不算 same-probe 失败证明)。"""
+    try:
+        need_ok = (
+            isinstance(slot.get("base_exit"), int)
+            and isinstance(slot.get("head_exit"), int)
+            and isinstance(slot.get("base_log_sha256"), str)
+            and isinstance(slot.get("head_log_sha256"), str)
+        )
+        if not need_ok:
+            return None
+        pr_head = slot.get("pr_head")
+        if not isinstance(pr_head, str) or not pr_head:
+            return None
+        # 逐 PR 精确绑定: pr_head 必须等于**本 PR** 的 MANIFEST head
+        if pr_head not in set(manifest_heads.values()):
+            return None
+        # slot.base 若声明必须等于本 PR 的 MANIFEST base(外来 → None)
+        slot_base = slot.get("base")
+        if (
+            manifest_bases
+            and slot_base is not None
+            and slot_base not in set(manifest_bases.values())
+        ):
+            return None
+        # probe 源文件在场 + probe_sha256 绑定(禁文件名回退)
+        probe = slot.get("probe")
+        if not isinstance(probe, str) or not probe:
+            return None
+        probe_p = Path(probe)
+        if not probe_p.is_file():
+            return None
+        probe_sha = slot.get("probe_sha256")
+        if not isinstance(probe_sha, str) or sha256_file(probe_p) != probe_sha:
+            return None
+        # receipt.test_target_sha256 == slot.probe_sha256(同 probe 绑定)
+        if probe_sha256 is not None and probe_sha != probe_sha256:
+            return None
+        # 双日志按 sha256 定位(hash-bound),目录内逐文件匹配
+        if log_dir is None or not log_dir.is_dir():
+            return None
+        base_log = head_log = None
+        for cand in sorted(log_dir.glob("*.log")):
+            digest = sha256_file(cand)
+            # 两个独立匹配: 两次真实独立执行完全可能输出相同字节
+            # (BASE/HEAD 日志 SHA 相等是合法形态,不得因 elif 只赋
+            # base_log 而把 head_log 永远留 None)。任何一门都不放宽。
+            if digest == slot["base_log_sha256"]:
+                base_log = cand
+            if digest == slot["head_log_sha256"]:
+                head_log = cand
+        if base_log is None or head_log is None:
+            return None
+        # hash-bound 日志必须真实包含该 qualified 测试的失败锚(非编译失败):
+        # `test <qualified> ... FAILED` 行 + `test result: FAILED.` 汇总才
+        # 证明"该 probe 在该侧真实执行失败"。禁止 probe 文件名 stem 模糊匹配,
+        # 禁止日志内任一 FAILED 匹配——必须锚到本 selector 的 qualified 名。
+        try:
+            base_text = base_log.read_text(encoding="utf-8", errors="replace")
+            head_text = head_log.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        if not isinstance(qualified_selector, str) or not qualified_selector:
+            return None
+        for text, exit_code in ((base_text, slot["base_exit"]), (head_text, slot["head_exit"])):
+            statuses = _test_statuses(text, qualified_selector)
+            if (
+                "FAILED" not in statuses
+                or "ok" in statuses
+                or not _FAIL_SUMMARY_RE.search(text)
+            ):
+                return None
+            if exit_code == 0:
+                return None
+        return {
+            "base_exit": slot["base_exit"],
+            "head_exit": slot["head_exit"],
+            "pr_head": pr_head,
+            "probe": probe,
+            "probe_sha256": probe_sha,
+            "classification": str(slot.get("classification", "")),
+            "base_log": str(base_log),
+            "head_log": str(head_log),
+        }
+    except (OSError, ValueError, AttributeError, TypeError):
+        # 任何证据读取异常都按缺证据处理(fail-closed),绝不崩溃
+        return None
+
+
+def _verify_product_receipt(
+    r: dict, manifest_head: str | None
+) -> tuple[dict | None, str | None]:
+    """逐条校验 per-selector 产品裁决记录: receipt 在场且与 summary 一致。
+
+    返回 (verified, harness_reason): verified 为 dict 时该记录可信
+    (observed=pass → pass 记录;observed=fail → 产品失败记录)。
+    - receipt_kind 必须**精确** `cargo-test-execution`(外来/伪造收据拒);
+    - receipt.selector == summary.selector;matched_tests 的末段必须含
+      selector(qualified selector 绑定实际 probe);
+    - receipt.head_before == summary.head == head_after == MANIFEST 该 PR
+      head(三方 HEAD 绑定);
+    - observed 一致(fail/pass);fail 时 exit_code == summary.cargo_exit ≠ 0;
+    - stdout/stderr 工件路径在场且 sha256 与 receipt 声明相符;
+    - 任一不符 → harness 证据错误(missing/foreign/mismatched 一律
+      blocked/unassessed,不得继承 existing/residual;不静默弱化 pass)。
+    """
+    sel = r.get("selector")
+    head = r.get("head")
+    cargo_exit = r.get("cargo_exit")
+    observed = r.get("observed")
+    receipt_path = r.get("receipt")
+    if not isinstance(sel, str) or not sel:
+        return None, "summary-selector-missing"
+    if not isinstance(receipt_path, str) or not receipt_path:
+        return None, f"{sel}:summary-receipt-path-missing"
+    rp = Path(receipt_path)
+    if not rp.is_file():
+        return None, f"{sel}:receipt-file-missing"
+    try:
+        rc = json.loads(rp.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, f"{sel}:receipt-unreadable"
+    if not isinstance(rc, dict):
+        return None, f"{sel}:receipt-not-object"
+    if rc.get("receipt_kind") != "cargo-test-execution":
+        return None, f"{sel}:receipt-kind-not-cargo-test-execution({rc.get('receipt_kind')!r})"
+    if rc.get("selector") != sel:
+        return None, f"{sel}:receipt-selector-mismatch({rc.get('selector')!r})"
+    matched = rc.get("matched_tests")
+    if not isinstance(matched, list) or not matched:
+        return None, f"{sel}:receipt-matched-tests-missing"
+    if not any(
+        isinstance(mt, str) and (mt == sel or mt.rsplit("::", 1)[-1] == sel)
+        for mt in matched
+    ):
+        return None, f"{sel}:receipt-matched-tests-not-selector"
+    if observed not in ("pass", "fail"):
+        return None, f"{sel}:summary-observed-invalid({observed!r})"
+    if rc.get("observed") != observed:
+        return None, f"{sel}:receipt-observed-mismatch({rc.get('observed')!r})"
+    if not isinstance(head, str) or not head:
+        return None, f"{sel}:summary-head-missing"
+    if rc.get("head_before") != head or rc.get("head_after") != head:
+        return None, f"{sel}:receipt-head-mismatch"
+    if manifest_head is not None and head != manifest_head:
+        return None, f"{sel}:summary-head-not-manifest({head[:8]}!={manifest_head[:8]})"
+    if observed == "fail":
+        if not isinstance(cargo_exit, int) or cargo_exit == 0:
+            return None, f"{sel}:summary-fail-with-zero-exit"
+        if rc.get("exit_code") != cargo_exit:
+            return None, f"{sel}:receipt-exit-mismatch"
+    else:
+        if rc.get("exit_code") != 0:
+            return None, f"{sel}:receipt-pass-with-nonzero-exit"
+    # stdout/stderr 工件在场 + hash 绑定
+    artifacts = rc.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return None, f"{sel}:receipt-artifacts-missing"
+    for key in ("stdout", "stderr"):
+        art = artifacts.get(key)
+        if not isinstance(art, str) or not art:
+            return None, f"{sel}:receipt-artifact-{key}-missing"
+        ap = Path(art)
+        if not ap.is_file():
+            return None, f"{sel}:receipt-artifact-{key}-file-missing"
+        declared = rc.get(f"{key}_sha256")
+        if not isinstance(declared, str) or sha256_file(ap) != declared:
+            return None, f"{sel}:receipt-artifact-{key}-hash-mismatch"
+    # 产品终态不信 summary/receipt 自报: 核 stdout 实际内容,复用 adapter
+    # 终态判定语义(olp-review-evidence-cargo.py)。pass 需该 qualified test
+    # 的 `... ok` 行 + `test result: ok.` 汇总 + exit 0;fail 需 `... FAILED`
+    # 行 + `test result: FAILED.` 汇总 + exit != 0。真 FAILED stdout 改标
+    # pass/exit0 → harness 证据错误(blocked/unassessed),不得当 pass。
+    qualified = rc.get("selector_qualified")
+    if not isinstance(qualified, str) or not qualified:
+        matched_q = [mt for mt in matched if isinstance(mt, str)]
+        qualified = matched_q[0] if len(matched_q) == 1 else None
+    if not qualified:
+        return None, f"{sel}:receipt-qualified-selector-missing"
+    try:
+        stdout_text = Path(artifacts["stdout"]).read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return None, f"{sel}:receipt-artifact-stdout-unreadable"
+    statuses = _test_statuses(stdout_text, qualified)
+    if observed == "pass":
+        if not (
+            "ok" in statuses
+            and "FAILED" not in statuses
+            and _PASS_SUMMARY_RE.search(stdout_text)
+        ):
+            return None, f"{sel}:receipt-pass-claim-contradicted-by-stdout"
+    else:
+        if not (
+            "FAILED" in statuses
+            and "ok" not in statuses
+            and _FAIL_SUMMARY_RE.search(stdout_text)
+        ):
+            return None, f"{sel}:receipt-fail-claim-contradicted-by-stdout"
+    verified = {
+        "selector": sel,
+        "observed": observed,
+        "adapter_exit": r.get("adapter_exit"),
+        "cargo_exit": cargo_exit if observed == "fail" else 0,
+        "receipt": receipt_path,
+        "receipt_selector_qualified": qualified,
+        "receipt_matched_tests": matched,
+        "receipt_test_target_sha256": rc.get("test_target_sha256"),
+    }
+    return verified, None
+
+
+def _slot_probes_selector(slot: dict, slot_log_dir: Path | None) -> list[str]:
+    """解析 slot probe 源文件实际包含的测试函数名(same probe 判定锚)。
+
+    probe 文件(.rs)内 `fn <name>(` 形态的测试名列表。**probe 文件必须
+    在场**(slot 核验已做 probe_sha256 绑定;此处只读该文件)——文件
+    缺失时返回空(无文件名回退,same probe 无法证明 → unassessed)。"""
+    probe = slot.get("probe")
+    if not isinstance(probe, str) or not probe:
+        return []
+    p = Path(probe)
+    if not p.is_file():
+        # 无路径名回退: probe 源不在场 = 无法解析 same-probe 函数名
+        return []
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    names = re.findall(r"\bfn\s+([A-Za-z0-9_]+)\s*\(", text)
+    return names
+
+
+def _qualified_selector_from(
+    slot: dict, selector: str, receipt_selector_qualified: str | None
+) -> str | None:
+    """same-probe 判定锚: receipt.selector_qualified 精确 qualified 测试名。
+
+    优先使用 receipt 的 selector_qualified(qualified selector 绑定实际
+    probe);仅当其末段确实等于本 selector 时采用。缺失时回退到唯一
+    fn 名 == selector 的 probe 源声明(probe 已经 sha256 绑定);仍无法
+    确定 → None(same probe 无法证明 → unassessed,不用文件名回退)。"""
+    if isinstance(receipt_selector_qualified, str) and receipt_selector_qualified:
+        if receipt_selector_qualified.rsplit("::", 1)[-1] == selector:
+            return receipt_selector_qualified
+        return None
+    fns = _slot_probes_selector(slot, None)
+    if selector in fns:
+        return selector
+    return None
+
+
+def _slot_proves_existing_for_selector(
+    slot: dict,
+    slot_log_dir: Path | None,
+    selector: str,
+    receipt_matched_tests: list | None,
+) -> bool:
+    """slot 双执行证据是否**精确匹配该 selector**(same probe)。
+
+    禁止按 exit_code 相等或"任一 head 匹配"把 slot 的 existing 证据推广
+    到整 PR: 只有 slot probe 源文件声明的测试函数(fn 名)与该失败
+    selector 同名(或 receipt matched_tests 含之)时才可归 existing。
+    """
+    if not selector:
+        return False
+    probe_fns = set(_slot_probes_selector(slot, slot_log_dir))
+    if selector in probe_fns:
+        return True
+    if isinstance(receipt_matched_tests, list):
+        for mt in receipt_matched_tests:
+            if isinstance(mt, str) and (
+                mt == selector or mt.rsplit("::", 1)[-1] == selector
+            ) and mt.rsplit("::", 1)[-1] in probe_fns:
+                return True
+    return False
+
+
+def aggregate_pr_classification(
+    manifest_path: Path,
+    replay_summary_path: Path,
+    slot_path: Path | None,
+    slot_log_dir: Path | None,
+) -> dict:
+    """通用 PR 级聚合。遍历 MANIFEST prs,消费 replay per-selector 裁决与
+    (如在场)BASE/HEAD 双执行 slot;不出现任何 PR 编号条件分支。"""
+    manifest = _load_json_file(manifest_path, "classify-manifest-invalid")
+    prs = manifest.get("prs")
+    if not isinstance(prs, dict) or not prs:
+        raise fail("classify-manifest-invalid", "MANIFEST 缺 prs 对象")
+    replay = _load_json_file(replay_summary_path, "classify-replay-invalid")
+    results = replay.get("results")
+    if not isinstance(results, list) or not results:
+        raise fail("classify-replay-invalid", "replay summary 缺 results 数组")
+
+    # MANIFEST 每条 PR 的 head/base 声明(receipt 三方 HEAD 绑定 + slot
+    # pr_head/base 逐 PR 精确绑定的锚)
+    manifest_heads: dict[str, str] = {}
+    manifest_bases: dict[str, str] = {}
+    for pr_key, meta in prs.items():
+        if isinstance(meta, dict) and isinstance(meta.get("head"), str) and meta["head"]:
+            manifest_heads[pr_key] = meta["head"]
+        if isinstance(meta, dict) and isinstance(meta.get("base"), str) and meta["base"]:
+            manifest_bases[pr_key] = meta["base"]
+
+    # slot 原始 JSON 只在文件在场时读取一次;**核验逐 PR 逐失败 selector
+    # 进行**(pr_head 必须等于本 PR 的 MANIFEST head,而非任一 MANIFEST
+    # head),不在循环外做"任一 head 匹配"的预核验。
+    slot_raw: dict | None = None
+    if slot_path is not None and slot_path.is_file():
+        slot_raw = _load_json_file(slot_path, "classify-slot-invalid")
+
+    # per-selector 索引: pr 字符串键 → [产品裁决记录]
+    by_pr: dict[str, list[dict]] = {}
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        pr_key = str(r.get("pr", ""))
+        if not pr_key:
+            continue
+        by_pr.setdefault(pr_key, []).append(r)
+
+    pr_classes: dict[str, dict] = {}
+    for pr_key, meta in prs.items():
+        if not isinstance(meta, dict):
+            continue
+        selectors = by_pr.get(pr_key, [])
+        product_fails: list[dict] = []
+        harness_faults: list[dict] = []
+        all_pass = bool(selectors)
+        for r in selectors:
+            observed = r.get("observed")
+            adapter_exit = r.get("adapter_exit")
+            cargo_exit = r.get("cargo_exit")
+            verified, harness_reason = _verify_product_receipt(
+                r, manifest_heads.get(pr_key)
+            )
+            if (
+                verified is not None
+                and observed == "fail"
+                and adapter_exit == 0
+                and isinstance(cargo_exit, int)
+                and cargo_exit != 0
+            ):
+                product_fails.append(verified)
+            elif observed == "pass" and verified is not None:
+                continue
+            else:
+                # harness 侧故障(adapter 未跑完/收据缺失/不一致/外来伪装)
+                # ≠ 产品失败;missing/foreign/mismatched 归 harness 证据错误,
+                # 该 PR 保守 blocked/unassessed。
+                harness_faults.append({
+                    "selector": r.get("selector"),
+                    "observed": observed,
+                    "adapter_exit": adapter_exit,
+                    "cargo_exit": cargo_exit,
+                    "reason": harness_reason or "summary-fields-invalid",
+                })
+                all_pass = False
+        if not selectors or harness_faults:
+            all_pass = False
+
+        intro = "unassessed"
+        slot_bound = None
+        # 双执行对照只证明 slot 声明的 same probe,且**逐失败 selector 逐 PR
+        # 精确绑定**重新核验:slot.pr_head 必须等于**本 PR** 的 MANIFEST head
+        # (不是任一 MANIFEST head),slot.base 若声明须等于本 PR MANIFEST
+        # base(外来 → None),receipt.test_target_sha256 == slot.probe_sha256,
+        # 且 hash-bound base/head 日志含该 selector 的 qualified 测试确切
+        # FAILED 锚。禁止按 exit_code 相等或任一 head 匹配把 existing
+        # 推广到整 PR 其他 selector。PR 归 existing/residual 当且仅当全部
+        # 失败 selector 都被同一 slot 的 same-probe 双执行覆盖。
+        if product_fails and slot_raw is not None:
+            covered_slots: list[dict | None] = []
+            for f in product_fails:
+                qualified = _qualified_selector_from(
+                    slot_raw,
+                    f["selector"],
+                    f.get("receipt_selector_qualified"),
+                )
+                if not qualified:
+                    covered_slots.append(None)
+                    continue
+                verified_slot = _verify_slot_evidence(
+                    slot_raw,
+                    slot_log_dir or (slot_path.parent if slot_path else None),
+                    {pr_key: manifest_heads.get(pr_key)},
+                    {pr_key: manifest_bases.get(pr_key)},
+                    qualified,
+                    f.get("receipt_test_target_sha256"),
+                )
+                if (
+                    verified_slot is not None
+                    and verified_slot["base_exit"] != 0
+                    and verified_slot["head_exit"] != 0
+                    and "existing" in verified_slot["classification"]
+                ):
+                    covered_slots.append(verified_slot)
+                else:
+                    covered_slots.append(None)
+            covered = [s is not None for s in covered_slots]
+            if all(covered):
+                slot0 = covered_slots[0]
+                intro = "existing"
+                slot_bound = {
+                    "pr_head": slot0["pr_head"],
+                    "probe": slot0["probe"],
+                    "base_exit": slot0["base_exit"],
+                    "head_exit": slot0["head_exit"],
+                    "classification": slot0["classification"],
+                    "base_log": slot0["base_log"],
+                    "head_log": slot0["head_log"],
+                    "covered_selectors": [
+                        f["selector"] for f, c in zip(product_fails, covered) if c
+                    ],
+                }
+            elif any(covered):
+                # 部分覆盖: 已覆盖 selector 可记 existing 证据,但 PR 整体
+                # 不可归 residual(存在无 same-probe 证据的失败)→ blocked。
+                slot0 = next(s for s in covered_slots if s is not None)
+                slot_bound = {
+                    "pr_head": slot0["pr_head"],
+                    "probe": slot0["probe"],
+                    "base_exit": slot0["base_exit"],
+                    "head_exit": slot0["head_exit"],
+                    "classification": slot0["classification"],
+                    "base_log": slot0["base_log"],
+                    "head_log": slot0["head_log"],
+                    "covered_selectors": [
+                        f["selector"] for f, c in zip(product_fails, covered) if c
+                    ],
+                    "partial": True,
+                }
+
+        if product_fails or harness_faults:
+            # 反例/证据故障成立: 只有(全部失败 selector 均被 slot same-probe
+            # 双执行覆盖且非 partial)且无 harness 证据错误才 residual;
+            # 否则 blocked(缺失/foreign/mismatched 收据不得继承 existing)。
+            if (
+                slot_bound is not None
+                and not slot_bound.get("partial")
+                and intro == "existing"
+                and not harness_faults
+            ):
+                pr_state = "residual"
+            else:
+                pr_state = "blocked"
+                if harness_faults and intro == "existing":
+                    # 有 harness 证据错误时 existing 不可采信 → 保守降级
+                    intro = "unassessed"
+        elif all_pass:
+            pr_state = "clean"
+        else:
+            pr_state = "blocked"
+
+        # introduced_vs_existing 只能从真实 same-probe 双执行对照派生。
+        # 当前生产仅支持"双 FAIL 形态同构 → existing"这一种对照模式;
+        # "BASE PASS + HEAD FAIL → introduced"是冻结词表中的保留语义,
+        # **尚未有对应的双执行证据模式支撑,不会产出**——缺证据一律
+        # unassessed。frozen spec L70-72: unassessed 一律不得 clean
+        # (无例外): 全 pass 但缺必需对照证据同样 blocked,直到真实
+        # same-probe BASE/HEAD 对照允许更强分类;不发明诊断。
+        if intro == "unassessed" and pr_state == "clean":
+            pr_state = "blocked"
+
+        pr_classes[pr_key] = {
+            "classification": pr_state,
+            "introduced_vs_existing": intro,
+            "outer_recommendation": meta.get("outer_recommendation"),
+            "product_fail_selectors": [f["selector"] for f in product_fails],
+            "harness_fault_selectors": [h["selector"] for h in harness_faults],
+            "dual_execution_evidence": slot_bound,
+            "recommendation_aligned": (
+                (pr_state == "clean")
+                == (meta.get("outer_recommendation") == "approve")
+                if isinstance(meta.get("outer_recommendation"), str) and meta["outer_recommendation"]
+                else None
+            ),
+        }
+
+    return {
+        "protocol": PROTOCOL,
+        "aggregation": "pr-classification",
+        "manifest": str(manifest_path),
+        "replay_summary": str(replay_summary_path),
+        "slot": (str(slot_path) if slot_path else None),
+        "prs": pr_classes,
+    }
+
+
+def cmd_classify(args: argparse.Namespace) -> None:
+    manifest_path = Path(args.manifest)
+    if not manifest_path.is_file():
+        raise fail("classify-manifest-invalid", f"MANIFEST 不存在: {manifest_path}")
+    replay_path = Path(args.replay_summary)
+    if not replay_path.is_file():
+        raise fail("classify-replay-invalid", f"replay summary 不存在: {replay_path}")
+    slot_path = Path(args.slot) if getattr(args, "slot", None) else None
+    slot_log_dir = Path(args.slot_log_dir) if getattr(args, "slot_log_dir", None) else None
+    emit_json(aggregate_pr_classification(manifest_path, replay_path, slot_path, slot_log_dir))
+
+
 def build_status(state: dict) -> dict:
     verdicts = {k: dict(v) for k, v in (state.get("verdicts") or {}).items()}
     # 两模型一致不能替代行为实验: 无本入口执行依据的 approve 逐 claim
@@ -1357,6 +2041,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("status")
     common(sp)
     sp.set_defaults(func=cmd_status)
+
+    cp = sub.add_parser("classify")
+    cp.add_argument("--manifest", required=True,
+                    help="外层 MANIFEST.json(分类意图 outer_recommendation)")
+    cp.add_argument("--replay-summary", required=True,
+                    help="生产 adapter 重放 summary(per-selector observed/exit)")
+    cp.add_argument("--slot", default=None,
+                    help="BASE/HEAD 双执行 slot 收据(存在才可能 existing/residual)")
+    cp.add_argument("--slot-log-dir", dest="slot_log_dir", default=None,
+                    help="slot 双日志目录(sha256 逐字节核验)")
+    cp.set_defaults(func=cmd_classify)
     return p
 
 
