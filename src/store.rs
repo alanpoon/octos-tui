@@ -10400,15 +10400,29 @@ impl Store {
         session: &SessionKey,
         turn: TurnId,
     ) -> Option<AppUiCommand> {
+        // The stale reply answers the in-flight hydrate (dispatch is deduped
+        // per session, so at most one is outstanding), but this branch
+        // early-returns before `apply_session_hydrate_result` clears its
+        // marker — release it here. While it stays armed, the refresh below
+        // (and every later hydrate on this connection) is dedup-rejected and
+        // the session strands until an unrelated path clears the set.
+        self.state.hydrate_in_flight.remove(session);
         let command = self.hydrate_session_state_command(session)?;
         let epoch = self.state.connection_epoch;
         self.state
             .stale_hydrate_refreshes
             .retain(|(_, _, recorded_epoch)| *recorded_epoch == epoch);
-        self.state
+        if !self
+            .state
             .stale_hydrate_refreshes
             .insert((session.clone(), turn, epoch))
-            .then_some(command)
+        {
+            // The once-guard already fired for this turn: drop the duplicate
+            // refresh and the marker it just armed.
+            self.state.hydrate_in_flight.remove(session);
+            return None;
+        }
+        Some(command)
     }
 
     fn apply_session_hydrate_result(
@@ -43867,6 +43881,77 @@ now analyzing the bus module"
             "Fresh canonical answer."
         );
         assert_eq!(store.state.sessions[0].messages[0].media, ["answer.png"]);
+    }
+
+    #[test]
+    fn stale_hydrate_reply_after_dispatch_releases_in_flight_marker() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(hydrate_capabilities());
+        let session = store.state.sessions[0].id.clone();
+        let turn = TurnId::new();
+        for (seq, payload) in [
+            PayloadV2::UserMessage {
+                text: "actual prompt".into(),
+                files: Vec::new(),
+            },
+            PayloadV2::AssistantPersisted {
+                text: "Actual completed answer.".into(),
+                assistant_segment_id: "segment-1".into(),
+                meta: octos_core::ui_protocol::MessageMeta {
+                    message_id: "actual-message".into(),
+                    persisted_at: chrono::Utc::now(),
+                    media: Vec::new(),
+                },
+            },
+            PayloadV2::TurnTerminal {
+                outcome: octos_core::ui_protocol::TurnTerminalOutcome::Completed,
+                error: None,
+                token_usage: None,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+                session.clone(),
+                seq as u64 + 1,
+                &turn.0.to_string(),
+                payload,
+            )));
+        }
+        // Production order: a hydrate is dispatched first (resume, open,
+        // phantom probe), arming the in-flight marker that dedupes every
+        // later producer — the test above applies the reply directly and
+        // never exercises this ordering.
+        let dispatched = store.hydrate_session_state_command(&session);
+        assert!(matches!(dispatched, Some(AppUiCommand::HydrateSession(_))));
+        assert!(store.state.hydrate_in_flight.contains(&session));
+        let snapshot = |state: &str| {
+            serde_json::from_value(serde_json::json!({
+            "session_id": session, "cursor": {"stream": "different-noncomparable-scope", "seq": 1000},
+            "messages": [], "turns": [{"turn_id": turn, "state": state}],
+        }))
+            .unwrap()
+        };
+        // The delayed reply still calls the completed turn active: the stale
+        // branch must release the answered hydrate's marker and emit the
+        // one-shot refresh instead of being dedup-rejected by it.
+        let command = store.apply_client_event(ClientEvent::SessionHydrate(snapshot("active")));
+        assert!(matches!(command, Some(AppUiCommand::HydrateSession(_))));
+        assert!(
+            store.state.hydrate_in_flight.contains(&session),
+            "the refresh dispatch re-arms the marker"
+        );
+        assert_eq!(store.state.stale_hydrate_refreshes.len(), 1);
+        // The once-guard still holds: a second stale reply for the same turn
+        // emits nothing, and it just answered the in-flight refresh — the
+        // marker must not strand.
+        assert!(
+            store
+                .apply_client_event(ClientEvent::SessionHydrate(snapshot("active")))
+                .is_none()
+        );
+        assert!(!store.state.hydrate_in_flight.contains(&session));
     }
 
     #[test]
