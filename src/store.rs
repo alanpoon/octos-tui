@@ -951,7 +951,10 @@ impl Store {
         // Snapshot so `reject_autonomy_slash` can tell whether the rejecting
         // dispatcher actually explained itself, and never republish a stale
         // status as if it were this command's reason.
-        let status_before = self.state.status.clone();
+        // Clear before dispatch: a reason recorded by an EARLIER command must
+        // never be attributed to this one. Only what this dispatch records is
+        // eligible to be surfaced below.
+        self.state.pending_autonomy_rejection = None;
         let produced = match crate::autonomy::parse_autonomy_slash(draft) {
             Ok(Some(crate::autonomy::AutonomyCommand::Agents(cmd))) => {
                 self.dispatch_agents_command(cmd)
@@ -971,20 +974,23 @@ impl Store {
             Ok(Some(crate::autonomy::AutonomyCommand::Loop(cmd))) => {
                 self.dispatch_loop_command(cmd)
             }
+            // Bare `/turn` etc.: a parsed no-op with no reason of its own.
             Ok(None) => {
-                self.reject_autonomy_slash(draft, &status_before);
+                self.reject_autonomy_slash(draft);
                 return SlashDispatchOutcome::Rejected;
             }
+            // A parse error carries its own reason; record it explicitly
+            // rather than leaving it to be re-read off the shared status bar.
             Err(err) => {
-                self.state.status = err.to_string();
-                self.reject_autonomy_slash(draft, &status_before);
+                self.reject_with_reason(err.to_string());
+                self.reject_autonomy_slash(draft);
                 return SlashDispatchOutcome::Rejected;
             }
         };
         match produced {
             Some(command) => SlashDispatchOutcome::accepted(Some(command)),
             None => {
-                self.reject_autonomy_slash(draft, &status_before);
+                self.reject_autonomy_slash(draft);
                 SlashDispatchOutcome::Rejected
             }
         }
@@ -1004,22 +1010,48 @@ impl Store {
     /// [`Self::show_unavailable_slash_command`]) push a Warning activity
     /// for precisely this reason; autonomy dispatch now matches them.
     ///
-    /// `status_before` guards the case where a dispatcher rejected without
-    /// setting a reason: republishing whatever the bar happened to hold
-    /// would attribute an unrelated message to this command, so fall back
-    /// to the generic unavailable text instead.
-    fn reject_autonomy_slash(&mut self, draft: &str, status_before: &str) {
-        let reason = if self.state.status == status_before {
-            t!("status.command_unavailable").into_owned()
-        } else {
-            self.state.status.clone()
-        };
-        self.push_local_activity(
-            ActivityKind::Warning,
+    /// A rejection reason reaches the transcript only when the dispatcher
+    /// recorded one through [`Self::reject_with_reason`]. A path that records
+    /// nothing falls back to the generic unavailable text rather than
+    /// republishing whatever the shared status bar happens to hold, which
+    /// would attribute an unrelated message to this command.
+    fn reject_autonomy_slash(&mut self, draft: &str) {
+        let reason = self
+            .state
+            .pending_autonomy_rejection
+            .take()
+            .unwrap_or_else(|| t!("status.command_unavailable").into_owned());
+        // `Report`, not `Warning` — this is the whole of the visibility fix.
+        //
+        // `flow_activity_items` (`app.rs`) routes Warnings through the
+        // agent-task flow, which filters by the ACTIVE turn id: a turn-less
+        // local rejection is dropped outright while a turn runs, and when idle
+        // it lands inside a settled group whose children are collapsed by
+        // default (`transcript_build.rs`) — so only the group summary shows
+        // and the reason is never rendered in either state.
+        //
+        // `flow_report_items` applies neither filter: reports get their own
+        // full-fidelity block, are never grouped, and are never collapsed.
+        // That is exactly what a client-local rejection needs — it is not an
+        // agent action and belongs to no turn.
+        let mut item = ActivityItem::new(
+            ActivityKind::Report,
             t!("status.local_slash_command").into_owned(),
             reason,
-            Some(t!("status.ignored_input", draft = draft).into_owned()),
-        );
+        )
+        .with_detail(t!("status.ignored_input", draft = draft).into_owned());
+        // Ownership: scope to the session the user typed in so the report
+        // follows that session and never bleeds into another after a switch.
+        // (`flow_report_items` keeps UNSCOPED reports visible everywhere —
+        // right for a global `/loop list`, wrong for this.)
+        if let Some(session_id) = self
+            .state
+            .active_session()
+            .map(|session| session.id.clone())
+        {
+            item = item.with_session(session_id);
+        }
+        self.state.push_activity(item);
     }
 
     /// `/research` — manage the named provider lanes (`sub_providers`) that back
@@ -2015,7 +2047,9 @@ impl Store {
                     return None;
                 }
                 let Ok(task_id) = task_id.parse::<TaskId>() else {
-                    self.state.status = t!("status.invalid_task_id", id = task_id).into_owned();
+                    self.reject_with_reason(
+                        t!("status.invalid_task_id", id = task_id).into_owned(),
+                    );
                     return None;
                 };
                 let (artifact_id, path, label) = match selector {
@@ -2083,14 +2117,18 @@ impl Store {
                     {
                         Ok(turn_id) => turn_id,
                         Err(_) => {
-                            self.state.status = t!("status.invalid_turn_id", id = raw).into_owned();
+                            self.reject_with_reason(
+                                t!("status.invalid_turn_id", id = raw).into_owned(),
+                            );
                             return None;
                         }
                     },
                     None => match self.state.active_turn().map(|(_, turn_id)| turn_id.clone()) {
                         Some(turn_id) => turn_id,
                         None => {
-                            self.state.status = t!("status.no_active_turn_inspect").into_owned();
+                            self.reject_with_reason(
+                                t!("status.no_active_turn_inspect").into_owned(),
+                            );
                             return None;
                         }
                     },
@@ -2287,7 +2325,7 @@ impl Store {
             }
             AgentsCommand::Spawn { count, prompt } => {
                 if self.state.active_turn().is_some() {
-                    self.state.status = t!("status.cannot_spawn_active_turn").into_owned();
+                    self.reject_with_reason(t!("status.cannot_spawn_active_turn").into_owned());
                     return None;
                 }
                 if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_AGENT_LIST) {
@@ -2325,7 +2363,7 @@ impl Store {
             } => {
                 let objective = objective.trim().to_string();
                 if objective.is_empty() {
-                    self.state.status = t!("status.goal_objective_empty").into_owned();
+                    self.reject_with_reason(t!("status.goal_objective_empty").into_owned());
                     return None;
                 }
                 if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_SESSION_GOAL_SET)
@@ -2456,7 +2494,7 @@ impl Store {
                     LoopCadence::Every(duration) => {
                         let secs = duration.as_secs();
                         if secs == 0 {
-                            self.state.status = t!("status.loop_interval_min").into_owned();
+                            self.reject_with_reason(t!("status.loop_interval_min").into_owned());
                             return None;
                         }
                         (crate::model::LoopMode::FixedInterval, Some(secs))
@@ -5645,6 +5683,21 @@ impl Store {
         })
     }
 
+    /// Publish a rejection reason on BOTH surfaces: the status bar (where it
+    /// has always gone) and the explicit
+    /// [`AppState::pending_autonomy_rejection`] channel that
+    /// [`Self::reject_autonomy_slash`] consumes.
+    ///
+    /// The channel exists because the status bar cannot answer "did this
+    /// dispatcher set a reason?". It is shared with turn state and chrome, and
+    /// the same invalid command submitted twice writes identical text both
+    /// times — indistinguishable, by before/after comparison alone, from a
+    /// dispatcher that set nothing.
+    fn reject_with_reason(&mut self, reason: String) {
+        self.state.status = reason.clone();
+        self.state.pending_autonomy_rejection = Some(reason);
+    }
+
     fn require_appui_method(&mut self, method: &'static str) -> bool {
         if self
             .state
@@ -5654,7 +5707,9 @@ impl Store {
         {
             return true;
         }
-        self.state.status = t!("status.appui_method_not_advertised", method = method).into_owned();
+        self.reject_with_reason(
+            t!("status.appui_method_not_advertised", method = method).into_owned(),
+        );
         false
     }
 
@@ -5670,14 +5725,17 @@ impl Store {
         {
             return true;
         }
-        self.state.status =
-            t!("status.appui_feature_not_advertised", feature = feature).into_owned();
+        self.reject_with_reason(
+            t!("status.appui_feature_not_advertised", feature = feature).into_owned(),
+        );
         false
     }
 
     fn require_mutating_appui_method(&mut self, method: &'static str) -> bool {
         if self.state.readonly {
-            self.state.status = t!("status.readonly_method_disabled", method = method).into_owned();
+            self.reject_with_reason(
+                t!("status.readonly_method_disabled", method = method).into_owned(),
+            );
             return false;
         }
         self.require_appui_method(method)
@@ -40730,13 +40788,145 @@ now analyzing the bus module"
             .activity
             .last()
             .expect("rejection must surface a visible activity, not just a status line");
-        assert_eq!(activity.kind, ActivityKind::Warning);
+        // `Report`, not `Warning`: Warnings are filtered by active turn id and
+        // collapsed inside settled groups, so the reason never reached the
+        // screen in either state (outer review #628, P1).
+        assert_eq!(activity.kind, ActivityKind::Report);
         assert_eq!(activity.title, "local slash command");
         assert!(
             activity.status.contains("session/goal/operator_transition"),
-            "the visible warning must carry the dispatcher's reason: {}",
+            "the visible report must carry the dispatcher's reason: {}",
             activity.status
         );
+
+        // The model-level assertions above passed BEFORE this fix while the
+        // reason was still absent from the screen. Assert the actual render.
+        let reason = activity.status.clone();
+        store.state.status = "idle".into();
+        let rendered = crate::app::debug_render_text(&store.state);
+        assert!(
+            rendered.contains(&reason),
+            "idle transcript must render the rejection reason.\nreason={reason:?}\n{rendered}"
+        );
+    }
+
+    /// Same rejection while a turn is running. `flow_activity_items` filters
+    /// activities by the ACTIVE turn id, so the turn-less local rejection used
+    /// to be excluded outright — the state where "Enter did nothing" was most
+    /// confusing, because the screen is otherwise busy (outer review #628, P1).
+    #[test]
+    fn goal_rejection_renders_in_the_transcript_during_an_active_turn() {
+        let configured = protocol_store_with_autonomy();
+        let mut store = store_with_live_reply(TurnId::new(), "active request");
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [
+                crate::model::APPUI_METHOD_SESSION_GOAL_GET,
+                crate::model::APPUI_METHOD_SESSION_GOAL_SET,
+                crate::model::APPUI_METHOD_SESSION_GOAL_CLEAR,
+            ],
+            [crate::model::APPUI_FEATURE_CODING_AUTONOMY_V1],
+        ));
+        store.state.target = configured.state.target;
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.set_session_goal(
+            &session_id,
+            Some(goal_record("active")),
+            Some("user".into()),
+        );
+        store.state.composer = "/goal archive --reason retiring stale goal".into();
+
+        assert!(store.compose_command().is_none());
+        let reason = store
+            .state
+            .activity
+            .last()
+            .expect("a rejection report")
+            .status
+            .clone();
+        // Exclude the status bar from the assertion: the bar is exactly the
+        // surface this fix exists to stop relying on.
+        store.state.status = "working".into();
+        let rendered = crate::app::debug_render_text(&store.state);
+        assert!(
+            rendered.contains(&reason),
+            "active-turn transcript must render the rejection.\nreason={reason:?}\n{rendered}"
+        );
+    }
+
+    /// The same invalid command twice must keep its specific reason. The old
+    /// before/after status comparison read the second identical write as
+    /// "the dispatcher set nothing" and replaced the explanation with the
+    /// generic unavailable line (outer review #628, P2).
+    #[test]
+    fn repeated_goal_rejection_keeps_its_specific_reason() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/goal archive --reason".into();
+        assert!(store.compose_command().is_none());
+        let first = store
+            .state
+            .activity
+            .last()
+            .expect("first rejection report")
+            .status
+            .clone();
+
+        store.state.composer = "/goal archive --reason".into();
+        assert!(store.compose_command().is_none());
+        let second = store
+            .state
+            .activity
+            .last()
+            .expect("second rejection report")
+            .status
+            .clone();
+
+        assert_eq!(
+            second, first,
+            "a repeated rejection must keep its explanation, not degrade to the generic line"
+        );
+        assert_ne!(
+            second,
+            t!("status.command_unavailable").into_owned(),
+            "the specific parse reason must survive the repeat"
+        );
+    }
+
+    /// A rejection recorded by an EARLIER command must not be attributed to a
+    /// later one that rejects without recording a reason of its own.
+    #[test]
+    fn stale_rejection_reason_is_not_reused_by_a_later_command() {
+        let mut store = protocol_store_with_autonomy();
+        store.state.composer = "/goal archive --reason".into();
+        assert!(store.compose_command().is_none());
+        let specific = store
+            .state
+            .activity
+            .last()
+            .expect("first rejection")
+            .status
+            .clone();
+        assert!(store.state.pending_autonomy_rejection.is_none(), "consumed");
+
+        // A DIFFERENT command that rejects for its own reason must report
+        // that reason, never the previous command's.
+        store.state.composer = "/turn".into();
+        assert!(store.compose_command().is_none());
+        let second = store
+            .state
+            .activity
+            .last()
+            .expect("second rejection")
+            .status
+            .clone();
+        assert_ne!(
+            second, specific,
+            "a later rejection must not inherit the previous command's explanation"
+        );
+        assert!(
+            !second.contains("reason"),
+            "the goal parse error must not leak into the /turn rejection: {second}"
+        );
+        assert!(store.state.pending_autonomy_rejection.is_none(), "consumed");
     }
 
     /// `/goal archive` with no `--reason` still sends a non-empty reason:

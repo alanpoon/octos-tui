@@ -5016,6 +5016,20 @@ pub struct AppState {
     /// session-open hydration fires the same RPC silently; only an explicit
     /// user query may pop the loops menu when the result lands.
     pub pending_loop_list_menu: bool,
+    /// Reason recorded by the most recent autonomy-dispatch rejection.
+    ///
+    /// An EXPLICIT channel rather than inferring from `status`: that bar is a
+    /// shared surface, so "did the dispatcher set a reason?" cannot be
+    /// answered by comparing it before and after dispatch. Submitting the
+    /// same invalid command twice writes the SAME text both times, which a
+    /// before/after comparison reads as "nothing was set" — replacing a
+    /// perfectly good reason with the generic unavailable line on every
+    /// repeat.
+    ///
+    /// Set by `Store::reject_with_reason`, consumed by
+    /// `Store::reject_autonomy_slash`. A rejection path that records nothing
+    /// degrades to the generic text: less specific, never wrong.
+    pub pending_autonomy_rejection: Option<String>,
     /// Loop id the `MENU_LOOP_ACTIONS` submenu is acting on (set when a
     /// loops-list row is activated).
     pub loop_actions_target: Option<String>,
@@ -7261,6 +7275,7 @@ impl AppState {
             loop_attributed_turns: std::collections::HashSet::new(),
             pending_loop_attribution: std::collections::HashSet::new(),
             pending_loop_list_menu: false,
+            pending_autonomy_rejection: None,
             loop_actions_target: None,
             config_path: None,
             activity_navigator: ActivityNavigatorState::default(),
