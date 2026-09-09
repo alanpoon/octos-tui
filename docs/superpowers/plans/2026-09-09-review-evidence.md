@@ -21,38 +21,32 @@ Phase 5 裁决纪要: .octos/cross-design-dispositions.md(GLM/k3/外层逐条采
    - spec 16→23 场景(pending peer/native 信号否决/伪造 cargo 日志/imported not-replayed/
      errored cross/flip 回边/approve happy path/分层 fallback/unknown-lifetime/哈希 ACK)
    - 删 estimate=2d;Allowed Changes 增 plans、scripts 通配、olp_watch_board.rs 定点修复条款
-7. [ ] Phase 6 实现(master 单写,peers 只读):
-   a. fixtures/review-evidence/**: 从前轮真实证据复制 8 反例 + 元数据;
-      复制前后源目录 SHA256 复核,fixtures 自带 SHA256 清单 + provenance 头
-   b. scripts/olp-review-evidence.py(可拆 olp-review-*.py 共享 helper): freeze/challenge/cross/status 子命令
-      - freeze: 两份初审齐全+可解析+outcome 有效(外部信号: runtime-evidence active_thread、
-        native result-N.md 否决报告自报) → manifest(SHA256/HEAD/base/runtime/session/goal/peer/turn),
-        原子写入(临时文件+rename),错误输出可解析 JSON
-      - challenge: **内容校验为门+执行为本**: 结构锚(测试名行/panicked at/test result: FAILED/
-        测试名可解析 harness 源)为必要条件;执行验证由生产入口实际执行证据携带的 argv/脚本,
-        捕获退出码+stdout/stderr,绑定 HEAD/运行目录/输出摘要;imported 未独立执行 → not-replayed;
-        kind 字段仅 hint;纯构造日志 → evidence-not-executed 拒绝
-      - cross: 要求 frozen+challenged;每条判词必须有 采纳/反驳/待验证 裁决;errored/pending
-        cross 拒绝;反驳成立 → challenge-refuted 回边
-      - status: 汇总,无证据绑定的两模型一致判词 → pending-behavioral-evidence;
-        PR 级 = f(claim × severity × introduced_vs_existing),期望分类来自外层
-        MANIFEST outer_recommendation(工具聚合,禁 PR 编号硬编码)
-   c. scripts/olp-review-monitor.py: --watch 模式渲染 lifecycle/current-turn/last-outcome/deliverables
-      四区块;runtime 复合身份;last-outcome=最近终止结果(旧 completed+新 running →
-      last-outcome=completed, current-turn=running, accepted=false 分层);
-      有 authority 时优先 lifetime.json(turn_id/generation),无时 unknown;
-      fallback 按 result-N.md+turns.txt+ui-protocol thread 完成态交叉核对
-      (**禁 next_seq vs turn 数值比较**,量纲不同);inplace ACK 哈希比对观测;
-      与 olp-watch-board.sh 并行不干扰(只读板文件)
-   d. tests/olp_review_evidence.rs + tests/olp_review_monitor.rs: 每场景一个 #[test],
-      以子进程真实调用 scripts/olp-review-*.py(RED→GREEN: 先写测试跑出断言级失败,
-      编译错误不算 RED,输出存 .octos/red-proof/ 附 SHA256+HEAD 清单);
-      至少一条集成测试调用真实运行入口执行历史生产反例(harness 成功与产品测试
-      失败分别记录);前置检测 python3 在 PATH
-   e. docs/OLP_REVIEW_EVIDENCE.md: 使用手册 + 判词状态机两层词表 + PR 级聚合规则
-   f. housekeeping commit(单独,先于功能实现): tests/olp_watch_board.rs:411
-      `while !read(...).map(...).unwrap_or(false) || true` → `loop { deadline break }`
-      语义等价修复(非行为改变,保留完整等待时长与原断言),解 clippy 基线
+ 7. [~] Phase 6 实现(master 单写 evidence 侧;监控侧由 monitor-impl-k3 peer
+     独占并行 — 外层 2026-09-09 调度授权更新):
+    a. [x] fixtures/review-evidence/**: 从前轮真实证据复制 8 反例 + 元数据;
+       复制前后源目录 SHA256 复核,fixtures 自带 SHA256 清单 + provenance 头
+       (FIXTURES-SHA256.json, 60+ 文件, commit 7ceccad)
+    b. [x] scripts/olp-review-evidence.py: freeze/challenge/cross/status 子命令
+       - freeze: 两份初审齐全+可解析+outcome 有效(外部信号: runtime-evidence active_thread、
+         native result-N.md 否决报告自报)+**外部权威 fail-closed**(无 native/runtime
+         终止收据 → peer-authority-missing;收据 slug 不符 → peer-authority-mismatch)
+       - challenge: **内容校验为门+执行为本**: 结构锚必要非充分;执行验证实际执行
+         argv 捕获退出码+输出绑定测试名(/usr/bin/false 等无关命令拒绝);
+         imported → not-replayed;kind 仅 hint
+       - cross: frozen+challenged 前置;逐 claim 覆盖;errored/pending 拒绝;
+         反驳成立 → challenge-refuted 回边;cross 报告同样要求外部权威
+       - status: 无证据绑定的两模型一致 → pending-behavioral-evidence;
+         冻结后初审被删除/被改写 → first-review-tampered(fail-closed)
+    c. [~] scripts/olp-review-monitor.py + tests/olp_review_monitor.rs:
+       monitor-impl-k3 peer(strong) 独占并行实现中(外层授权),master 不互写;
+       交付后 master 统一验证(all-targets/fmt/clippy + monitor target)
+    d. [x] tests/olp_review_evidence.rs: 23 tests 全部以子进程真实调用脚本;
+       外层反例回归 4 条按"先 RED 后修"(outer-probe-red.log 2 failed →
+       outer-probe-green.log 全绿,SHA256 落盘 .octos/red-proof/);
+       真实 Store harness 集成验收(临时 clone + include! 反例源码,真实
+       cargo 执行 8 探针,28.9s,commit ee668e0);测试补写顺序如实记录
+    e. [ ] docs/OLP_REVIEW_EVIDENCE.md: 使用手册 + 判词状态机两层词表 + PR 级聚合规则
+    f. [x] housekeeping commit(a4455cf): tests/olp_watch_board.rs clippy 修复
 8. [ ] Phase 7 双 peer 独立 review(同一 peer 名续轮)→ independent-glm/k3.md → 互读 → cross-glm/k3.md
 9. [ ] Phase 8 必跑验证:
    - cargo test --all-targets -- --test-threads=8 (CARGO_BUILD_JOBS=4)
