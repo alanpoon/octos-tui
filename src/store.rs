@@ -967,6 +967,9 @@ impl Store {
             Ok(Some(crate::autonomy::AutonomyCommand::Loop(cmd))) => {
                 self.dispatch_loop_command(cmd)
             }
+            Ok(Some(crate::autonomy::AutonomyCommand::Monitor(cmd))) => {
+                self.dispatch_monitor_command(cmd)
+            }
             Ok(None) => return SlashDispatchOutcome::Rejected,
             Err(err) => {
                 self.state.status = err.to_string();
@@ -2339,6 +2342,113 @@ impl Store {
                         profile_id,
                     },
                 ))
+            }
+        }
+    }
+
+    /// `/monitor` (octos#1977) — the zero-token sibling of `/loop`.
+    ///
+    /// Same shape as [`Self::dispatch_loop_command`], minus `fire-now`: a
+    /// monitor fires when its probe emits a matching line, so there is nothing
+    /// to force.
+    fn dispatch_monitor_command(
+        &mut self,
+        cmd: crate::autonomy::MonitorCommand,
+    ) -> Option<AppUiCommand> {
+        use crate::autonomy::MonitorCommand;
+
+        // `list` is a global query and does not require an active session —
+        // same rationale as `/loop list`.
+        if matches!(cmd, MonitorCommand::List) {
+            if !self.require_appui_method(crate::model::APPUI_METHOD_MONITOR_LIST) {
+                return None;
+            }
+            self.state.status = t!("status.listing_monitors").into_owned();
+            self.state.pending_monitor_list_menu = true;
+            let session_id = self.active_session().map(|session| session.id.clone());
+            // Without a session the server would fall back to the `main`
+            // profile and filter out every monitor under the user's actual
+            // one — the `loop/list` global-decode bug, same fix.
+            let profile_id = self
+                .active_session_profile_id()
+                .or_else(|| self.state.onboarding.launch_profile_id.clone());
+            return Some(AppUiCommand::ListMonitors(
+                crate::model::MonitorListParams {
+                    session_id,
+                    profile_id,
+                },
+            ));
+        }
+
+        let session_id = self.active_autonomy_session_id()?;
+        let profile_id = self.active_session_profile_id();
+        match cmd {
+            MonitorCommand::List => None,
+            MonitorCommand::Create {
+                name,
+                argv,
+                mode,
+                filter_regex,
+                interval,
+            } => {
+                if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_MONITOR_CREATE) {
+                    return None;
+                }
+                // octos clamps to MONITOR_MIN_POLL_INTERVAL_SECS; reject here
+                // too so `every 0s` fails at the keystroke rather than arming
+                // a busy-loop the server then silently rewrites.
+                let interval_seconds = match interval.map(|d| d.as_secs()) {
+                    Some(0) => {
+                        self.state.status = t!("status.monitor_interval_min").into_owned();
+                        return None;
+                    }
+                    other => other,
+                };
+                self.state.status = t!("status.creating_monitor", name = name.clone()).into_owned();
+                Some(AppUiCommand::CreateMonitor(
+                    crate::model::MonitorCreateParams {
+                        session_id,
+                        profile_id,
+                        name,
+                        argv,
+                        filter_regex,
+                        mode: mode.map(|mode| mode.as_wire().to_string()),
+                        interval_seconds,
+                    },
+                ))
+            }
+            MonitorCommand::Pause(monitor_id) => {
+                if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_MONITOR_PAUSE) {
+                    return None;
+                }
+                self.state.status =
+                    t!("status.pausing_monitor", id = monitor_id.clone()).into_owned();
+                Some(AppUiCommand::PauseMonitor(crate::model::MonitorIdParams {
+                    monitor_id,
+                    session_id: Some(session_id),
+                }))
+            }
+            MonitorCommand::Resume(monitor_id) => {
+                if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_MONITOR_RESUME) {
+                    return None;
+                }
+                self.state.status =
+                    t!("status.resuming_monitor", id = monitor_id.clone()).into_owned();
+                Some(AppUiCommand::ResumeMonitor(crate::model::MonitorIdParams {
+                    monitor_id,
+                    session_id: Some(session_id),
+                }))
+            }
+            MonitorCommand::Delete(monitor_id) => {
+                if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_MONITOR_DELETE) {
+                    return None;
+                }
+                self.state.status =
+                    t!("status.deleting_monitor", id = monitor_id.clone()).into_owned();
+                Some(AppUiCommand::DeleteMonitor(crate::model::MonitorIdParams {
+                    monitor_id,
+                    session_id: Some(session_id),
+                }))
             }
         }
     }
@@ -8940,6 +9050,139 @@ impl Store {
                 self.state.status = t!(
                     "status.loop_mutation",
                     id = loop_id,
+                    verb = verb,
+                    outcome = outcome
+                )
+                .into_owned();
+            }
+            AutonomyResult::MonitorCreate(result) => {
+                let monitor = result.monitor_state;
+                let name = monitor.name.clone();
+                let monitor_id = monitor.monitor_id.clone();
+                // Prefer the record's own session over the echoed one: a
+                // create scopes to the session that armed it, and the echo is
+                // optional on the wire.
+                let session_id = result
+                    .session_id
+                    .unwrap_or_else(|| monitor.session_id.clone());
+                self.state.upsert_session_monitor(&session_id, monitor);
+                self.state.status =
+                    t!("status.monitor_created", id = monitor_id, name = name).into_owned();
+            }
+            AutonomyResult::MonitorList(result) => {
+                let block = crate::app::format_monitor_list_block(
+                    &result.monitors,
+                    result.session_id.is_none(),
+                );
+                // Same scoped/global split as `loop/list`: a scoped query is
+                // authoritative for its one session; a global query is
+                // authoritative only for the profile the server RESOLVED, so
+                // clear exactly those mirrors and regroup by owning session.
+                let count = match result.session_id.as_ref() {
+                    Some(session_id) => {
+                        self.state.set_session_monitors(session_id, result.monitors)
+                    }
+                    None => {
+                        if let Some(scope) = result.profile_id.as_deref() {
+                            for entry in self.state.session_autonomy.iter_mut() {
+                                if entry.session_id.profile_id() == Some(scope) {
+                                    entry.monitors.clear();
+                                }
+                            }
+                        }
+                        let mut grouped: std::collections::HashMap<
+                            SessionKey,
+                            Vec<octos_core::ui_protocol::UiMonitorRecord>,
+                        > = std::collections::HashMap::new();
+                        for record in result.monitors {
+                            grouped
+                                .entry(record.session_id.clone())
+                                .or_default()
+                                .push(record);
+                        }
+                        grouped
+                            .into_iter()
+                            .map(|(session_id, monitors)| {
+                                self.state.set_session_monitors(&session_id, monitors)
+                            })
+                            .sum()
+                    }
+                };
+                let user_requested = std::mem::take(&mut self.state.pending_monitor_list_menu);
+                self.state.status = t!("status.monitor_list_refreshed", count = count).into_owned();
+                // Unlike `/loop list`, BOTH scoped and global queries render
+                // the transcript block. Loops can send a scoped query to their
+                // live menu instead; monitors have no menu yet, and a bare
+                // status count would leave monitor ids unobtainable — which
+                // makes every id-taking verb (`pause`/`resume`/`delete`)
+                // unusable, the exact failure the loop-list transcript block
+                // exists to prevent. Hydration (user_requested=false) stays
+                // silent either way.
+                if !user_requested {
+                    return None;
+                }
+                let title = t!("status.monitor_list_title").into_owned();
+                // One pinned snapshot, never a log — same rule as loops.
+                self.state
+                    .activity
+                    .retain(|item| !(item.kind == ActivityKind::Report && item.title == title));
+                self.state.push_activity(
+                    ActivityItem::new(
+                        ActivityKind::Report,
+                        title,
+                        t!("status.monitor_list_refreshed", count = count).into_owned(),
+                    )
+                    .with_detail(block),
+                );
+            }
+            AutonomyResult::MonitorMutation { method, result } => {
+                let monitor_id = result
+                    .monitor_id
+                    .clone()
+                    .or_else(|| {
+                        result
+                            .monitor_state
+                            .as_ref()
+                            .map(|monitor| monitor.monitor_id.clone())
+                    })
+                    .unwrap_or_default();
+                let session_id = result.session_id.clone().or_else(|| {
+                    result
+                        .monitor_state
+                        .as_ref()
+                        .map(|monitor| monitor.session_id.clone())
+                });
+                // `ok` is optional on this wire shape; absent means the server
+                // answered without a verdict, which is only ever sent on
+                // success (an error would be a JSON-RPC error frame).
+                let ok = result.ok.unwrap_or(true);
+                if let Some(session_id) = session_id.as_ref() {
+                    // Mirror the loop rule: only a SUCCESSFUL delete removes
+                    // the entry, so a denied delete cannot hide a live monitor
+                    // until the next hydration.
+                    if ok
+                        && (method == crate::model::APPUI_METHOD_MONITOR_DELETE
+                            || result.deleted == Some(true))
+                    {
+                        self.state.remove_session_monitor(session_id, &monitor_id);
+                    } else if let Some(monitor) = result.monitor_state {
+                        self.state.upsert_session_monitor(session_id, monitor);
+                    }
+                }
+                let verb = match method.as_str() {
+                    "monitor/pause" => "pause",
+                    "monitor/resume" => "resume",
+                    "monitor/delete" => "delete",
+                    _ => "mutation",
+                };
+                let outcome = if ok {
+                    t!("status.accepted")
+                } else {
+                    t!("status.rejected")
+                };
+                self.state.status = t!(
+                    "status.monitor_mutation",
+                    id = monitor_id,
                     verb = verb,
                     outcome = outcome
                 )
@@ -46185,6 +46428,186 @@ now analyzing the bus module"
             .expect("mirror");
         assert_eq!(mirror.loops.len(), 1);
         assert!(store.state.status.contains("1 loop"));
+    }
+
+    fn monitor_record(
+        id: &str,
+        session_id: &SessionKey,
+    ) -> octos_core::ui_protocol::UiMonitorRecord {
+        octos_core::ui_protocol::UiMonitorRecord {
+            monitor_id: id.into(),
+            session_id: session_id.clone(),
+            profile_id: None,
+            name: "logs".into(),
+            argv: vec!["tail".into(), "-f".into(), "app.log".into()],
+            filter_regex: Some("ERROR".into()),
+            mode: "stream".into(),
+            interval_seconds: None,
+            batch_ms: 200,
+            max_events_per_hour: 60,
+            persistent: false,
+            status: "active".into(),
+            pause_reason: None,
+            goal_id: None,
+            last_fired_at_ms: None,
+            fires_used: 0,
+            expires_at_ms: None,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        }
+    }
+
+    #[test]
+    fn autonomy_monitor_list_result_replaces_mirror_monitors() {
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::MonitorList(crate::model::MonitorListResult {
+                session_id: Some(session_id.clone()),
+                profile_id: None,
+                monitors: vec![monitor_record("mon_a", &session_id)],
+            }),
+        }));
+        let mirror = store
+            .state
+            .session_autonomy_for(&session_id)
+            .expect("mirror");
+        assert_eq!(mirror.monitors.len(), 1);
+        assert!(store.state.status.contains("1 monitor"));
+    }
+
+    /// The list must reach the TRANSCRIPT, not just a status count: every
+    /// id-taking verb needs an id, and a bare "N monitor(s)" leaves the user
+    /// unable to name one. This is the failure the loop-list block documents.
+    #[test]
+    fn user_requested_monitor_list_renders_ids_into_the_transcript() {
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        store.state.pending_monitor_list_menu = true;
+        store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::MonitorList(crate::model::MonitorListResult {
+                session_id: Some(session_id.clone()),
+                profile_id: None,
+                monitors: vec![monitor_record("mon_a", &session_id)],
+            }),
+        }));
+        let report = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.kind == ActivityKind::Report)
+            .expect("a monitor list report");
+        assert!(
+            report
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("mon_a"),
+            "report must name the id: {report:?}"
+        );
+    }
+
+    /// Hydration fires the same RPC silently; only a user-typed `/monitor
+    /// list` may write a transcript report.
+    #[test]
+    fn hydration_monitor_list_stays_out_of_the_transcript() {
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        assert!(!store.state.pending_monitor_list_menu);
+        store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::MonitorList(crate::model::MonitorListResult {
+                session_id: Some(session_id.clone()),
+                profile_id: None,
+                monitors: vec![monitor_record("mon_a", &session_id)],
+            }),
+        }));
+        assert!(
+            !store
+                .state
+                .activity
+                .iter()
+                .any(|item| item.kind == ActivityKind::Report),
+            "hydration must stay silent"
+        );
+        // The mirror still updates — silence is about the transcript only.
+        assert_eq!(
+            store
+                .state
+                .session_autonomy_for(&session_id)
+                .expect("mirror")
+                .monitors
+                .len(),
+            1
+        );
+    }
+
+    /// A REJECTED delete must not drop a live monitor from the mirror — that
+    /// would hide it until the next full hydration.
+    #[test]
+    fn rejected_monitor_delete_keeps_the_mirror_entry() {
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        store
+            .state
+            .upsert_session_monitor(&session_id, monitor_record("mon_a", &session_id));
+        store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::MonitorMutation {
+                method: crate::model::APPUI_METHOD_MONITOR_DELETE.to_string(),
+                result: crate::model::MonitorMutationResult {
+                    session_id: Some(session_id.clone()),
+                    monitor_id: Some("mon_a".into()),
+                    ok: Some(false),
+                    status: None,
+                    monitor_state: None,
+                    deleted: None,
+                },
+            },
+        }));
+        assert_eq!(
+            store
+                .state
+                .session_autonomy_for(&session_id)
+                .expect("mirror")
+                .monitors
+                .len(),
+            1,
+            "a denied delete must not remove the monitor"
+        );
+    }
+
+    #[test]
+    fn accepted_monitor_delete_removes_the_mirror_entry() {
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        store
+            .state
+            .upsert_session_monitor(&session_id, monitor_record("mon_a", &session_id));
+        store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::MonitorMutation {
+                method: crate::model::APPUI_METHOD_MONITOR_DELETE.to_string(),
+                result: crate::model::MonitorMutationResult {
+                    session_id: Some(session_id.clone()),
+                    monitor_id: Some("mon_a".into()),
+                    ok: Some(true),
+                    status: None,
+                    monitor_state: None,
+                    deleted: Some(true),
+                },
+            },
+        }));
+        assert!(
+            store
+                .state
+                .session_autonomy_for(&session_id)
+                .expect("mirror")
+                .monitors
+                .is_empty()
+        );
     }
 
     #[test]
