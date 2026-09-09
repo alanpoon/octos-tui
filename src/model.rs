@@ -668,6 +668,16 @@ pub struct PendingGoalTransition {
     pub session_id: SessionKey,
     pub profile_id: Option<String>,
     pub follow_up: PendingGoalFollowUp,
+    /// The goal this intent was AUTHORIZED against, captured from the cached
+    /// record the dispatch guard accepted. The refresh response must name the
+    /// same goal or the intent is abandoned: the backend's `goal_id` identity
+    /// check cannot catch a mismatch, because the client would be sending the
+    /// replacement's own valid id paired with an intent aimed at a different
+    /// goal. Archive is terminal at the pinned backend, so misapplying one is
+    /// irreversible.
+    pub staged_goal_id: String,
+    /// The verb the operator typed, for the abandonment message.
+    pub verb: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

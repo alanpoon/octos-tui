@@ -1609,6 +1609,8 @@ status:
   loop_list_refreshed: "循环列表已刷新：%{count} 个循环"
   loop_mutation: "循环 %{id} %{verb} %{outcome}"
   cannot_transition_no_goal: "无法转换：服务器报告无目标。"
+  goal_transition_target_changed: "已取消：准备 %{verb} 期间目标已变更。请针对当前目标重新发起。"
+  goal_transition_abandoned: "已取消：%{verb} 因目标刷新未完成而被丢弃。如仍需要请重新发起。"
   cannot_transition_goal_state: "无法在 `%{state}` 状态下转换目标（由模型管控）。"
   goal_verb_pausing: "正在暂停"
   goal_verb_resuming: "正在恢复"

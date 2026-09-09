@@ -847,6 +847,8 @@ status:
   loop_list_refreshed: "Loop list refreshed: %{count} loop(s)"
   loop_mutation: "Loop %{id} %{verb} %{outcome}"
   cannot_transition_no_goal: "Cannot transition: server reports no goal."
+  goal_transition_target_changed: "Cancelled: the goal changed while %{verb} was being prepared. Re-issue it against the current goal."
+  goal_transition_abandoned: "Cancelled: %{verb} was dropped because its goal refresh did not complete. Re-issue it if you still want it."
   cannot_transition_goal_state: "Cannot transition goal in `%{state}` state (model-owned)."
   goal_verb_pausing: "Pausing"
   goal_verb_resuming: "Resuming"
