@@ -776,6 +776,7 @@ def apply_live_verdict(state: dict, claim: str, live: dict) -> str:
         "executed": {
             "adapter": rc.get("adapter"),
             "argv": rc.get("argv"),
+            "observed": observed,
             "exit_code": rc.get("exit_code"),
             "stdout_sha256": rc.get("stdout_sha256"),
             "stderr_sha256": rc.get("stderr_sha256"),
@@ -1383,6 +1384,7 @@ def _verify_slot_evidence(
     manifest_bases: dict[str, str] | None = None,
     qualified_selector: str | None = None,
     probe_sha256: str | None = None,
+    trusted: dict | None = None,
 ) -> dict | None:
     """BASE/HEAD 双执行对照核验(sha256 逐字节),不通过 → None(unassessed)。
 
@@ -1471,6 +1473,43 @@ def _verify_slot_evidence(
                 return None
             if exit_code == 0:
                 return None
+        # Blocker1(ROOT design-review #3): BASE/HEAD 双执行证据两侧都必须
+        # 绑定到受信上下文注册的真实执行 —— slot 携带 base_receipt/
+        # head_receipt 路径,各自须: (a) provenance 命中注册(路径 canonical
+        # 相等); (b) executed.head_before == slot 对应 commit(manifest
+        # base/head 已由上方逐 PR 门锚定); (c) 同 qualified selector +
+        # test_target_sha256 == probe_sha256; (d) observed=fail 且 exit 真
+        # int 非零; (e) 其 stdout_sha256 == slot 对应 log_sha(防注册 BASE
+        # PASS/异 selector + 手写 FAIL 日志冒充)。任一不满足 → None。
+        trusted = trusted or {}
+        slot_base = slot.get("base")
+        bound: dict[str, dict] = {}
+        for side, commit, log_sha in (
+            ("base_receipt", slot_base, slot["base_log_sha256"]),
+            ("head_receipt", pr_head, slot["head_log_sha256"]),
+        ):
+            trec, _tres = _receipt_provenance_ok(slot.get(side), trusted)
+            if trec is None:
+                return None
+            ex = trec["executed"]
+            if ex.get("head_before") != commit:
+                return None
+            if qualified_selector is not None and ex.get("selector_qualified") != qualified_selector:
+                return None
+            if probe_sha256 is not None and ex.get("test_target_sha256") != probe_sha256:
+                return None
+            if ex.get("observed") != "fail":
+                return None
+            ex_exit = ex.get("exit_code")
+            if isinstance(ex_exit, bool) or not isinstance(ex_exit, int) or ex_exit == 0:
+                return None
+            if ex.get("stdout_sha256") != log_sha:
+                return None
+            bound[side] = {
+                "receipt": trec["receipt"],
+                "receipt_sha256": trec["receipt_sha256"],
+                "review_dir": trec["review_dir"],
+            }
         return {
             "base_exit": slot["base_exit"],
             "head_exit": slot["head_exit"],
@@ -1480,6 +1519,8 @@ def _verify_slot_evidence(
             "classification": str(slot.get("classification", "")),
             "base_log": str(base_log),
             "head_log": str(head_log),
+            "base_receipt": bound.get("base_receipt"),
+            "head_receipt": bound.get("head_receipt"),
         }
     except (OSError, ValueError, AttributeError, TypeError):
         # 任何证据读取异常都按缺证据处理(fail-closed),绝不崩溃
@@ -1686,9 +1727,11 @@ def aggregate_pr_classification(
     replay_summary_path: Path,
     slot_path: Path | None,
     slot_log_dir: Path | None,
+    trusted: dict | None = None,
 ) -> dict:
     """通用 PR 级聚合。遍历 MANIFEST prs,消费 replay per-selector 裁决与
     (如在场)BASE/HEAD 双执行 slot;不出现任何 PR 编号条件分支。"""
+    trusted = trusted or {}
     manifest = _load_json_file(manifest_path, "classify-manifest-invalid")
     prs = manifest.get("prs")
     if not isinstance(prs, dict) or not prs:
@@ -1740,6 +1783,12 @@ def aggregate_pr_classification(
             verified, harness_reason = _verify_product_receipt(
                 r, manifest_heads.get(pr_key)
             )
+            if verified is not None:
+                # Blocker1: receipt 来源必须命中受信上下文注册
+                trec, treason = _receipt_provenance_ok(r.get("receipt"), trusted)
+                if trec is None:
+                    verified = None
+                    harness_reason = treason or "receipt-untrusted"
             # Python bool 是 int 子类: adapter_exit/cargo_exit 必须是真
             # int —— False 冒充 0(True 冒充 1)与字段一致性相悖,拒绝。
             adapter_exit_int = (
@@ -1813,6 +1862,7 @@ def aggregate_pr_classification(
                     {pr_key: manifest_bases.get(pr_key)},
                     qualified,
                     f.get("receipt_test_target_sha256"),
+                    trusted=trusted,
                 )
                 if (
                     verified_slot is not None
@@ -1913,6 +1963,247 @@ def aggregate_pr_classification(
     }
 
 
+# ---------------------------------------------------------------------------
+# Blocker1(PR#632 human HOLD): classify 可信来源绑定(provenance)。
+# 一致性 ≠ 来源: 自洽的伪造 MANIFEST/summary/receipt/slot/日志不再可信。
+# 信任来源 = 调用方显式给出的受信评审上下文(--review-dir,可重复)中,
+# 经 challenge --live-cargo 真实落盘并 accepted 的记录(challenges[*].
+# history);不建第二注册表、不从 summary/manifest 发现目录。
+# ---------------------------------------------------------------------------
+
+
+def _load_trusted_live_records(review_dirs: list[Path]) -> dict:
+    """从显式受信评审上下文收集 accepted live 记录,按 receipt sha256 索引。
+
+    每个上下文必须: review-state.json 可解析为对象、frozen、reviews 必填
+    且嵌套形状合法、verify_no_tamper 通过、真实 repo HEAD 与 state.head
+    一致。读取在 review_lock(与 freeze/challenge/cross 同一 flock)临界
+    区内进行,防止与并发写状态竞态。记录必须 accepted==true 且 executed
+    形状完整;receipt 路径 canonical 相等且位于该上下文 live-evidence/
+    内、文件 sha256 与记录一致。任何畸形 → 结构化 JSON 错误
+    fail-closed(不扩旧 parser 范围)。
+    """
+    index: dict[str, dict] = {}
+    for rd in review_dirs:
+        if not rd.is_dir():
+            raise fail("classify-context-missing", f"受信上下文不存在: {rd}")
+        raw = (rd / STATE_FILENAME).read_text(encoding="utf-8") if (rd / STATE_FILENAME).exists() else None
+        if raw is None:
+            raise fail(
+                "classify-context-missing",
+                f"受信上下文缺 review-state.json: {rd}",
+            )
+        try:
+            state = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise fail(
+                "classify-context-invalid",
+                f"受信上下文 state 非合法 JSON: {e}: {rd}",
+            )
+        if not isinstance(state, dict):
+            raise fail(
+                "classify-context-invalid",
+                f"受信上下文 state 顶层须为对象: {rd}",
+            )
+        if state.get("frozen") is not True:
+            raise fail(
+                "classify-context-missing",
+                f"受信上下文未冻结(不可作信任来源): {rd}",
+            )
+        # 形状守卫(fail-closed,结构化 JSON): verify_no_tamper 对
+        # reviews 嵌套形状有假设,畸形输入须在此结构化拒绝而非 traceback。
+        reviews = state.get("reviews")
+        if not isinstance(reviews, dict) or not reviews:
+            raise fail(
+                "classify-context-invalid",
+                f"受信上下文 state.reviews 缺失/形状非法(须非空对象): {rd}",
+            )
+        for label, rec in reviews.items():
+            if not isinstance(label, str) or not isinstance(rec, dict):
+                raise fail(
+                    "classify-context-invalid",
+                    f"受信上下文 state.reviews[{label!r}] 形状非法(须对象): {rd}",
+                )
+            if not isinstance(rec.get("path"), str) or not rec.get("path"):
+                raise fail(
+                    "classify-context-invalid",
+                    f"受信上下文 state.reviews[{label}].path 缺失/非法: {rd}",
+                )
+            if not isinstance(rec.get("sha256"), str) or not rec.get("sha256"):
+                raise fail(
+                    "classify-context-invalid",
+                    f"受信上下文 state.reviews[{label}].sha256 缺失/非法: {rd}",
+                )
+        # 真实 repo HEAD 与 state.head 一致(bounded helper,锚定归属)
+        repo_s = state.get("repo")
+        state_head = state.get("head")
+        if not isinstance(repo_s, str) or not repo_s or not isinstance(state_head, str) or not state_head:
+            raise fail(
+                "classify-context-invalid",
+                f"受信上下文 state.repo/head 缺失/非法: {rd}",
+            )
+        try:
+            real_head = resolve_head(Path(repo_s))
+        except ReviewError:
+            raise fail(
+                "classify-context-invalid",
+                f"受信上下文 repo HEAD 不可解析: {rd}",
+            )
+        if real_head != state_head:
+            raise fail(
+                "classify-context-invalid",
+                f"受信上下文 repo 真实 HEAD 与 state.head 不符: {rd}",
+            )
+        # 注: 调用方(cmd_classify)已按稳定顺序持有全部上下文的
+        # review_lock(ExitStack 覆盖 load+aggregate);此处不再内嵌加锁,
+        # 防同一排他 flock 经不同 fd 二次获取导致自死锁。
+        try:
+            verify_no_tamper(state)
+        except ReviewError:
+            raise fail(
+                "classify-context-missing",
+                f"受信上下文 state 校验失败(tamper): {rd}",
+            )
+        chs = state.get("challenges") or {}
+        if not isinstance(chs, dict):
+            raise fail(
+                "classify-context-invalid",
+                f"受信上下文 challenges 形状非法: {rd}",
+            )
+        live_dir = (rd / "live-evidence").resolve()
+        for claim, entry in chs.items():
+            if not isinstance(claim, str) or not isinstance(entry, dict):
+                raise fail(
+                    "classify-context-invalid",
+                    f"受信上下文 challenges 条目形状非法: {rd}",
+                )
+            for rec in entry.get("history") or []:
+                if not isinstance(rec, dict) or rec.get("accepted") is not True:
+                    continue
+                ex = rec.get("executed")
+                receipt_s = rec.get("receipt")
+                sha = rec.get("receipt_sha256")
+                if (
+                    not isinstance(ex, dict)
+                    or not isinstance(receipt_s, str)
+                    or not receipt_s
+                    or not isinstance(sha, str)
+                    or not sha
+                ):
+                    raise fail(
+                        "classify-context-invalid",
+                        f"accepted live 记录形状非法: {rd}",
+                    )
+                rp = Path(receipt_s)
+                try:
+                    rp_resolved = rp.resolve()
+                except OSError:
+                    raise fail(
+                        "classify-context-invalid",
+                        f"receipt 路径不可解析: {receipt_s}",
+                    )
+                # 路径同一性: canonical 相等 + live-evidence 目录包含
+                try:
+                    rp_resolved.relative_to(live_dir)
+                except ValueError:
+                    raise fail(
+                        "classify-context-invalid",
+                        f"accepted receipt 不在受信 live-evidence 内: {receipt_s}",
+                    )
+                if not rp_resolved.is_file():
+                    raise fail(
+                        "classify-context-invalid",
+                        f"accepted receipt 文件缺失: {receipt_s}",
+                    )
+                if sha256_file(rp_resolved) != sha:
+                    raise fail(
+                        "classify-context-invalid",
+                        f"accepted receipt 与注册 sha256 不符(篡改): {receipt_s}",
+                    )
+                # 注册 receipt 的实际 head(双侧)必须等于所属上下文
+                # state.head —— 防跨上下文/跨 HEAD 注册件混入。
+                try:
+                    rc_head_obj = json.loads(rp_resolved.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    rc_head_obj = {}
+                if not isinstance(rc_head_obj, dict):
+                    rc_head_obj = {}
+                if (
+                    rc_head_obj.get("head_before") != state.get("head")
+                    or rc_head_obj.get("head_after") != state.get("head")
+                ):
+                    raise fail(
+                        "classify-context-invalid",
+                        f"accepted receipt head 与所属上下文 state.head 不符: {receipt_s}",
+                    )
+                # 受信注册件 = sha 锚定的 receipt 原件: state 快照缺字段时
+                # 以 receipt 本身为准(observed/exit/selector 等,均被
+                # sha256 完整性覆盖;防旧快照无 observed 导致注册失真)。
+                try:
+                    rc_obj = json.loads(rp_resolved.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    rc_obj = {}
+                if not isinstance(rc_obj, dict):
+                    rc_obj = {}
+                # receipt(hash 锚定原件)为基底;state 快照 ex 与 receipt 的
+                # **核心执行字段**两侧都在且不一致 → 结构化拒绝(不静默以
+                # 任一侧覆盖);legacy 记录缺字段时回退 receipt 实测值。
+                _CORE_FIELDS = (
+                    "observed", "exit_code", "selector",
+                    "selector_qualified", "test_target_sha256",
+                    "stdout_sha256", "head_before", "head_after",
+                )
+                for _f in _CORE_FIELDS:
+                    if (
+                        _f in rc_obj
+                        and rc_obj[_f] is not None
+                        and _f in ex
+                        and ex[_f] is not None
+                        and rc_obj[_f] != ex[_f]
+                    ):
+                        raise fail(
+                            "classify-context-invalid",
+                            f"accepted 记录与 receipt 核心字段 {_f} 不一致: {receipt_s}",
+                        )
+                merged_ex = {k: v for k, v in rc_obj.items()}
+                merged_ex.update({k: v for k, v in ex.items() if v is not None})
+                index[sha] = {
+                    "review_dir": str(rd),
+                    "receipt": str(rp_resolved),  # canonical(resolved)
+                    "receipt_sha256": sha,
+                    "state_head": state.get("head"),
+                    "executed": merged_ex,
+                }
+    return index
+
+
+def _receipt_provenance_ok(
+    receipt_path: str | None, trusted: dict
+) -> tuple[dict | None, str | None]:
+    """summary 记录的 receipt 是否来自受信上下文注册。
+
+    返回 (trusted_record, reason): sha256 必须命中注册索引(防外部/未注册
+    receipt),且注册路径 canonical 相等(防外部同内容副本绕过
+    live-evidence 边界)。
+    """
+    if not isinstance(receipt_path, str) or not receipt_path:
+        return None, "summary-receipt-path-missing"
+    rp = Path(receipt_path)
+    if not rp.is_file():
+        return None, "receipt-file-missing"
+    sha = sha256_file(rp)
+    rec = trusted.get(sha)
+    if rec is None:
+        return None, "receipt-not-registered-in-trusted-context"
+    try:
+        resolved = rp.resolve()
+    except OSError:
+        return None, "receipt-path-unresolvable"
+    if str(resolved) != rec["receipt"]:
+        return None, "receipt-path-not-registered-copy"
+    return rec, None
+
+
 def cmd_classify(args: argparse.Namespace) -> None:
     manifest_path = Path(args.manifest)
     if not manifest_path.is_file():
@@ -1922,7 +2213,34 @@ def cmd_classify(args: argparse.Namespace) -> None:
         raise fail("classify-replay-invalid", f"replay summary 不存在: {replay_path}")
     slot_path = Path(args.slot) if getattr(args, "slot", None) else None
     slot_log_dir = Path(args.slot_log_dir) if getattr(args, "slot_log_dir", None) else None
-    emit_json(aggregate_pr_classification(manifest_path, replay_path, slot_path, slot_log_dir))
+    # 受信上下文: canonical 去重 + 稳定排序(锁序确定,防交叉死锁);
+    # 存在性先验 —— 缺失须在 review_lock(review_lock 会 mkdir)之前失败。
+    raw_dirs = [Path(p) for p in (getattr(args, "review_dir", None) or [])]
+    canonical: list[Path] = []
+    for p in raw_dirs:
+        try:
+            rp = p.resolve()
+        except OSError:
+            raise fail("classify-context-missing", f"受信上下文路径不可解析: {p}")
+        if rp not in canonical:
+            canonical.append(rp)
+    canonical.sort(key=lambda x: str(x))
+    for rp in canonical:
+        if not rp.is_dir():
+            raise fail("classify-context-missing", f"受信上下文不存在: {rp}")
+    # ExitStack 按稳定顺序持有全部上下文的 review_lock,临界区覆盖
+    # load(_load_trusted_live_records)与 aggregate(receipt/artifact 再读)
+    # —— 与 freeze/challenge/cross 共享同一 flock 协议;loader 内部不再
+    # 加锁(防同 flock 二次排他获取自死锁)。
+    with contextlib.ExitStack() as stack:
+        for rp in canonical:
+            stack.enter_context(review_lock(rp))
+        trusted = _load_trusted_live_records(canonical)
+        emit_json(
+            aggregate_pr_classification(
+                manifest_path, replay_path, slot_path, slot_log_dir, trusted=trusted
+            )
+        )
 
 
 def build_status(state: dict) -> dict:
@@ -2072,6 +2390,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="外层 MANIFEST.json(分类意图 outer_recommendation)")
     cp.add_argument("--replay-summary", required=True,
                     help="生产 adapter 重放 summary(per-selector observed/exit)")
+    cp.add_argument("--review-dir", dest="review_dir", action="append", default=[],
+                    help="受信评审上下文(可重复): 其 accepted live receipt 才是"
+                         "分类的执行来源;至少一个,否则全部 unassessed")
     cp.add_argument("--slot", default=None,
                     help="BASE/HEAD 双执行 slot 收据(存在才可能 existing/residual)")
     cp.add_argument("--slot-log-dir", dest="slot_log_dir", default=None,

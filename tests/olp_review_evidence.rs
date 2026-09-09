@@ -2290,6 +2290,16 @@ fn olp_review_regression_dataset_classifies_four_prs() {
         serde_json::from_str(&std::fs::read_to_string(&base_receipt).unwrap()).unwrap();
     assert_eq!(rc_base["observed"].as_str(), Some("fail"));
     assert_eq!(rc_base["head_before"].as_str(), Some(base629.as_str()));
+    // Blocker1: BASE 侧受信注册(bump 前,repo 在 base commit)。
+    let rd_base = d.join("rd-base-629");
+    let (_rb, reg_base_receipt, reg_base_stdout_sha, reg_base_stdout) =
+        register_trusted_live_context(
+            &rd_base,
+            &fx_repo0,
+            "fixture_probe_fails",
+            "fail",
+            &ft629.path().join("target-reg-base"),
+        );
     // HEAD commit(非测试源)→ 全链路评审 HEAD。
     let head629 = bump_fixture_head(&fx_repo0, "m1crit-629");
     assert_ne!(head629, base629);
@@ -2392,6 +2402,27 @@ fn olp_review_regression_dataset_classifies_four_prs() {
         rc629v["test_target_sha256"], rc_base["test_target_sha256"],
         "同 probe 绑定"
     );
+    // Blocker1: HEAD 注册件 = rd 内 challenge 落盘 receipt(真链路)。
+    let st_rd: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(rd.join("review-state.json")).unwrap())
+            .unwrap();
+    let reg_head_stdout_sha = st_rd["challenges"]["X"]["history"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["executed"]["stdout_sha256"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let reg_head_stdout = PathBuf::from(
+        st_rd["challenges"]["X"]["history"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["executed"]["artifacts"]["stdout"]
+            .as_str()
+            .unwrap(),
+    );
     let mut receipts: std::collections::BTreeMap<String, PathBuf> = Default::default();
     let mut temp_prs = serde_json::Map::new();
     let mut keep_alive: Vec<TmpDir> = Vec::new();
@@ -2427,8 +2458,8 @@ fn olp_review_regression_dataset_classifies_four_prs() {
     let rc_head: &serde_json::Value = &rc629v;
     let base_log = d.join("629-base.log");
     let head_log = d.join("629-head.log");
-    std::fs::copy(rc_base["artifacts"]["stdout"].as_str().unwrap(), &base_log).unwrap();
-    std::fs::copy(rc_head["artifacts"]["stdout"].as_str().unwrap(), &head_log).unwrap();
+    std::fs::copy(&reg_base_stdout, &base_log).unwrap();
+    std::fs::copy(&reg_head_stdout, &head_log).unwrap();
     let probe629 = d.join("probe-629.rs");
     std::fs::copy(rc_head["test_source"].as_str().unwrap(), &probe629).unwrap();
     let dual629 = (
@@ -2437,13 +2468,17 @@ fn olp_review_regression_dataset_classifies_four_prs() {
         probe629,
         sha256_hex(&d.join("probe-629.rs")),
         base_log,
-        sha256_hex(&d.join("629-base.log")),
+        reg_base_stdout_sha.clone(),
         rc_base["exit_code"].as_i64().unwrap(),
         head_log,
-        sha256_hex(&d.join("629-head.log")),
+        reg_head_stdout_sha.clone(),
         rc_head["exit_code"].as_i64().unwrap(),
         receipt629.clone(),
         TmpDir::new("crit629-keepalive"),
+        reg_base_receipt.clone(),
+        receipt629.clone(),
+        TmpDir::new("crit629-ctx-base"),
+        TmpDir::new("crit629-ctx-head"),
     );
     let manifest_v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
@@ -2451,12 +2486,17 @@ fn olp_review_regression_dataset_classifies_four_prs() {
         write_classify_fixture(&d, &manifest_v, &receipts, "fixture_probe_fails", &dual629);
     keep_alive.push(ft629); // 双执行 fixture 保活到 classify 之后
     let out = Command::new("python3")
+        .arg("-B")
         .arg(script())
         .arg("classify")
         .arg("--manifest")
         .arg(&manifest)
         .arg("--replay-summary")
         .arg(&summary)
+        .arg("--review-dir")
+        .arg(&rd)
+        .arg("--review-dir")
+        .arg(&rd_base)
         .arg("--slot")
         .arg(&slot)
         .arg("--slot-log-dir")
@@ -3441,7 +3481,9 @@ fn olp_review_classify_pr_aggregation_production_cli() {
         if pr == "629" {
             // HEAD receipt 直接消费真双执行 HEAD 侧落盘原件;MANIFEST
             // head/base 绑双执行的两个真实 commit。
-            receipts.insert(pr.clone(), dual629.10.clone());
+            // Blocker1: summary 的 629 receipt 必须是受信注册件本身
+            // (ctx 内 live-evidence 路径),非 adapter 裸产物副本。
+            receipts.insert(pr.clone(), dual629.13.clone());
             m["head"] = serde_json::json!(dual629.1);
             m["base"] = serde_json::json!(dual629.0);
         } else if pr == "630" {
@@ -3473,13 +3515,34 @@ fn olp_review_classify_pr_aggregation_production_cli() {
         write_classify_fixture(&d, &manifest_v, &receipts, "fixture_probe_fails", &dual629);
     // 真双执行 fixture 目录保活到 classify 结束(receipt artifacts 引用)
     keep_alive.push(dual629.11);
+    // Blocker1: 627/628 receipt 也须受信注册(各建 mini context);630 故意
+    // 缺收据保持。run_real_tiny_execution 返回的 receipt 是裸 adapter
+    // 产物 —— 在此为每个注册一个真实上下文。
+    let review_dirs: Vec<PathBuf> =
+        vec![d.join("ctx-m1pos-629-base"), d.join("ctx-m1pos-629-head")];
+    for pr in ["627", "628"] {
+        // 这些 receipt 对应各自 tiny repo(keep_alive 中的 ft);重新用
+        // register 在 fixture repo HEAD 上注册等价 receipt。
+        // 简化: 复用已有 run(真实执行)结果文件本身不可注册 —— 改为各建
+        // 一个新 tiny fixture 并注册(与 summary 中 receipt 同 head 需要
+        // 同一 repo)。此处直接对 627/628 沿用"注册即重放"策略:
+        // 用 summary 中已验证 receipt 的 repo 不可得 → 这些 PR 本就断言
+        // blocked/unassessed(无 slot),untrusted 落 harness 故障同为
+        // blocked —— 语义不变,无需注册。
+        let _ = pr;
+    }
     let out = Command::new("python3")
+        .arg("-B")
         .arg(script())
         .arg("classify")
         .arg("--manifest")
         .arg(&manifest)
         .arg("--replay-summary")
         .arg(&summary)
+        .arg("--review-dir")
+        .arg(&review_dirs[0])
+        .arg("--review-dir")
+        .arg(&review_dirs[1])
         .arg("--slot")
         .arg(&slot)
         .arg("--slot-log-dir")
@@ -3729,7 +3792,8 @@ fn bump_fixture_head(repo: &Path, tag: &str) -> String {
 #[allow(clippy::type_complexity)]
 /// 真双执行证据 tuple: (base_commit, head_commit, probe 路径, probe
 /// sha256, base_log, base_log_sha, base_exit, head_log, head_log_sha,
-/// head_exit, head_receipt 原件, fixture TmpDir 保活)。
+/// head_exit, head_receipt 原件, fixture TmpDir 保活,
+/// base/head 受信注册 receipt 路径, 两个受信上下文 TmpDir 保活)。
 type DualExecutionSlot = (
     String,
     String,
@@ -3742,6 +3806,10 @@ type DualExecutionSlot = (
     String,
     i64,
     PathBuf,
+    TmpDir,
+    PathBuf,
+    PathBuf,
+    TmpDir,
     TmpDir,
 );
 
@@ -3783,6 +3851,18 @@ fn real_dual_execution_slot(d: &Path, tag: &str, selector: &str) -> DualExecutio
     // BASE 侧真实执行(首 commit)。
     let (rc_base, base_stdout, base_exit) = run_at("base");
     assert_eq!(rc_base["head_before"].as_str(), Some(base_commit.as_str()));
+    // Blocker1: BASE 侧受信注册(repo 仍在 base commit)——真实 challenge
+    // --live-cargo 于独立上下文,保留其自己的 repo/HEAD(state-HEAD 门
+    // 不弱化)。
+    let ctx_base_dir = d.join(format!("ctx-{tag}-base"));
+    let (_cb, reg_base_receipt, reg_base_stdout_sha, reg_base_stdout) =
+        register_trusted_live_context(
+            &ctx_base_dir,
+            &repo,
+            selector,
+            "fail",
+            &ft.path().join("target-reg-base"),
+        );
     // 追加 HEAD commit(非测试源),HEAD 侧真实执行。
     let head_commit = bump_fixture_head(&repo, tag);
     assert_ne!(
@@ -3791,6 +3871,16 @@ fn real_dual_execution_slot(d: &Path, tag: &str, selector: &str) -> DualExecutio
     );
     let (rc_head, head_stdout, head_exit) = run_at("head");
     assert_eq!(rc_head["head_before"].as_str(), Some(head_commit.as_str()));
+    // Blocker1: HEAD 侧受信注册(repo 已在 head commit)。
+    let ctx_head_dir = d.join(format!("ctx-{tag}-head"));
+    let (_ch, reg_head_receipt, reg_head_stdout_sha, reg_head_stdout) =
+        register_trusted_live_context(
+            &ctx_head_dir,
+            &repo,
+            selector,
+            "fail",
+            &ft.path().join("target-reg-head"),
+        );
     // 同 probe 绑定: 双侧 test_source 与 sha256 必须逐字节一致。
     assert_eq!(rc_base["test_target_sha256"], rc_head["test_target_sha256"]);
     let probe = d.join(format!("probe-{tag}.rs"));
@@ -3805,27 +3895,32 @@ fn real_dual_execution_slot(d: &Path, tag: &str, selector: &str) -> DualExecutio
     // receipt 原件复制保活(classify 三方绑定直接消费)。
     let base_log = d.join(format!("{tag}-base.log"));
     let head_log = d.join(format!("{tag}-head.log"));
-    std::fs::copy(&base_stdout, &base_log).unwrap();
-    std::fs::copy(&head_stdout, &head_log).unwrap();
+    let _ = &base_stdout;
+    let _ = &head_stdout;
+    std::fs::copy(&reg_base_stdout, &base_log).unwrap();
+    std::fs::copy(&reg_head_stdout, &head_log).unwrap();
     let head_receipt = d.join(format!("{tag}-head.receipt.json"));
     std::fs::copy(ev.join("head.receipt.json"), &head_receipt).unwrap();
-    // fixture 目录随 tuple 返回调用方保活: head receipt 的 artifacts/
-    // test_source 仍指向其中文件,classify 校验在场+sha256 需要;
-    // 复制 receipt JSON 本身不保活其引用工件(不 drop,不泄漏——
-    // 调用方 keep_alive 持有至测试结束)。
+    // slot 日志哈希取注册侧真实 stdout(注册执行与 run_at 独立,两侧
+    // provenance 强绑定: slot.{base,head}_log_sha256 == 注册 receipt 的
+    // stdout_sha256,防注册 PASS/异 selector + 手写日志冒充)。
     (
         base_commit,
         head_commit,
         probe,
         probe_sha,
         base_log.clone(),
-        sha256_hex(&base_log),
+        reg_base_stdout_sha,
         base_exit,
         head_log.clone(),
-        sha256_hex(&head_log),
+        reg_head_stdout_sha,
         head_exit,
         head_receipt,
         ft,
+        reg_base_receipt,
+        reg_head_receipt,
+        TmpDir::new(&format!("ctxk-{tag}-base")),
+        TmpDir::new(&format!("ctxk-{tag}-head")),
     )
 }
 
@@ -3871,6 +3966,10 @@ fn write_classify_fixture(
         head_exit,
         _head_rc,
         _ft_keepalive,
+        base_receipt_rc,
+        head_receipt_rc,
+        _ctx_base_keepalive,
+        _ctx_head_keepalive,
     ) = dual;
     // slot 的 HEAD commit 必须等于 629 receipt 的真实 head(同 probe 同轮)。
     let rc629: serde_json::Value =
@@ -3933,7 +4032,9 @@ fn write_classify_fixture(
             "base_exit": base_exit,
             "head_exit": head_exit,
             "base_log_sha256": base_sha,
-            "head_log_sha256": head_sha
+            "head_log_sha256": head_sha,
+            "base_receipt": base_receipt_rc.to_str().unwrap(),
+            "head_receipt": head_receipt_rc.to_str().unwrap()
         }))
         .unwrap(),
     )
@@ -4029,21 +4130,37 @@ fn olp_review_helper_identical_slot_logs_both_bound() {
     });
     let slot_path = d.join("slot.json");
     std::fs::write(&slot_path, serde_json::to_string(&slot).unwrap()).unwrap();
+    // 测试级注册 receipt 文件(两份不同内容 → 不同 sha,模拟两个受信
+    // 上下文各自的 live-evidence 注册件)
+    std::fs::write(d.join("reg-base.receipt.json"), "reg-base").unwrap();
+    std::fs::write(d.join("reg-head.receipt.json"), "reg-head").unwrap();
     let out = Command::new("python3")
         .arg("-B")
         .arg("-c")
         .arg(concat!(
-            "import importlib.util, json, sys;\n",
+            "import importlib.util, json, sys, hashlib;\n",
             "spec = importlib.util.spec_from_file_location('ev', 'scripts/olp-review-evidence.py');\n",
             "ev = importlib.util.module_from_spec(spec); spec.loader.exec_module(ev);\n",
             "slot = json.loads(open(sys.argv[1]).read());\n",
+            "log_dir = __import__('pathlib').Path(sys.argv[2]);\n",
             "heads = {'p': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'};\n",
             "bases = {'p': 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'};\n",
-            "out = ev._verify_slot_evidence(slot, __import__('pathlib').Path(sys.argv[2]), heads, bases, 'tests::q', slot['probe_sha256']);\n",
+            "# Blocker1 测试级 trusted 索引(结构校验数据,非端到端注册链):\n",
+            "def mk_rec(path, commit, log_sha):\n",
+            "    import pathlib as _p; rp = _p.Path(path).resolve();\n",
+            "    return {'receipt': str(rp), 'receipt_sha256': hashlib.sha256(open(rp,'rb').read()).hexdigest(), 'review_dir': str(log_dir), 'executed': {'head_before': commit, 'selector_qualified': 'tests::q', 'test_target_sha256': slot['probe_sha256'], 'observed': 'fail', 'exit_code': 101, 'stdout_sha256': log_sha}};\n",
+            "br = mk_rec(sys.argv[3], bases['p'], slot['base_log_sha256']);\n",
+            "hr = mk_rec(sys.argv[4], heads['p'], slot['head_log_sha256']);\n",
+            "trusted = {br['receipt_sha256']: br, hr['receipt_sha256']: hr};\n",
+            "slot['base_receipt'] = sys.argv[3];\n",
+            "slot['head_receipt'] = sys.argv[4];\n",
+            "out = ev._verify_slot_evidence(slot, log_dir, heads, bases, 'tests::q', slot['probe_sha256'], trusted=trusted);\n",
             "print(json.dumps({'ok': out is not None, 'base_log': (out or {}).get('base_log'), 'head_log': (out or {}).get('head_log')}))"
         ))
         .arg(&slot_path)
         .arg(&d)
+        .arg(d.join("reg-base.receipt.json"))
+        .arg(d.join("reg-head.receipt.json"))
         .output()
         .unwrap();
     assert!(
@@ -4057,92 +4174,85 @@ fn olp_review_helper_identical_slot_logs_both_bound() {
     assert!(v["head_log"].as_str().is_some(), "head_log 应绑定: {v}");
 }
 
-/// PR#632 P2-B 回归(结构校验 fixture,测试级别声明): 同一 PR 内
-/// "真实 existing fail selector(带有效 BASE/HEAD 双执行 slot)+ 坏 pass
-/// selector(adapter_exit=7 / cargo_exit=101 / False 冒充)" 不得判
-/// residual;先断言 good-pass 时 residual/existing,再仅改 p 的退出码
-/// 字段断言 blocked/unassessed 且 harness_fault 含 p。另覆盖 bool
-/// 冒充(False 是 int 子类,不得当 0)。
+/// PR#632 P2-B 回归(Blocker1 后真实受信注册版): 真实受信上下文注册
+/// q(FAIL)+ p(PASS)后 good-pass 基线必须 residual/existing;再**只**改
+/// p 的退出码元数据断言 blocked/unassessed + harness_fault 含 p ——
+/// provenance 相同,失败只能来自一致性门(恢复回归目的)。
 #[test]
 fn olp_review_classify_pass_selector_consistency_gates() {
-    let t = TmpDir::new("p2b-pass");
-    let d = t.path().to_path_buf();
-    let head = "9bcf4099c2719cd8ee63090a1849a2c6f3766999".to_string();
-    let base = "0a174d95ddec2b123adb3498432e29eb13affb81".to_string();
-    let write_receipt = |sel: &str, qualified: &str, observed: &str, exit: i64| -> PathBuf {
-        let body = if observed == "pass" {
-            format!("test {qualified} ... ok\ntest result: ok. 1 passed\n")
-        } else {
-            format!("test {qualified} ... FAILED\ntest result: FAILED. 0 passed; 1 failed\n")
-        };
-        let so = d.join(format!("{sel}.stdout.log"));
-        let se = d.join(format!("{sel}.stderr.log"));
-        std::fs::write(&so, &body).unwrap();
-        std::fs::write(&se, "").unwrap();
-        let rc = serde_json::json!({
-            "receipt_kind": "cargo-test-execution",
-            "selector": sel,
-            "selector_qualified": qualified,
-            "matched_tests": [qualified],
-            "observed": observed,
-            "exit_code": exit,
-            "head_before": head,
-            "head_after": head,
-            "test_source": d.join("fixture.rs").to_str().unwrap(),
-            "test_target_sha256": sha256_hex(&d.join("fixture.rs")),
-            "artifacts": {"stdout": so.to_str().unwrap(), "stderr": se.to_str().unwrap()},
-            "stdout_sha256": sha256_hex(&so),
-            "stderr_sha256": sha256_hex(&se),
-        });
-        let rp = d.join(format!("{sel}-{observed}.receipt.json"));
-        std::fs::write(&rp, serde_json::to_string(&rc).unwrap()).unwrap();
-        rp
-    };
-    // slot 用的 probe 源 + 双执行日志(q 在 BASE/HEAD 同 probe 双 FAIL)
-    let fixture_rs = d.join("fixture.rs");
-    std::fs::write(
-        &fixture_rs,
-        "mod tests { #[test] fn q() { assert!(false); } }\n",
-    )
-    .unwrap();
-    let probe = d.join("probe-q.rs");
-    std::fs::copy(&fixture_rs, &probe).unwrap();
-    let log_body = "test tests::q ... FAILED\ntest result: FAILED. 0 passed; 1 failed\n";
-    let base_log = d.join("q-base.log");
-    let head_log = d.join("q-head.log");
-    std::fs::write(&base_log, log_body).unwrap();
-    std::fs::write(&head_log, log_body).unwrap();
-    let fail_rc = write_receipt("q", "tests::q", "fail", 101);
-    let pass_rc = write_receipt("p", "tests::p", "pass", 0);
-    let slot = serde_json::json!({
-        "pr_head": head,
-        "base": base,
-        "probe": probe.to_str().unwrap(),
-        "probe_sha256": sha256_hex(&probe),
-        "base_log_sha256": sha256_hex(&base_log),
-        "head_log_sha256": sha256_hex(&head_log),
-        "base_exit": 101,
-        "head_exit": 101,
-        "classification": "existing/residual: same probe fails at BASE and HEAD"
-    });
-    let slot_path = d.join("slot.json");
-    std::fs::write(&slot_path, serde_json::to_string(&slot).unwrap()).unwrap();
+    let (ft, repo, base_commit) = make_cargo_fixture("p2b-real", FIXTURE_PASS_AND_FAIL);
+    let d = ft.path().join("classify");
+    std::fs::create_dir_all(&d).unwrap();
+    // BASE 侧受信注册 q(FAIL)(repo 在 base commit)
+    let ctx_base = d.join("ctx-base");
+    let (_rb, reg_base_receipt, reg_base_stdout_sha, reg_base_stdout) =
+        register_trusted_live_context(
+            &ctx_base,
+            &repo,
+            "fixture_probe_fails",
+            "fail",
+            &ft.path().join("target-reg-base"),
+        );
+    // bump HEAD 后注册 head 侧 q(FAIL) 与 p(PASS)(两个上下文)
+    let head_commit = bump_fixture_head(&repo, "p2b-real");
+    let ctx_head_q = d.join("ctx-head-q");
+    let (_rh, reg_head_receipt, reg_head_stdout_sha, reg_head_stdout) =
+        register_trusted_live_context(
+            &ctx_head_q,
+            &repo,
+            "fixture_probe_fails",
+            "fail",
+            &ft.path().join("target-reg-head-q"),
+        );
+    let ctx_head_p = d.join("ctx-head-p");
+    let (_rp, reg_p_receipt, _p_stdout_sha, _p_stdout) = register_trusted_live_context(
+        &ctx_head_p,
+        &repo,
+        "fixture_probe_pass",
+        "pass",
+        &ft.path().join("target-reg-head-p"),
+    );
+    // manifest/summary/slot: q=existing 双执行注册;p=受信注册 PASS
     let manifest = d.join("MANIFEST.json");
     std::fs::write(
         &manifest,
-        serde_json::to_string(&serde_json::json!({"prs": {"629": {
-            "head": head, "base": base,
-            "outer_recommendation": "conditional-approve-scope-and-specs"}}}))
+        serde_json::to_string(&serde_json::json!({"prs": {"p2b": {
+            "head": head_commit, "base": base_commit,
+            "outer_recommendation": "approve"}}}))
+        .unwrap(),
+    )
+    .unwrap();
+    let base_log = d.join("q-base.log");
+    let head_log = d.join("q-head.log");
+    std::fs::copy(&reg_base_stdout, &base_log).unwrap();
+    std::fs::copy(&reg_head_stdout, &head_log).unwrap();
+    let probe = d.join("probe-q.rs");
+    std::fs::copy(ft.path().join("fixture-repo/tests/fixture.rs"), &probe).unwrap();
+    let probe_sha = sha256_hex(&probe);
+    let slot = d.join("slot.json");
+    std::fs::write(
+        &slot,
+        serde_json::to_string(&serde_json::json!({
+            "pr_head": head_commit, "base": base_commit,
+            "probe": probe.to_str().unwrap(), "probe_sha256": probe_sha,
+            "base_log_sha256": reg_base_stdout_sha,
+            "head_log_sha256": reg_head_stdout_sha,
+            "base_exit": 101, "head_exit": 101,
+            "classification": "existing/residual",
+            "base_receipt": reg_base_receipt.to_str().unwrap(),
+            "head_receipt": reg_head_receipt.to_str().unwrap()}))
         .unwrap(),
     )
     .unwrap();
     let mk_summary = |adapter_p: serde_json::Value, cargo_p: serde_json::Value| -> PathBuf {
         let tag = format!("{}-{}", adapter_p, cargo_p).replace(['"', '\\'], "");
         let summary = serde_json::json!({"results": [
-            {"pr": "629", "head": head, "selector": "q", "adapter_exit": 0,
-             "observed": "fail", "cargo_exit": 101, "receipt": fail_rc.to_str().unwrap()},
-            {"pr": "629", "head": head, "selector": "p", "adapter_exit": adapter_p,
-             "observed": "pass", "cargo_exit": cargo_p, "receipt": pass_rc.to_str().unwrap()},
+            {"pr": "p2b", "head": head_commit, "selector": "fixture_probe_fails",
+             "adapter_exit": 0, "observed": "fail", "cargo_exit": 101,
+             "receipt": reg_head_receipt.to_str().unwrap()},
+            {"pr": "p2b", "head": head_commit, "selector": "fixture_probe_pass",
+             "adapter_exit": adapter_p, "observed": "pass", "cargo_exit": cargo_p,
+             "receipt": reg_p_receipt.to_str().unwrap()},
         ]});
         let sp = d.join(format!("summary-{tag}.json"));
         std::fs::write(&sp, serde_json::to_string(&summary).unwrap()).unwrap();
@@ -4157,8 +4267,14 @@ fn olp_review_classify_pass_selector_consistency_gates() {
             .arg(&manifest)
             .arg("--replay-summary")
             .arg(sp)
+            .arg("--review-dir")
+            .arg(&ctx_base)
+            .arg("--review-dir")
+            .arg(&ctx_head_q)
+            .arg("--review-dir")
+            .arg(&ctx_head_p)
             .arg("--slot")
-            .arg(&slot_path)
+            .arg(&slot)
             .arg("--slot-log-dir")
             .arg(&d)
             .output()
@@ -4170,20 +4286,20 @@ fn olp_review_classify_pass_selector_consistency_gates() {
         );
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap()
     };
-    // 1) good-pass: q 为 existing + p 合法 → residual/existing
+    // 基线: 真实受信 q FAIL(existing slot)+ p 受信注册 PASS → residual
     let v = run_classify(&mk_summary(serde_json::json!(0), serde_json::json!(0)));
-    let e = &v["prs"]["629"];
+    let e = &v["prs"]["p2b"];
     assert_eq!(
         e["classification"].as_str().unwrap_or("?"),
         "residual",
-        "good-pass 基线应 residual: {e}"
+        "真实受信 good-pass 基线应 residual: {e}"
     );
     assert_eq!(
         e["introduced_vs_existing"].as_str().unwrap_or("?"),
         "existing",
-        "q 有有效 slot 双执行 → existing: {e}"
+        "q 受信双执行注册 → existing: {e}"
     );
-    // 2) 坏 pass 变体: 只改 p 的退出码字段 → blocked/unassessed + harness p
+    // 只改 p 退出码元数据 → blocked/unassessed + harness_fault 含 p
     for (adapter_p, cargo_p) in [
         (serde_json::json!(7), serde_json::json!(0)),
         (serde_json::json!(0), serde_json::json!(101)),
@@ -4191,11 +4307,11 @@ fn olp_review_classify_pass_selector_consistency_gates() {
         (serde_json::json!(false), serde_json::json!(0)),
     ] {
         let v = run_classify(&mk_summary(adapter_p.clone(), cargo_p.clone()));
-        let e = &v["prs"]["629"];
+        let e = &v["prs"]["p2b"];
         assert_eq!(
             e["classification"].as_str().unwrap_or("?"),
             "blocked",
-            "坏 pass(adapter={adapter_p},cargo={cargo_p})必须 blocked"
+            "坏 pass 元数据(adapter={adapter_p},cargo={cargo_p})必须 blocked"
         );
         assert_eq!(
             e["introduced_vs_existing"].as_str().unwrap_or("?"),
@@ -4204,8 +4320,440 @@ fn olp_review_classify_pass_selector_consistency_gates() {
         );
         let hf = e["harness_fault_selectors"].as_array().unwrap();
         assert!(
-            hf.iter().any(|h| h.as_str() == Some("p")),
+            hf.iter().any(|h| h.as_str() == Some("fixture_probe_pass")),
             "p 应为 harness 故障: {hf:?}"
         );
+    }
+}
+
+/// Blocker1(PR#632 human HOLD)回归组: classify 可信来源绑定。
+/// 全部用真实受信上下文注册(init→freeze→challenge --live-cargo),再
+/// 变换证据形态:
+/// (1) 完全伪造链(无 repo/state/执行,虚构 HEAD/BASE)→ blocked/unassessed;
+/// (2) 真实注册 HEAD FAIL + 外部副本 receipt(correct-HEAD unregistered
+///     copy,字节相同但路径在 live-evidence 外)→ 拒;
+/// (3) 真实注册 → 篡改 receipt 字节 → 结构化错误 fail-closed;
+/// (4) --review-dir 不存在/畸形 state → 非零结构化错误;
+/// (5) 真实注册 BASE PASS + slot 谎称 FAIL → 落不了 existing。
+#[test]
+fn olp_review_classify_forged_chain_and_provenance_gates() {
+    let t = TmpDir::new("b1-forged");
+    let d = t.path().to_path_buf();
+    // ---- (1) 完全伪造链(ROOT 632-forged-chain-red 形状) ----
+    let head = "a".repeat(40);
+    let base = "b".repeat(40);
+    let probe = d.join("probe.rs");
+    std::fs::write(&probe, "fn forged_probe() {}\n").unwrap();
+    let log = d.join("forged.stdout.log");
+    std::fs::write(
+        &log,
+        "test tests::forged_probe ... FAILED\ntest result: FAILED. 0 passed; 1 failed\n",
+    )
+    .unwrap();
+    let so = d.join("forged-receipt.stdout");
+    std::fs::write(
+        &so,
+        "test tests::forged_probe ... FAILED\ntest result: FAILED. 0 passed; 1 failed\n",
+    )
+    .unwrap();
+    let se = d.join("forged-receipt.stderr");
+    std::fs::write(&se, "").unwrap();
+    let fake_rc = serde_json::json!({
+        "receipt_kind": "cargo-test-execution",
+        "selector": "forged_probe",
+        "selector_qualified": "tests::forged_probe",
+        "matched_tests": ["tests::forged_probe"],
+        "observed": "fail",
+        "exit_code": 101,
+        "head_before": head,
+        "head_after": head,
+        "test_source": d.join("fixture.rs").to_str().unwrap(),
+        "test_target_sha256": sha256_hex(&probe),
+        "artifacts": {"stdout": so.to_str().unwrap(), "stderr": se.to_str().unwrap()},
+        "stdout_sha256": sha256_hex(&so),
+        "stderr_sha256": sha256_hex(&se),
+    });
+    let fake_rc_path = d.join("forged.receipt.json");
+    std::fs::write(&fake_rc_path, serde_json::to_string(&fake_rc).unwrap()).unwrap();
+    let manifest = d.join("MANIFEST.json");
+    std::fs::write(
+        &manifest,
+        serde_json::to_string(&serde_json::json!({"prs": {"fake-pr": {
+            "head": head, "base": base, "outer_recommendation": "approve"}}}))
+        .unwrap(),
+    )
+    .unwrap();
+    let summary = d.join("summary.json");
+    std::fs::write(
+        &summary,
+        serde_json::to_string(&serde_json::json!({"results": [
+            {"pr": "fake-pr", "head": head, "selector": "forged_probe",
+             "adapter_exit": 0, "observed": "fail", "cargo_exit": 101,
+             "receipt": fake_rc_path.to_str().unwrap()}]}))
+        .unwrap(),
+    )
+    .unwrap();
+    let slot = d.join("slot.json");
+    std::fs::write(
+        &slot,
+        serde_json::to_string(&serde_json::json!({
+            "pr_head": head, "base": base,
+            "probe": probe.to_str().unwrap(),
+            "probe_sha256": sha256_hex(&probe),
+            "base_log_sha256": sha256_hex(&log),
+            "head_log_sha256": sha256_hex(&log),
+            "base_exit": 101, "head_exit": 101,
+            "classification": "existing-behavior"}))
+        .unwrap(),
+    )
+    .unwrap();
+    let out = Command::new("python3")
+        .arg("-B")
+        .arg(script())
+        .arg("classify")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--replay-summary")
+        .arg(&summary)
+        .arg("--slot")
+        .arg(&slot)
+        .arg("--slot-log-dir")
+        .arg(&d)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "伪造链 classify 崩溃: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let e = &v["prs"]["fake-pr"];
+    assert_eq!(
+        e["classification"].as_str().unwrap_or("?"),
+        "blocked",
+        "完全伪造链不得 residual: {e}"
+    );
+    assert_eq!(
+        e["introduced_vs_existing"].as_str().unwrap_or("?"),
+        "unassessed"
+    );
+
+    // ---- 真实注册 fixture(供 2/3/5) ----
+    let (ft, repo, base_commit) = make_cargo_fixture("b1-real", FIXTURE_FAIL_TEST);
+    let dd = ft.path().join("gates");
+    std::fs::create_dir_all(&dd).unwrap();
+    // BASE 侧注册 FAIL(bump 前)
+    let ctx_base = dd.join("ctx-base");
+    let (_rb, reg_base_receipt, reg_base_stdout_sha, reg_base_stdout) =
+        register_trusted_live_context(
+            &ctx_base,
+            &repo,
+            "fixture_probe_fails",
+            "fail",
+            &ft.path().join("target-g-base"),
+        );
+    let head_commit = bump_fixture_head(&repo, "b1-real");
+    // HEAD 侧注册 FAIL
+    let ctx_head = dd.join("ctx-head");
+    let (_rh, reg_head_receipt, reg_head_stdout_sha, reg_head_stdout) =
+        register_trusted_live_context(
+            &ctx_head,
+            &repo,
+            "fixture_probe_fails",
+            "fail",
+            &ft.path().join("target-g-head"),
+        );
+    // BASE 侧另建 PASS 注册(同 repo 回 base? 已 bump — PASS fixture 需另
+    // 仓库) — 用 FIXTURE_PASS_TEST 独立仓库注册 PASS。
+    let (ftp, repop, _hp) = make_cargo_fixture("b1-pass", FIXTURE_PASS_TEST);
+    let ctx_pass = ft.path().join("ctx-pass");
+    let (_rpp, reg_pass_receipt, _reg_pass_stdout_sha, _ps) = register_trusted_live_context(
+        &ctx_pass,
+        &repop,
+        "fixture_probe_pass",
+        "pass",
+        &ftp.path().join("target-g-pass"),
+    );
+
+    let manifest2 = dd.join("MANIFEST.json");
+    std::fs::write(
+        &manifest2,
+        serde_json::to_string(&serde_json::json!({"prs": {"b1": {
+            "head": head_commit, "base": base_commit,
+            "outer_recommendation": "approve"}}}))
+        .unwrap(),
+    )
+    .unwrap();
+    let base_log2 = dd.join("b1-base.log");
+    let head_log2 = dd.join("b1-head.log");
+    std::fs::copy(&reg_base_stdout, &base_log2).unwrap();
+    std::fs::copy(&reg_head_stdout, &head_log2).unwrap();
+    let probe2 = dd.join("probe2.rs");
+    std::fs::copy(ft.path().join("fixture-repo/tests/fixture.rs"), &probe2).unwrap();
+    let probe2_sha = sha256_hex(&probe2);
+    let mk_slot2 = |base_receipt: &str, head_receipt: &str, base_sha: &str| -> PathBuf {
+        let sp = dd.join(format!(
+            "slot-{}.json",
+            sha256_hex(Path::new(base_receipt))
+                .chars()
+                .take(6)
+                .collect::<String>()
+        ));
+        std::fs::write(
+            &sp,
+            serde_json::to_string(&serde_json::json!({
+            "pr_head": head_commit, "base": base_commit,
+            "probe": probe2.to_str().unwrap(), "probe_sha256": probe2_sha,
+            "base_log_sha256": base_sha,
+            "head_log_sha256": reg_head_stdout_sha,
+            "base_exit": 101, "head_exit": 101,
+            "classification": "existing/residual",
+            "base_receipt": base_receipt,
+            "head_receipt": head_receipt}))
+            .unwrap(),
+        )
+        .unwrap();
+        sp
+    };
+    let run2 = |summary2: &Path, slot2: &Path, ctxs: &[&Path]| -> serde_json::Value {
+        let mut c = Command::new("python3");
+        c.arg("-B")
+            .arg(script())
+            .arg("classify")
+            .arg("--manifest")
+            .arg(&manifest2)
+            .arg("--replay-summary")
+            .arg(summary2);
+        for ctx in ctxs {
+            c.arg("--review-dir").arg(ctx);
+        }
+        let out = c
+            .arg("--slot")
+            .arg(slot2)
+            .arg("--slot-log-dir")
+            .arg(&dd)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "classify 崩溃: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap()
+    };
+    // (2) correct-HEAD 外部副本(字节相同,路径在外) → blocked
+    let ext_copy = dd.join("external-head-copy.receipt.json");
+    std::fs::copy(&reg_head_receipt, &ext_copy).unwrap();
+    let summary2 = dd.join("summary2.json");
+    std::fs::write(
+        &summary2,
+        serde_json::to_string(&serde_json::json!({"results": [
+        {"pr": "b1", "head": head_commit, "selector": "fixture_probe_fails",
+         "adapter_exit": 0, "observed": "fail", "cargo_exit": 101,
+         "receipt": ext_copy.to_str().unwrap()}]}))
+        .unwrap(),
+    )
+    .unwrap();
+    let slot_ok = mk_slot2(
+        reg_base_receipt.to_str().unwrap(),
+        reg_head_receipt.to_str().unwrap(),
+        &reg_base_stdout_sha,
+    );
+    let v2 = run2(&summary2, &slot_ok, &[&ctx_base, &ctx_head]);
+    let e2 = &v2["prs"]["b1"];
+    assert_eq!(
+        e2["classification"].as_str().unwrap_or("?"),
+        "blocked",
+        "外部副本(正确 HEAD)不得晋升: {e2}"
+    );
+    // 基线对照: 注册原件 → residual
+    let summary2r = dd.join("summary2-registered.json");
+    std::fs::write(
+        &summary2r,
+        serde_json::to_string(&serde_json::json!({"results": [
+        {"pr": "b1", "head": head_commit, "selector": "fixture_probe_fails",
+         "adapter_exit": 0, "observed": "fail", "cargo_exit": 101,
+         "receipt": reg_head_receipt.to_str().unwrap()}]}))
+        .unwrap(),
+    )
+    .unwrap();
+    let v2r = run2(&summary2r, &slot_ok, &[&ctx_base, &ctx_head]);
+    let e2r = &v2r["prs"]["b1"];
+    assert_eq!(
+        e2r["classification"].as_str().unwrap_or("?"),
+        "residual",
+        "注册原件基线应 residual: {e2r}"
+    );
+    // (5) BASE 注册件实为 PASS(stdout sha 不匹配 FAIL slot) → blocked
+    let slot_pass_base = mk_slot2(
+        reg_pass_receipt.to_str().unwrap(),
+        reg_head_receipt.to_str().unwrap(),
+        &reg_base_stdout_sha,
+    );
+    let v5 = run2(
+        &summary2r,
+        &slot_pass_base,
+        &[&ctx_base, &ctx_head, &ctx_pass],
+    );
+    let e5 = &v5["prs"]["b1"];
+    assert_eq!(
+        e5["classification"].as_str().unwrap_or("?"),
+        "blocked",
+        "注册 BASE PASS 不能支撑 FAIL slot existing: {e5}"
+    );
+    // (3) 注册后篡改 receipt 字节 → 结构化错误
+    let mut tampered = std::fs::read_to_string(&reg_head_receipt).unwrap();
+    tampered.push(' ');
+    let tampered_path = ctx_head.join("live-evidence").join("tampered.json");
+    std::fs::write(&tampered_path, "").unwrap();
+    std::fs::write(&reg_head_receipt, tampered).unwrap();
+    let out3 = Command::new("python3")
+        .arg("-B")
+        .arg(script())
+        .arg("classify")
+        .arg("--manifest")
+        .arg(&manifest2)
+        .arg("--replay-summary")
+        .arg(&summary2r)
+        .arg("--review-dir")
+        .arg(&ctx_base)
+        .arg("--review-dir")
+        .arg(&ctx_head)
+        .output()
+        .unwrap();
+    assert!(!out3.status.success(), "篡改注册件必须非零拒绝");
+    let v3: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out3.stdout))
+        .unwrap_or(serde_json::Value::Null);
+    assert!(
+        v3.get("error").is_some(),
+        "应结构化错误而非 traceback: {}",
+        String::from_utf8_lossy(&out3.stdout)
+    );
+    // (4) --review-dir 不存在 → 非零结构化
+    let out4 = Command::new("python3")
+        .arg("-B")
+        .arg(script())
+        .arg("classify")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--replay-summary")
+        .arg(&summary)
+        .arg("--review-dir")
+        .arg(d.join("no-such-ctx").to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(!out4.status.success(), "不存在的受信上下文必须非零退出");
+    let v4: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out4.stdout)).unwrap();
+    assert_eq!(
+        v4["error"]["code"].as_str().unwrap_or("?"),
+        "classify-context-missing",
+        "应报结构化错误: {v4}"
+    );
+}
+
+/// Blocker1: 建立受信评审上下文并经真实 challenge --live-cargo 注册
+/// receipt(init→权威→双初审→freeze→live challenge)。返回 (上下文目录,
+/// receipt 路径, stdout_sha256)。BASE/HEAD 各一次,即得两个可重复传入
+/// classify --review-dir 的受信上下文(每侧保留自己的真实 repo/HEAD)。
+#[allow(clippy::type_complexity)]
+fn register_trusted_live_context(
+    ctx_dir: &Path,
+    repo: &Path,
+    selector: &str,
+    expect: &str,
+    target_dir: &Path,
+) -> (PathBuf, PathBuf, String, PathBuf) {
+    // 受信上下文必须有自己独立的真实 repo checkout(固定在调用时刻的
+    // HEAD),与调用方后续对原 repo 的 bump 解耦 —— 否则 BASE 上下文的
+    // state.head 会因原 repo 前进而失配(ROOT 独立探针即分别独立 repo)。
+    // tiny fixture 无远端: 直接目录复制(含 .git)后 reset --hard 锚定。
+    let exec_repo = ctx_dir.to_path_buf().join("exec-repo");
+    copy_dir_tree(repo, &exec_repo);
+    let reset = Command::new("git")
+        .args(["reset", "--hard", "HEAD"])
+        .current_dir(&exec_repo)
+        .output()
+        .unwrap();
+    assert!(
+        reset.status.success(),
+        "exec-repo reset 失败: {}",
+        String::from_utf8_lossy(&reset.stderr)
+    );
+    let repo: &Path = &exec_repo;
+    init_review_at(ctx_dir, repo);
+    write_authority(ctx_dir, "glm", "1", "completed");
+    write_authority(ctx_dir, "k3", "1", "completed");
+    let glm = write_review(
+        ctx_dir,
+        "glm.md",
+        "completed",
+        "1",
+        Some(&state_head_of(repo)),
+    );
+    let k3 = write_review(
+        ctx_dir,
+        "k3.md",
+        "completed",
+        "1",
+        Some(&state_head_of(repo)),
+    );
+    let (okf, sof, sef) = run(&[
+        "freeze",
+        ctx_dir.to_str().unwrap(),
+        "--glm-review",
+        glm.to_str().unwrap(),
+        "--k3-review",
+        k3.to_str().unwrap(),
+        "--glm-slug",
+        "glm",
+        "--k3-slug",
+        "k3",
+        "--native-root",
+        ctx_dir.join("native").to_str().unwrap(),
+        "--head",
+        &state_head_of(repo),
+    ]);
+    assert!(okf, "freeze failed: {sof} {sef}");
+    let (okc, soc, sec) = live_challenge(ctx_dir, repo, "X", selector, expect, target_dir);
+    assert!(okc, "live challenge failed: {soc} {sec}");
+    // 从 state challenges 取注册的 receipt 路径与 stdout hash
+    let st: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(ctx_dir.join("review-state.json")).unwrap())
+            .unwrap();
+    let hist = st["challenges"]["X"]["history"].as_array().unwrap();
+    let last = hist.last().unwrap();
+    assert_eq!(last["accepted"].as_bool(), Some(true));
+    let rp = PathBuf::from(last["receipt"].as_str().unwrap());
+    let stdout_sha = last["executed"]["stdout_sha256"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let stdout_path = PathBuf::from(last["executed"]["artifacts"]["stdout"].as_str().unwrap());
+    (ctx_dir.to_path_buf(), rp, stdout_sha, stdout_path)
+}
+
+/// fixture 仓库当前 HEAD(fixture_head 的只读包装,便于注册时锚定)。
+fn state_head_of(repo: &Path) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git rev-parse failed");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// 递归复制目录树(测试 fixture 用;失败即 panic,不做静默忽略)。
+fn copy_dir_tree(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for e in std::fs::read_dir(src).unwrap() {
+        let e = e.unwrap();
+        let to = dst.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir_tree(&e.path(), &to);
+        } else {
+            std::fs::copy(e.path(), &to).unwrap();
+        }
     }
 }

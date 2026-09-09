@@ -45,7 +45,10 @@ python3 scripts/olp-review-evidence.py freeze <review_dir> \
 | native result-N.md 非 errored(外部否决) | `peer-outcome-invalid` |
 | native 收据 slug 与报告 slug 匹配 | `peer-authority-mismatch` |
 | **有至少一种外部终止权威**(native 收据或 runtime-evidence 终止快照) | `peer-authority-missing` |
-| 报告 turn ≥ turns.txt 已结束轮次 | `stale-turn` |
+| 报告 turn 恰等 native 最新编号 N(= turns.txt 已结束轮次) | — |
+| 报告 turn < N(旧轮初审) | `stale-turn` |
+| 报告 turn > N(未来轮) | `turn-mismatch` |
+| 报告 turn 非数字/缺失 | `peer-outcome-invalid` |
 | 报告 HEAD == 评审 HEAD(可选) | `head-mismatch` |
 
 冻结记录每份初审的 SHA256/peer/turn/outcome;此后任何改写或**删除**
@@ -163,10 +166,30 @@ python3 scripts/olp-review-monitor.py <review_dir> \
 
 ## classify — PR 级通用聚合(spec L55-73/L439-455)
 
+**受信来源门(Blocker1)**: `--review-dir <dir>`(可重复,必填才有来源):
+每个上下文须 frozen、reviews 形状合法、真实 repo HEAD == state.head、
+verify_no_tamper 通过(同一 flock 临界区读取);注册表 = 其 challenges[*].
+history 中 accepted live 记录(receipt canonical 路径 + sha256 +
+live-evidence 目录包含),只由 `--live-cargo` 写入,classify 只读。
+`--review-dir` **可重复**: BASE/HEAD(及多 PR)各自一个受信上下文,
+每上下文保留自己的真实 repo/HEAD(state-HEAD 门不弱化)。caller-selected
+context 是**受信边界**(调用方选择信任哪些评审目录),不是密码学签名——
+能整套改写受信目录的行动者在边界之外(物理/仓库安全与 freeze 防篡改
+层职责)。
+per-HEAD receipt 须命中注册(防外部副本/篡改);BASE/HEAD 双执行证明
+**两侧**各自绑定注册执行(同 qualified selector + test_target sha +
+observed=fail + 真 int 非零 exit + stdout sha == slot 对应 log sha)。
+一致性 ≠ 来源: 完全自洽伪造链 → blocked/unassessed;历史未注册数据 →
+blocked/unassessed 降级。`clean` 当前为保留态(无受支持的对照证明路径
+时不可达,不放宽)。PASS 记录要求 adapter_exit 与 cargo_exit 均为
+**真 int 0**(bool 是 int 子类,显式拒绝)。
+
+
 ```bash
 python3 scripts/olp-review-evidence.py classify \
   --manifest <MANIFEST.json> --replay-summary <replay-summary.json> \
-  [--slot <outer-verification-slot.json> --slot-log-dir <双日志目录>]
+  --review-dir <ctx1> [--review-dir <ctx2> ...] \
+  [--slot <slot.json> --slot-log-dir <双日志目录>]
 ```
 
 分类意图来自外层(MANIFEST `outer_recommendation`);工具只做通用聚合
@@ -210,7 +233,7 @@ unverified          not-replayed(imported 未独立复验)
 
 ## 测试真实性边界
 
-- `tests/olp_review_evidence.rs`(42 pass / 1 ignored,23+1 场景):
+- `tests/olp_review_evidence.rs`(53 pass / 1 ignored):
   子进程真实调用生产入口;外层反例回归先 RED 后修(证据 `.octos/red-proof/`)。
 - `olp_review_k3_full_happy_path_accepted` 替代旧假日志 approve 路线
   (python 假 cargo 日志违反合约 3,已 REMOVED)。

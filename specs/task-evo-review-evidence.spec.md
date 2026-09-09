@@ -31,8 +31,10 @@ satisfies: [REQ-OLP-REVIEW-EVIDENCE]
   必要条件(全部可编程校验): (a) 测试过滤名行 (b) `panicked at` 行
   (c) `test result: FAILED. ... N failed` 汇总 (d) 绑定测试名可在 harness
   源解析。以上仅证"形似",**不构成执行证明**。执行验证必须由生产入口
-  `olp-review-evidence.py` 实际执行证据携带的 argv/脚本,捕获真实退出码与
-  stdout/stderr,并把 HEAD/运行目录/测试名/源码与输出摘要绑定写入 manifest。
+  `olp-review-evidence.py` 经固定生产 cargo adapter(`--live-cargo`,唯一
+  live 执行路径)实时执行,捕获真实退出码与 stdout/stderr,并把 HEAD/
+  运行目录/测试名/源码与输出摘要绑定写入 manifest;证据携带的自报
+  argv/脚本一律 `executor-not-trusted`,不被执行。
   外层 imported 日志(未独立执行)→ 判词 `not-replayed`,不得自动 accepted。
   纯构造 cargo 样式日志的伪造证据必须被拒绝。
 - 交叉(cross):仅当两份初审已冻结且挑战证据已接纳后才允许;交叉报告必须对
@@ -469,6 +471,25 @@ Rule: review-monitor — Herdr 监控:区块分离与身份防混
     (receipt/HEAD/probe/BASE/selector 锚)不放宽
 
 Rule: review-regression — 前轮八反例回归数据集
+
+场景: classify 受信来源门(伪造链拒绝)(critical)
+  测试:
+    包: octoscode
+    过滤: olp_review_classify_forged_chain_and_provenance_gates
+    过滤: olp_review_classify_pr_aggregation_production_cli
+    过滤: olp_review_regression_dataset_classifies_four_prs
+  假设 (a) 无 repo/无 review state/无真实执行的完全自洽伪造链
+    (虚构 HEAD/BASE/receipt/slot/日志);(b) receipt 未在受信上下文
+    注册(外部副本/篡改);(c) BASE/HEAD 双执行证明任一侧未注册或
+    registered BASE 为 PASS/异 selector
+  当 classify 聚合(显式 --review-dir 受信上下文,可重复)
+  那么 一致性不等于来源: 伪造链/未注册/篡改/BASE 侧不匹配 →
+    blocked/unassessed 或结构化错误,绝不 residual;真实注册的
+    BASE FAIL + HEAD FAIL 同 probe 双执行 → residual/existing。
+    受信注册表 = 各上下文 challenges[*].history 中 accepted live
+    记录(receipt canonical 路径 + sha256 + live-evidence 目录包含),
+    只由 --live-cargo 写入,classify 只读;历史未注册数据 →
+    blocked/unassessed 降级,不改写为新鲜执行。
 
 场景: pass selector 一致性门(critical)
   测试:
