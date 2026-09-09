@@ -190,6 +190,12 @@ pub enum AutonomyParseError {
     /// `/goal ... --budget <value>` where the value was missing or did
     /// not parse as a positive token count.
     InvalidBudget(String),
+    /// `/goal ... --<flag>` where `<flag>` is not one this parser knows.
+    /// Folding an unrecognized flag into the objective silently created a
+    /// junk goal (`/goal archive --reason x` became an objective named
+    /// "archive --reason x"), so it is a hard error like a malformed
+    /// `--budget`.
+    UnknownFlag(String),
     /// `/loop ... every <interval>` where the interval failed to parse.
     InvalidInterval(String),
     /// `/agents spawn` where the count token is missing, non-numeric, or zero.
@@ -224,6 +230,9 @@ impl std::fmt::Display for AutonomyParseError {
                     f,
                     "could not parse --budget `{raw}` (try 500k, 2m, or 50000)"
                 )
+            }
+            Self::UnknownFlag(flag) => {
+                write!(f, "unknown /goal flag `{flag}` (the only flag is --budget)")
             }
             Self::InvalidInterval(raw) => {
                 write!(f, "could not parse interval `{raw}`")
@@ -468,6 +477,18 @@ fn parse_goal(tail: &str) -> Result<GoalCommand, AutonomyParseError> {
 /// value is a hard error so it surfaces a hint instead of silently
 /// folding the flag into the objective text. When the flag is absent the
 /// budget is `None` and the backend default applies.
+/// A whitespace-delimited token that is syntactically a long flag: `--` plus
+/// at least one ASCII letter. Deliberately excludes a bare `--`, `---`, and
+/// anything with the dashes mid-word (`alpha--beta`), all of which are prose.
+fn is_flag_token(word: &str) -> bool {
+    word.strip_prefix("--")
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_alphabetic()))
+}
+
+fn is_budget_flag(word: &str) -> bool {
+    word == "--budget" || word.starts_with("--budget=")
+}
+
 fn extract_budget_flag(input: &str) -> Result<(String, Option<u64>), AutonomyParseError> {
     // Fast path: no `--budget` token → the objective is the input verbatim
     // (outer trim only), preserving any internal whitespace the user typed.
@@ -476,9 +497,19 @@ fn extract_budget_flag(input: &str) -> Result<(String, Option<u64>), AutonomyPar
     // never mangled. Only when a real flag is present do we tokenize (and
     // accept single-space normalization of the objective as the cost of
     // the opt-in flag syntax).
-    let has_flag = input
+    // An unrecognized flag is a hard error BEFORE the no-flag fast path below,
+    // so it can never be folded into the objective. `/goal archive --reason x`
+    // used to become an objective literally named "archive --reason x" — the
+    // same silent-fold failure the malformed-`--budget` error already guards
+    // against. Only whitespace-delimited `--<alpha>…` tokens count, so prose
+    // like `alpha--beta` or a bare `--` stays objective text.
+    if let Some(unknown) = input
         .split_whitespace()
-        .any(|word| word == "--budget" || word.starts_with("--budget="));
+        .find(|word| is_flag_token(word) && !is_budget_flag(word))
+    {
+        return Err(AutonomyParseError::UnknownFlag((*unknown).to_string()));
+    }
+    let has_flag = input.split_whitespace().any(is_budget_flag);
     if !has_flag {
         return Ok((input.trim().to_string(), None));
     }
@@ -918,6 +949,50 @@ mod tests {
             parse_autonomy_slash("/goal --budget 2m"),
             Err(AutonomyParseError::EmptyGoalObjective)
         ));
+    }
+
+    #[test]
+    fn goal_rejects_an_unknown_flag_instead_of_folding_it_into_the_objective() {
+        // `archive` is an `octos goal` CLI verb but NOT a TUI verb, so
+        // `/goal archive --reason cleanup` fell through to the objective
+        // branch and silently created a goal literally named
+        // "archive --reason cleanup". Only `--budget` is a known flag;
+        // anything else is a hard error, exactly as a malformed `--budget`
+        // already is, so the user sees a hint instead of a junk goal.
+        for input in [
+            "/goal archive --reason cleanup",
+            "/goal reopen --reason=stalled",
+            "/goal do things --oops",
+        ] {
+            assert!(
+                matches!(
+                    parse_autonomy_slash(input),
+                    Err(AutonomyParseError::UnknownFlag(_))
+                ),
+                "expected UnknownFlag for: {input}"
+            );
+        }
+        let message = parse_autonomy_slash("/goal archive --reason cleanup")
+            .expect_err("unknown flag rejected")
+            .to_string();
+        assert!(
+            message.contains("--reason"),
+            "the error must name the offending flag, got: {message}"
+        );
+    }
+
+    #[test]
+    fn goal_objective_still_accepts_prose_with_inner_dashes() {
+        // Only whitespace-delimited `--flag` tokens are flags. Prose that
+        // merely contains dashes must still parse as an objective.
+        let parsed = parse_autonomy_slash("/goal rewrite the alpha--beta parser").unwrap();
+        assert_eq!(
+            parsed,
+            Some(AutonomyCommand::Goal(GoalCommand::Set {
+                objective: "rewrite the alpha--beta parser".into(),
+                token_budget: None,
+            }))
+        );
     }
 
     #[test]

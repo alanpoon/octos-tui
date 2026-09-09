@@ -969,7 +969,18 @@ impl Store {
             }
             Ok(None) => return SlashDispatchOutcome::Rejected,
             Err(err) => {
-                self.state.status = err.to_string();
+                // Record the rejection like `show_unknown_slash_command` and
+                // `show_unavailable_slash_command` do. Setting only the status
+                // line meant a rejected `/goal …` flashed its reason and left
+                // no transcript record of what was wrong with the input.
+                let status = err.to_string();
+                self.state.status = status.clone();
+                self.push_local_activity(
+                    ActivityKind::Warning,
+                    t!("status.local_slash_command").into_owned(),
+                    status,
+                    Some(t!("status.ignored_input", draft = draft).into_owned()),
+                );
                 return SlashDispatchOutcome::Rejected;
             }
         };
@@ -29817,6 +29828,33 @@ now analyzing the bus module"
             !store.state.status.contains("Unknown slash"),
             "no unknown-command warning for message text: {}",
             store.state.status
+        );
+    }
+
+    #[test]
+    fn autonomy_parse_rejection_records_a_local_activity() {
+        // `show_unknown_slash_command` / `show_unavailable_slash_command` both
+        // push a warning activity, but the parse-error arm only set the status
+        // line — so a rejected `/goal …` flashed a transient message and left
+        // no transcript record of what was wrong.
+        let mut store = store_with_empty_session();
+        let before = store.state.activity.len();
+
+        let outcome = store.dispatch_autonomy_slash("/goal do things --budget");
+
+        assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
+        assert_eq!(
+            store.state.activity.len(),
+            before + 1,
+            "the parse rejection must be recorded like every other rejection"
+        );
+        let activity = store.state.activity.last().expect("local warning activity");
+        assert_eq!(activity.kind, ActivityKind::Warning);
+        assert_eq!(activity.title, "local slash command");
+        assert!(
+            activity.status.contains("--budget"),
+            "the recorded reason must be the parse error, got: {}",
+            activity.status
         );
     }
 
