@@ -1,0 +1,245 @@
+# OLP Review Evidence — 行为证据互审流程
+
+> 入口: `scripts/olp-review-evidence.py` · 监控: `scripts/olp-review-monitor.py`
+> Spec: [specs/task-evo-review-evidence.spec.md](../specs/task-evo-review-evidence.spec.md)
+> Plan: [docs/superpowers/plans/2026-09-09-review-evidence.md](superpowers/plans/2026-09-09-review-evidence.md)
+
+## 流程总览
+
+```
+init ──▶ freeze ──▶ challenge ──▶ cross(×2) ──▶ status
+          两份初审     行为证据       逐 claim 裁决    汇总判词
+          (冻结+SHA)  (执行为本)     (采纳/反驳/待验证)
+```
+
+四个子命令按顺序推进;任一步失败输出可解析 JSON
+`{"error": {"code": "...", "message": "..."}}` 且 exit != 0。
+
+## init — 初始化评审目录
+
+```bash
+python3 scripts/olp-review-evidence.py init <review_dir> \
+  --repo <repo> --base <base_sha> --head <head_sha> \
+  --runtime <runtime_path> --session <session_id> --goal <goal_id>
+```
+
+记录 HEAD/base/runtime/session/goal 到 `review-state.json`(原子写入)。
+
+## freeze — 冻结两份独立初审
+
+```bash
+python3 scripts/olp-review-evidence.py freeze <review_dir> \
+  --glm-review glm.md --k3-review k3.md \
+  --glm-slug <slug> --k3-slug <slug> \
+  --native-root <runtime>/data/peers   # 外部权威收据根
+  [--runtime-evidence runtime-evidence.json]
+```
+
+**前置校验(fail-closed)**:
+
+| 校验 | 错误码 |
+|---|---|
+| 两份初审文件都存在且可解析 frontmatter | `first-reviews-incomplete` |
+| peer outcome 非 pending/errored(自报) | `peer-outcome-invalid` |
+| runtime-evidence 该 slug 无 active_thread | `peer-outcome-invalid` |
+| native result-N.md 非 errored(外部否决) | `peer-outcome-invalid` |
+| native 收据 slug 与报告 slug 匹配 | `peer-authority-mismatch` |
+| **有至少一种外部终止权威**(native 收据或 runtime-evidence 终止快照) | `peer-authority-missing` |
+| 报告 turn 恰等 native 最新编号 N(= turns.txt 已结束轮次) | — |
+| 报告 turn < N(旧轮初审) | `stale-turn` |
+| 报告 turn > N(未来轮) | `turn-mismatch` |
+| 报告 turn 非数字/缺失 | `peer-outcome-invalid` |
+| 报告 HEAD == 评审 HEAD(可选) | `head-mismatch` |
+
+冻结记录每份初审的 SHA256/peer/turn/outcome;此后任何改写或**删除**
+均触发 `first-review-tampered`(verify fail-closed)。
+
+## challenge — 行为证据(内容校验为门、执行为本)
+
+**推荐路径 — `--live-cargo`(唯一 live 执行入口)**:
+
+```bash
+python3 scripts/olp-review-evidence.py challenge <review_dir> \
+  --claim <claim_id> --live-cargo \
+  --selector <精确测试名> --expect pass|fail \
+  [--lib] [--test-target <集成测试名>] [--exec-repo <repo>]
+  [--manifest <Cargo.toml>] [--cargo-target-dir <dir>] [--timeout 300]
+```
+
+由本入口实时执行**固定的生产 Cargo adapter**
+(`scripts/olp-review-evidence-cargo.py`):repo/manifest/精确 selector/
+HEAD/source 绑定与完整输出工件/退出码全部由 adapter 产生并写
+`live-evidence/*.receipt.json`;本入口只转发参数、约束 deadline 并复核
+自产 receipt(selector/HEAD 一致),不引入任意 shell 旁路。**外部传入
+receipt/imported 日志不构成执行证明。**`--selector` 必须是 adapter
+`--list` 唯一定位的精确测试名(zero-match 前置拒绝 `no-tests-matched`);
+`--expect` 显式声明预期 pass/fail;真实执行但结果与预期相反
+(`expectation-violated`)仍如实记录为行为证据。`--lib` 走 src/ 单元测试
+路径(源文件 SHA256 绑定),集成测试省略。
+
+**负向判定路径 — 显式 `--evidence` 日志(仅拒绝/分层,永不采信为执行)**:
+
+```bash
+python3 scripts/olp-review-evidence.py challenge <review_dir> \
+  --evidence ev.log --claim <claim_id> \
+  --test-name outer_review_627_x \
+  --harness-root tests/ --harness-root src/ \
+  --run-dir <repo> [--timeout 300] [--imported]
+```
+
+`--live-cargo` 与 `--imported` 互斥。`--exec-argv` 任意执行体一律
+`executor-not-trusted`(**永不执行**;唯一 live 执行入口是 `--live-cargo`
+经固定生产 adapter)。**判定顺序**:
+
+1. **imported 分层**(先于一切内容判定): 外层导入未独立执行的日志 →
+   `not-replayed`,不自动 accepted。
+2. **内容门**: 证据含结构锚(测试名行 + panicked at + FAILED 汇总,
+   或通过形态 `test result: ok.`);纯文档/字符串断言 →
+   `evidence-not-behavioral`,claim 置 `unverified`。
+3. **测试名解析**: `--test-name` 必须能在 `--harness-root` 源码中解析到
+   `fn <name>(` 定义。
+4. **执行终拒(核心)**: 结构锚齐全但无本入口真实执行的 receipt →
+   `evidence-not-executed`(外部日志/自造 argv 均不可作为执行证明;
+   `/usr/bin/false` 等无关命令同拒)。执行证明只能来自 `--live-cargo`
+   自产 receipt(selector/HEAD 绑定)。
+
+**判别式**(executed 后):
+
+- exit≠0 + FAILED 汇总(PR HEAD 真实复现) → `blocked-on-evidence`
+- exit=0 + `test result: ok.`(真实通过) → `approve`
+- 仅遗留路径可达 → `flipped`(PR 级聚合 residual)
+
+## cross — 交叉互审
+
+```bash
+python3 scripts/olp-review-evidence.py cross <review_dir> \
+  --cross-report cross.md --cross-slug <slug> \
+  --native-root <runtime>/data/peers --expect-claims X,Y,Z \
+  [--allow-operator-refute]
+```
+
+前置: frozen + challenge 已接纳。cross 报告须含结构化 `cross_claims`
+块(`cross_claims: [{id, verdict, evidence, ...}]`),逐 claim 覆盖
+(`missing-claim-coverage`;无块 → 覆盖校验拒绝);errored/pending 拒绝;
+同样要求外部权威收据。**文字+行号反驳不得覆盖已复现失败** —— 结构化
+refute 仅在已验证新行为证据或显式 `--allow-operator-refute` 人工裁决
+下生效,否则 `challenge-refuted` 回边只认新重放行为证据。
+
+## status — 汇总
+
+```bash
+python3 scripts/olp-review-evidence.py status <review_dir>
+```
+
+- 无执行证据的两模型一致 approve → `pending-behavioral-evidence`
+- PR 级聚合 = f(claim × severity × introduced_vs_existing),
+  期望分类来自外层 MANIFEST `outer_recommendation`(禁 PR 编号硬编码)
+
+## 监控入口 — Herdr pane 可读
+
+```bash
+python3 scripts/olp-review-monitor.py <review_dir> \
+  [--runtime-dir <runtime>] [--profile <profile>] \
+  [--board <ack-board.md>] [--session <wire-session>] \
+  [--format human|json]
+```
+
+四区块: lifecycle / current-turn / last-outcome / deliverables。核心
+身份语义(fail-closed,详见 spec `Rule: review-monitor`):
+
+- **runtime 身份是复合标识**(runtime 路径+session+goal),裸 `goal_01`
+  不是身份;`--profile` 缺省时不扫描 foreign profile 兜底。
+- **thread 晋升 running 需正向身份证明**: 未完 native thread
+  (v/session_id/thread_id/next_seq/completed=false,无 active 键)要晋升
+  peer 为 running,peer 目录 `originator`(wire master 同源)与 `goal`
+  文件必须对当前视角已知字段**实际匹配**——缺失即 unknown
+  (`peer-*-unproven-missing`),信息不足 ≠ 归属证明;与当前视角矛盾的
+  一律 unknown。身份逐键一致的合法绑定仍 running(正向对照)。
+- **终止态只信 native 证据**: result-N.md+turns.txt 交叉一致的
+  completed/errored/interrupted/rate_limited 四值如实分层;快照自报
+  outcome/outcome_source 仅作 `snapshot-outcome-untrusted:*` notes,
+  不构成终止权威。lifetime.json 逐字段严格校验(originator==master 等)。
+- **negative_events 归属过滤**: 按当前 profile+goal(+ 事件携带的
+  originator session)过滤;当前 profile 缺失不扫 foreign。
+- ACK 缓存写自身 `monitor-state.json`(原子),与 `olp-watch-board.sh`
+  契约互不干扰;监控绝不改写 review-state.json。
+
+## classify — PR 级通用聚合(spec L55-73/L439-455)
+
+**受信来源门(Blocker1)**: `--review-dir <dir>`(可重复,必填才有来源):
+每个上下文须 frozen、reviews 形状合法、真实 repo HEAD == state.head、
+verify_no_tamper 通过(同一 flock 临界区读取);注册表 = 其 challenges[*].
+history 中 accepted live 记录(receipt canonical 路径 + sha256 +
+live-evidence 目录包含),只由 `--live-cargo` 写入,classify 只读。
+`--review-dir` **可重复**: BASE/HEAD(及多 PR)各自一个受信上下文,
+每上下文保留自己的真实 repo/HEAD(state-HEAD 门不弱化)。caller-selected
+context 是**受信边界**(调用方选择信任哪些评审目录),不是密码学签名——
+能整套改写受信目录的行动者在边界之外(物理/仓库安全与 freeze 防篡改
+层职责)。
+per-HEAD receipt 须命中注册(防外部副本/篡改);BASE/HEAD 双执行证明
+**两侧**各自绑定注册执行(同 qualified selector + test_target sha +
+observed=fail + 真 int 非零 exit + stdout sha == slot 对应 log sha)。
+一致性 ≠ 来源: 完全自洽伪造链 → blocked/unassessed;历史未注册数据 →
+blocked/unassessed 降级。`clean` 当前为保留态(无受支持的对照证明路径
+时不可达,不放宽)。PASS 记录要求 adapter_exit 与 cargo_exit 均为
+**真 int 0**(bool 是 int 子类,显式拒绝)。
+
+
+```bash
+python3 scripts/olp-review-evidence.py classify \
+  --manifest <MANIFEST.json> --replay-summary <replay-summary.json> \
+  --review-dir <ctx1> [--review-dir <ctx2> ...] \
+  [--slot <slot.json> --slot-log-dir <双日志目录>]
+```
+
+分类意图来自外层(MANIFEST `outer_recommendation`);工具只做通用聚合
+派生,**零 PR 编号分支**:
+
+- **per-selector 产品裁决(逐条 receipt 校验)**: 每条失败记录必须
+  receipt 文件在场且 summary↔receipt 一致(selector/HEAD before+after/
+  observed/exit_code);**缺失/外来伪装/不一致 → harness 证据错误,
+  该 PR 一律 blocked/unassessed,不得继承 existing/residual**。
+  harness 状态(adapter_exit)与产品失败分列——`adapter_exit=0/
+  cargo_exit=101/observed=fail` 是"harness 成功+产品测试失败"(缺陷
+  证据),adapter 非零是 harness 故障,均不得混淆。
+- **introduced_vs_existing**: 需 BASE/HEAD 同 probe 双执行对照(slot
+  sha256 逐字节核验 + pr_head 匹配 + **slot probe 源文件声明的测试
+  函数名与失败 selector 精确同名**)。**当前生产仅支持"双 FAIL 形态
+  同构 → existing"一种对照模式**;`introduced`(HEAD FAIL + BASE
+  PASS)是冻结词表的保留语义,**当前无对应双执行证据模式支撑、不会
+  产出**——缺该模式证据时不判 introduced,一律 `unassessed`。
+  **缺双执行证据或仅部分失败 selector 被覆盖 → `unassessed`/整 PR
+  blocked,禁按 exit_code 相等或任一 head 匹配把 existing 推广到整
+  PR;缺双执行证据禁标 clean**。
+- **PR 级**: `clean`(全 pass 且无 unassessed)/`residual`(失败全
+  existing,判词绑定 slot+双日志)/`blocked`(反例成立且无双执行对照,
+  或 harness 收据缺失/hash 不符)。
+- claim 级 `flipped` = 遗留/既有路径(legacy/existing),与
+  `introduced_vs_existing` 是两个维度;真实执行复现失败 → claim 级
+  `blocked-on-evidence`。
+
+## 判词状态机(claim 级两层词表)
+
+```
+approve ──challenge(fail)──▶ flipped ──cross反驳──▶ challenge-refuted
+   │                            │
+   │ 无证据                     │ executed FAIL @HEAD
+   ▼                            ▼
+pending-behavioral-evidence   blocked-on-evidence
+   │ 收口仍缺
+   ▼
+unverified          not-replayed(imported 未独立复验)
+```
+
+## 测试真实性边界
+
+- `tests/olp_review_evidence.rs`(53 pass / 1 ignored):
+  子进程真实调用生产入口;外层反例回归先 RED 后修(证据 `.octos/red-proof/`)。
+- `olp_review_k3_full_happy_path_accepted` 替代旧假日志 approve 路线
+  (python 假 cargo 日志违反合约 3,已 REMOVED)。
+- `olp_review_real_store_harness_executes_historical_negative_probes`:
+  临时 clone 固定 PR 合成树 + `include!` 外层诊断反例源码,真实 cargo
+  编译执行 8 探针(约 30s,独立昂贵验收,不在每个单测重复)。
+- Python 打印 cargo 样式文本的伪造 argv 无法成为行为 verified。
+- 顺序如实记录: 首批 18 测试与脚本同轮实现(先落盘后补测试);
+  外层反例与新场景按先 RED 后修。
