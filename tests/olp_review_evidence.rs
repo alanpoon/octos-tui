@@ -2230,20 +2230,13 @@ fn olp_review_regression_dataset_classifies_four_prs() {
         "fixtures 应含 60+ 文件,实际 {}",
         files.len()
     );
-    // adversarial.log 是缺陷证据: 8 failed,不得写成通过
+    // adversarial.log 是缺陷证据: 8 failed,不得写成通过。
+    // 文件经 git add -f 强制纳入提交(.gitignore *.log 规则例外,
+    // 见 FIXTURES-SHA256.json note) — 干净 checkout 必须在场,缺失即失败。
     let adv = std::fs::read_to_string(fx.join("evidence/adversarial.log"))
-        // .gitignore *.log 规则可能使该缺陷证据文件在干净 checkout 缺失;
-        // 此处不 panic —— 由下方清单核验给出 fail-closed 语义。
-        .unwrap_or_else(|_| String::new());
-    assert!(
-        !adv.is_empty() || std::env::var("CI_FIXTURES_FULL").is_ok(),
-        "adversarial.log 缺失(可能被 *.log ignore 规则排除);这是缺陷证据文件,\
-         干净树必须有它: 运行 git add -f 或用 --force 恢复"
-    );
-    if !adv.is_empty() {
-        assert!(adv.contains("8 failed"), "adversarial.log 应记录 8 failed");
-        assert!(!adv.contains("8 passed"), "不得把 8 failed 写成 8 passed");
-    }
+        .expect("adversarial.log 必须在提交内(git add -f;*.log ignore 例外)");
+    assert!(adv.contains("8 failed"), "adversarial.log 应记录 8 failed");
+    assert!(!adv.contains("8 passed"), "不得把 8 failed 写成 8 passed");
     // MANIFEST 期望分类(外层独立写入)存在且非硬编码于脚本
     let outer: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(fx.join("MANIFEST.json")).unwrap()).unwrap();
