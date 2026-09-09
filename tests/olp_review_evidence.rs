@@ -7,7 +7,7 @@
 //! 外层反例场景(olp_review_outer_probe_*)按"先 RED 后修"补写,
 //! 对应 ../outer-evidence-probe-results.json 实测缺陷。
 //! v4(evidence-rescue-shared): adapter 行为证据改经真实最小 Cargo fixture
-//! (make_cargo_fixture,无依赖真实编译真实断言,共享 target 缓存),不再递归
+//! (make_cargo_fixture,无依赖真实编译真实断言,fixture 独立 target),不再递归
 //! 编译整仓;adapter 修复外层两实测漏洞(zero-match/foreign-manifest,
 //! ../outer-adapter-probe-results.json)并新增 --lib 单元测试入口;8 真实
 //! Store 探针重放改 #[ignore] 显式单独集成入口(外层单次执行)。
@@ -286,8 +286,10 @@ fn review_head(dir: &Path, fixture_repo: &Path) -> String {
 }
 
 /// 创建最小无依赖 Cargo fixture(真实 git 仓库,HEAD 可绑定)。
-/// 子进程带 deadline;首次调用编译一次并复制 target 到共享缓存,
-/// 后续调用复制缓存,秒级完成(8 并发不再 8 份从零编译)。
+/// 只建 repo+源码+git HEAD,不预编译/不共享/不复制 target: 共享 target
+/// 会被 cargo 按 mtime 误信 fingerprint 跨 fixture 复用旧二进制
+/// (PR#632 CI 二轮根因,详见 commit message);编译由 adapter 在
+/// 各自 --target-dir 真实执行(compile-error fixture 由其拒绝分支覆盖)。
 fn make_cargo_fixture(tag: &str, tests_rs: &str) -> (TmpDir, PathBuf, String) {
     let t = TmpDir::new(&format!("fixture-{tag}"));
     let repo = t.path().join("fixture-repo");
@@ -300,10 +302,7 @@ fn make_cargo_fixture(tag: &str, tests_rs: &str) -> (TmpDir, PathBuf, String) {
     )
     .unwrap();
     std::fs::write(repo.join("tests").join("fixture.rs"), tests_rs).unwrap();
-    let seed = cache_dir().join("seed-Cargo.lock");
-    if seed.exists() {
-        std::fs::copy(&seed, repo.join("Cargo.lock")).unwrap();
-    }
+    // (target 复用根因见函数 doc;此处只建 repo,不碰任何共享缓存。)
     // git init 必须最先执行: identity 配置写的是本 fixture 仓库的
     // .git/config(--local),init 之前配置会失败或误写父 repo。
     {
@@ -360,27 +359,6 @@ fn make_cargo_fixture(tag: &str, tests_rs: &str) -> (TmpDir, PathBuf, String) {
         );
     }
     let head = fixture_head(&repo);
-    let cache_t = cache_dir().join("target");
-    if !cache_t.exists() {
-        let out = run_deadline(
-            Command::new("cargo")
-                .args(["test", "--no-run"])
-                .current_dir(&repo)
-                .env("CARGO_TARGET_DIR", &cache_t)
-                .env("CARGO_BUILD_JOBS", "4"),
-            300,
-            "fixture seed build",
-        );
-        assert!(
-            out.status.success(),
-            "fixture seed build failed: {}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let _ = std::fs::rename(repo.join("Cargo.lock"), &seed);
-    }
-    let _ = std::fs::remove_dir_all(t.path().join("target"));
-    copy_dir(&cache_t, &t.path().join("target"));
     (t, repo, head)
 }
 
@@ -394,26 +372,6 @@ fn fixture_head(repo: &Path) -> String {
     );
     assert!(out.status.success());
     String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
-/// 共享缓存(进程级,跨并发测试复用): target 编译产物 + seed Cargo.lock。
-fn cache_dir() -> PathBuf {
-    let d = std::env::temp_dir().join("olp-review-evidence-fixture-cache");
-    std::fs::create_dir_all(&d).unwrap();
-    d
-}
-
-fn copy_dir(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for e in std::fs::read_dir(src).unwrap() {
-        let e = e.unwrap();
-        let to = dst.join(e.file_name());
-        if e.file_type().unwrap().is_dir() {
-            copy_dir(&e.path(), &to);
-        } else {
-            let _ = std::fs::copy(e.path(), &to);
-        }
-    }
 }
 
 /// 带 deadline 的子进程执行: 持句柄 poll,超时 kill+wait 回收,
