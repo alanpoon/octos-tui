@@ -11698,6 +11698,17 @@ impl Store {
         None
     }
 
+    /// Activity-row title for a monitor: the human name the server sent, or
+    /// the id when it sent none. Same never-unattributed rule as
+    /// [`crate::model::BackgroundActivityParams::display_origin`], so a
+    /// monitor's lifecycle rows and its event lines agree on what to call it.
+    fn monitor_title(monitor_id: &str, name: Option<&str>) -> String {
+        name.map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(monitor_id)
+            .to_string()
+    }
+
     fn apply_notification(&mut self, notification: UiNotification) -> Option<AppUiCommand> {
         match notification {
             // #1477 voice rich-output visual lifecycle. octoscode does not yet
@@ -12843,14 +12854,90 @@ impl Store {
             // steer earns a re-stage — whoever consumes it first (this arm or
             // the terminal fallback) owns the re-queue; the other is a no-op.
             UiNotification::TurnSteerDropped(event) => self.apply_turn_steer_dropped(event),
-            // New in the octos-core rev pinned by task-consume-turn-steer-dropped
-            // (monitor runtime + background activity feed). This client renders
-            // no UI for them yet — ignore explicitly so the match stays
-            // exhaustive without changing any state.
-            UiNotification::MonitorUpdated(_)
-            | UiNotification::MonitorFired(_)
-            | UiNotification::MonitorExpired(_)
-            | UiNotification::BackgroundActivity(_) => None,
+            // octos#1977 monitor LIFECYCLE, gated on
+            // `coding.monitor_runtime.v1`. The matched event lines arrive
+            // separately as `background/activity` (origin_kind "monitor") and
+            // are already rendered; these three carry the STATE around them.
+            // Mirrors the `loop/updated|fired|completed` handlers above —
+            // monitors are the zero-token sibling of loops and read the same
+            // way in the activity feed.
+            UiNotification::MonitorUpdated(event) => {
+                // A monitor that hit its per-hour flood cap is auto-paused
+                // SERVER-side; `pause_reason` is the only signal the user gets
+                // that their event lines stopped on purpose rather than
+                // because the probe died. Prefer it over the bare status.
+                let status = match (
+                    event.status.clone(),
+                    event.monitor_state.pause_reason.clone(),
+                ) {
+                    (_, Some(reason)) if !reason.trim().is_empty() => {
+                        format!("{} — {reason}", event.monitor_state.status)
+                    }
+                    (Some(status), _) => status,
+                    (None, _) => event.monitor_state.status.clone(),
+                };
+                let title = Self::monitor_title(
+                    &event.monitor_state.monitor_id,
+                    Some(&event.monitor_state.name),
+                );
+                self.state.push_activity(
+                    ActivityItem::new(ActivityKind::Progress, title, status)
+                        .with_detail("monitor")
+                        .with_session(event.session_id.clone()),
+                );
+                None
+            }
+            UiNotification::MonitorFired(event) => {
+                // `line_count` is what distinguishes a monitor wake from a
+                // loop tick: it says how much matched, so a chatty probe is
+                // legible as one row rather than inferred from a burst of
+                // background-activity lines.
+                let status = match event.line_count {
+                    Some(1) => "fired · 1 line".to_string(),
+                    Some(count) => format!("fired · {count} lines"),
+                    None => "fired".to_string(),
+                };
+                let title = Self::monitor_title(&event.monitor_id, event.name.as_deref());
+                self.state.push_activity(
+                    ActivityItem::new(ActivityKind::Progress, title, status)
+                        .with_detail("monitor")
+                        .with_session(event.session_id.clone()),
+                );
+                None
+            }
+            UiNotification::MonitorExpired(event) => {
+                // A non-persistent monitor expires either on its timeout or
+                // because the stream process exited — very different facts for
+                // the user, and `reason` is what separates them.
+                let status = match event.reason.as_deref().map(str::trim) {
+                    Some(reason) if !reason.is_empty() => format!("expired — {reason}"),
+                    _ => event
+                        .status
+                        .clone()
+                        .unwrap_or_else(|| "expired".to_string()),
+                };
+                let title = Self::monitor_title(
+                    &event.monitor_id,
+                    event
+                        .monitor_state
+                        .as_ref()
+                        .map(|monitor| monitor.name.as_str()),
+                );
+                self.state.push_activity(
+                    ActivityItem::new(ActivityKind::Progress, title, status)
+                        .with_detail("monitor")
+                        .with_session(event.session_id.clone()),
+                );
+                None
+            }
+            // `background/activity` never reaches here: the transport decodes
+            // it tui-locally into `ClientEvent::BackgroundActivity` before the
+            // vendored decoder runs (the pinned octos-core rev predates the
+            // variant), and `push_background_activity` renders it. This arm is
+            // the defensive tail for a future rev where the vendored decoder
+            // wins the race — dropping it there would be correct, because the
+            // row would already have been rendered by the other path.
+            UiNotification::BackgroundActivity(_) => None,
         }
     }
 
@@ -19972,7 +20059,12 @@ mod tests {
     }
 
     #[test]
-    fn monitor_and_background_activity_notifications_are_ignored() {
+    fn monitor_lifecycle_notifications_render_activity_rows() {
+        // octos#1977: monitors are armed by the MODEL (keeper-gated
+        // `monitor_create`), so the TUI never sees a request/response pair for
+        // them — these three notifications are the only lifecycle signal it
+        // gets, and dropping them made an auto-paused monitor indistinguishable
+        // from a dead one.
         let mut store = store_with_empty_session();
         let sid = store.state.sessions[0].id.0.clone();
         let before_status = store.state.status.clone();
@@ -19980,7 +20072,8 @@ mod tests {
         let monitor = serde_json::json!({
             "monitor_id": "m1", "session_id": sid, "name": "logs", "argv": ["tail"],
             "mode": "stream", "batch_ms": 100, "max_events_per_hour": 10, "persistent": false,
-            "status": "active", "fires_used": 0, "created_at_ms": 0, "updated_at_ms": 0
+            "status": "paused", "pause_reason": "max_events_per_hour exceeded",
+            "fires_used": 60, "created_at_ms": 0, "updated_at_ms": 0
         });
         let frames = [
             (
@@ -19989,28 +20082,81 @@ mod tests {
             ),
             (
                 "monitor/fired",
-                serde_json::json!({"session_id": sid, "monitor_id": "m1"}),
+                serde_json::json!({"session_id": sid, "monitor_id": "m1",
+                                   "name": "logs", "line_count": 3}),
             ),
             (
                 "monitor/expired",
-                serde_json::json!({"session_id": sid, "monitor_id": "m1"}),
-            ),
-            (
-                "background/activity",
-                serde_json::json!({
-                    "session_id": sid, "origin_kind": "monitor", "origin_id": "m1",
-                    "text": "line", "emitted_at_ms": 0
-                }),
+                serde_json::json!({"session_id": sid, "monitor_id": "m1",
+                                   "reason": "stream process exited"}),
             ),
         ];
         for (method, params) in frames {
             let notification = UiNotification::from_method_and_params(method, params)
                 .unwrap_or_else(|err| panic!("{method} decodes: {err:?}"));
             let command = store.apply_event(AppUiEvent::Protocol(notification));
-            assert!(command.is_none(), "{method} must be ignored");
+            assert!(command.is_none(), "{method} must not issue a command");
         }
+
+        let rows: Vec<(String, String)> = store
+            .state
+            .activity
+            .iter()
+            .filter(|item| item.detail.as_deref() == Some("monitor"))
+            .map(|item| (item.title.clone(), item.status.clone()))
+            .collect();
+        assert_eq!(rows.len(), 3, "one row per lifecycle frame: {rows:?}");
+
+        // Named monitors are titled by name, not id, so the lifecycle rows and
+        // the `background/activity` group header agree on what to call it.
+        assert_eq!(rows[0].0, "logs");
+        assert_eq!(rows[1].0, "logs");
+        // `monitor/expired` carries the record only optionally, and octos does
+        // not emit this frame at all yet, so a payload without it falls back to
+        // the id rather than inventing a name. Deliberately not papered over
+        // with a client-side name cache: that would need per-session eviction
+        // to stay bounded, for a frame nothing currently sends.
+        assert_eq!(rows[2].0, "m1");
+
+        // The auto-pause reason is the whole point: without it the user only
+        // sees their event lines stop.
+        assert!(
+            rows[0].1.contains("max_events_per_hour exceeded"),
+            "updated row must surface the pause reason: {:?}",
+            rows[0]
+        );
+        // A monitor wake is legible as ONE row carrying its match count,
+        // rather than being inferred from a burst of background lines.
+        assert_eq!(rows[1].1, "fired \u{b7} 3 lines");
+        assert!(rows[2].1.contains("stream process exited"), "{:?}", rows[2]);
+
+        // Lifecycle rows are ambient: they never hijack the status line or
+        // make an idle session look busy.
         assert_eq!(store.state.status, before_status);
         assert_eq!(store.state.run_state, before_run_state);
+    }
+
+    #[test]
+    fn background_activity_is_not_double_rendered_by_the_vendored_decoder() {
+        // `background/activity` is decoded tui-locally in the transport into
+        // `ClientEvent::BackgroundActivity` and rendered by
+        // `push_background_activity`. Should a future vendored octos-core rev
+        // win the decode race, this arm must stay a no-op — rendering here too
+        // would duplicate every line.
+        let mut store = store_with_empty_session();
+        let sid = store.state.sessions[0].id.0.clone();
+        let before_status = store.state.status.clone();
+        let notification = UiNotification::from_method_and_params(
+            "background/activity",
+            serde_json::json!({
+                "session_id": sid, "origin_kind": "monitor", "origin_id": "m1",
+                "text": "line", "emitted_at_ms": 0
+            }),
+        )
+        .expect("background/activity decodes");
+        let command = store.apply_event(AppUiEvent::Protocol(notification));
+        assert!(command.is_none());
+        assert_eq!(store.state.status, before_status);
     }
 
     /// A server that advertises `event.turn_steer_dropped.v1` (dropped-before-

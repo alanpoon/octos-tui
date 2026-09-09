@@ -3271,6 +3271,7 @@ fn appui_feature_tokens_for(old_server: bool) -> Vec<String> {
         UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
         UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
         UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
+        crate::model::APPUI_FEATURE_CODING_MONITOR_RUNTIME_V1,
         UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
         UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
         UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
@@ -8949,6 +8950,25 @@ mod tests {
         assert!(
             !appui_feature_header_for(true)
                 .contains(crate::model::APPUI_FEATURE_BACKGROUND_ACTIVITY_V1),
+            "the old-server baseline must not request it"
+        );
+    }
+
+    #[test]
+    fn should_advertise_monitor_runtime_when_negotiating_features() {
+        // octos gates monitor notifications on this token server-side (#1977
+        // blocker 6: a connection that did not negotiate never receives
+        // `monitor/updated|fired|expired`, on live broadcast AND reconnect
+        // replay). Without it in the header the lifecycle handlers in
+        // `store::apply_notification` are unreachable by construction.
+        let header = appui_feature_header_for(false);
+        assert!(
+            header.contains(crate::model::APPUI_FEATURE_CODING_MONITOR_RUNTIME_V1),
+            "modern feature header must request the monitor runtime: {header}"
+        );
+        assert!(
+            !appui_feature_header_for(true)
+                .contains(crate::model::APPUI_FEATURE_CODING_MONITOR_RUNTIME_V1),
             "the old-server baseline must not request it"
         );
     }

@@ -274,6 +274,24 @@ pub const APPUI_FEATURE_CODING_AGENT_CONTROL_V1: &str = "coding.agent_control.v1
 pub const APPUI_FEATURE_CODING_GOAL_RUNTIME_V1: &str = "coding.goal_runtime.v1";
 pub const APPUI_FEATURE_CODING_LOOP_RUNTIME_V1: &str = "coding.loop_runtime.v1";
 
+/// octos#1977 monitor runtime — the ZERO-TOKEN sibling of `coding.loop_runtime.v1`.
+/// A monitor is a probe subprocess whose filtered stdout lines wake the master
+/// through an external continuation; unlike `/loop` it does not burn a master
+/// turn per tick, so it runs only when an event line actually appears.
+///
+/// Negotiating this gates the `monitor/updated|fired|expired` LIFECYCLE
+/// notifications. It does not imply a control surface: monitors are armed by
+/// the MODEL through the keeper-gated `monitor_create` tool (octos
+/// `goal_tool.rs`), not by this client, so the TUI is a lifecycle OBSERVER.
+///
+/// The matched event lines themselves already arrive over a separate,
+/// already-negotiated channel — `background/activity` with
+/// `origin_kind = "monitor"` ([`APPUI_FEATURE_BACKGROUND_ACTIVITY_V1`]). What
+/// this feature adds is the state around them: armed, fired, auto-paused on
+/// the per-hour flood cap, expired. Without it a monitor silently
+/// auto-pauses and the user sees their event lines simply stop.
+pub const APPUI_FEATURE_CODING_MONITOR_RUNTIME_V1: &str = "coding.monitor_runtime.v1";
+
 /// octos#2019 human sink over background events that today only wake the
 /// model. When negotiated the server pushes `background/activity`; when it is
 /// NOT negotiated the server never sends the frame, so an older TUI can never
