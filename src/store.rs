@@ -273,6 +273,11 @@ pub struct Store {
 /// `Accepted` carries the optional [`AppUiCommand`] the dispatcher produced (it
 /// is `None` for accepted pure-client commands like `/theme`, `/ps`, `/copy`,
 /// `OpenMenu`), so acceptance is decoupled from "produced a backend command".
+/// The server's error code for a `session/open` naming a profile it does not
+/// have. The client treats it as "this profile needs creating", not a generic
+/// failure.
+const PROFILE_UNRESOLVED_ERROR_CODE: &str = "profile_unresolved";
+
 /// The command is boxed (as elsewhere in this crate, e.g.
 /// [`crate::menu::types::MenuAction::SendAppUi`]) to keep the enum small —
 /// `AppUiCommand` is a large variant and `Rejected` carries no data.
@@ -9372,6 +9377,24 @@ impl Store {
                 None
             }
             AppUiEvent::Error(error) => {
+                // The server rejected `session/open` because the requested
+                // profile does not exist. On a REMOTE launch this is the only
+                // authoritative signal available: `profiles_data_dir` is set
+                // only for a stdio launch (see `event_loop`), so
+                // `local_profile_is_missing` returns None and the launch-time
+                // guard in `apply_launch_resolve_event` cannot fire. Route the
+                // rejection into the same creation flow instead of dead-ending
+                // on a raw error the operator cannot act on. Gated on the
+                // server actually supporting local creation — against a legacy
+                // server the wizard's create step would fail too.
+                if error.code == PROFILE_UNRESOLVED_ERROR_CODE
+                    && self.local_profile_create_supported()
+                    && let Some(profile_id) = self.state.onboarding.launch_profile_id.clone()
+                {
+                    self.state.status = error.message.clone();
+                    self.begin_missing_local_profile_creation(profile_id);
+                    return None;
+                }
                 // OUTER_LOOP_REVIEW #12: an attributed `session/hydrate`
                 // failure/cancellation answers the in-flight request — clear
                 // every session's marker so a later resume/reconnect can
@@ -26831,6 +26854,61 @@ now analyzing the bus module"
         assert!(store.state.onboarding.creating_new_profile);
         assert_eq!(store.state.onboarding.requested_id, "ymote");
         assert!(store.state.onboarding.profile_id.is_none());
+    }
+
+    #[test]
+    fn remote_profile_unresolved_rejection_opens_profile_creation() {
+        // A WebSocket launch has no local data dir, so `profiles_data_dir` is
+        // None, `local_profile_is_missing` returns None ("unknown"), and the
+        // launch-time guard cannot fire no matter what the server advertises.
+        // The server's own `profile_unresolved` rejection is the authoritative
+        // signal that the pinned profile does not exist — route it into the
+        // same creation flow instead of dead-ending on a raw error.
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+        ]));
+        store.state.onboarding.launch_profile_id = Some("alan".into());
+        assert!(
+            store.state.onboarding.profiles_data_dir.is_none(),
+            "a remote launch has no local profile registry"
+        );
+
+        store.apply_client_event(
+            AppUiEvent::Error(AppUiError {
+                code: "profile_unresolved".into(),
+                message: "session/open request tui-6 failed: profile 'alan' is not \
+                          configured for this AppUI session"
+                    .into(),
+            })
+            .into(),
+        );
+
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
+        assert!(store.state.onboarding.creating_new_profile);
+        assert_eq!(store.state.onboarding.requested_id, "alan");
+    }
+
+    #[test]
+    fn profile_unresolved_without_local_create_support_does_not_open_creation() {
+        // A legacy/non-solo server cannot create a local profile, so the
+        // rejection must stay an error rather than opening a wizard whose
+        // create step would itself fail.
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_AUTH_STATUS,
+        ]));
+        store.state.onboarding.launch_profile_id = Some("alan".into());
+
+        store.apply_client_event(
+            AppUiEvent::Error(AppUiError {
+                code: "profile_unresolved".into(),
+                message: "profile 'alan' is not configured for this AppUI session".into(),
+            })
+            .into(),
+        );
+
+        assert!(!store.active_menu_id_is(crate::menu::registry::MENU_ONBOARD));
     }
 
     #[test]

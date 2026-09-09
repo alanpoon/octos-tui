@@ -174,6 +174,42 @@ fn olp_ack_rejects_unknown_status() {
     assert!(!ack_line_matches_v1("ACK(done):   ")); // empty explanation
 }
 
+/// Blackboard #2 (2026-09-08): the `olp-init.sh` board template must not seed
+/// a bare `ACK:` placeholder. The inner loop appends its receipt *after* the
+/// stub, producing `ACK: ACK(done): …` — a line the v1 grammar rejects (it
+/// starts with `ACK:` and is not on the frozen legacy whitelist) and the
+/// harvest sentinel never matches. The template must leave the first receipt
+/// free to stand on its own line starting with `ACK(`.
+#[test]
+fn olp_init_board_template_seeds_no_ack_placeholder() {
+    let script = read("scripts/olp-init.sh");
+    let marker = "<<'BOARD'\n";
+    let start = script
+        .find(marker)
+        .expect("olp-init.sh must emit the blackboard via a <<'BOARD' heredoc");
+    let body = &script[start + marker.len()..];
+    let end = body
+        .find("\nBOARD\n")
+        .expect("the BOARD heredoc must be terminated");
+    let template = &body[..end];
+
+    let seeded: Vec<&str> = template
+        .lines()
+        .filter(|line| line.trim_start().starts_with("ACK"))
+        .collect();
+    assert!(
+        seeded.is_empty(),
+        "the board template must not seed an ACK line — the inner loop fills in \
+         after it and the resulting receipt violates the v1 grammar:\n{}",
+        seeded.join("\n")
+    );
+    // The v1 grammar must still be taught, as prose rather than a fillable stub.
+    assert!(
+        template.contains("ACK(done|wontdo|blocked)"),
+        "the board template must still document the v1 ACK grammar"
+    );
+}
+
 #[test]
 fn olp_lane_template_parses() {
     let protocol = read("docs/OUTER_LOOP_PROTOCOL.md");

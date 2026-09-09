@@ -409,6 +409,11 @@ pub struct ProtocolAppUiBackend {
     /// healthy transport usable for correction, but fail session-bound work
     /// closed until an explicit/reconnect open succeeds (including TTL retries).
     session_open_required: bool,
+    /// The server's reason for the most recent `session/open` rejection on this
+    /// connection. Follow-ups refused by `reject_command_without_confirmed_open`
+    /// quote it, so the operator sees the actual cause (e.g. an unknown profile)
+    /// instead of only the first innocent command that tripped the gate.
+    session_open_rejection_reason: Option<String>,
     deferred_until_reconnect_open: VecDeque<AppUiCommand>,
     sending_reconnect_open: bool,
     /// A replacement stdio child is connected, but the store must not clear
@@ -1748,6 +1753,7 @@ impl ProtocolAppUiBackend {
             reconnect_session_scopes: VecDeque::new(),
             reconnect_open_barrier: None,
             session_open_required: false,
+            session_open_rejection_reason: None,
             deferred_until_reconnect_open: VecDeque::new(),
             sending_reconnect_open: false,
             backend_relaunch_reconcile_pending: false,
@@ -1983,6 +1989,8 @@ impl ProtocolAppUiBackend {
         self.capabilities_probe = None;
         self.client_hello_barrier = None;
         self.reconnect_open_barrier = None;
+        // Per-connection: a new connection has rejected nothing yet.
+        self.session_open_rejection_reason = None;
         self.reconnect_session_scopes.clear();
         // A command deferred behind this connection's barriers never crosses
         // to the replacement child: it has no pending entry (so it would be
@@ -2310,6 +2318,7 @@ impl ProtocolAppUiBackend {
             if opened_session == expected_session {
                 self.reconnect_open_barrier = None;
                 self.session_open_required = false;
+                self.session_open_rejection_reason = None;
                 // The server confirmed this scope: promote the candidate so a
                 // later rejected open has a known-good target to fall back to.
                 self.confirmed_reopen_session = self.reopen_session.clone();
@@ -2337,6 +2346,7 @@ impl ProtocolAppUiBackend {
                 // re-arms the barrier before its own follow-ups are sent.
                 self.reconnect_open_barrier = None;
                 self.session_open_required = true;
+                self.session_open_rejection_reason = rpc_error_reason_from_frame(text);
                 self.reconnect_session_scopes.clear();
                 self.reopen_session = self.confirmed_reopen_session.clone();
                 self.queue_pending_backend_relaunch_reconcile();
@@ -2398,10 +2408,16 @@ impl ProtocolAppUiBackend {
     }
 
     fn reject_command_without_confirmed_open(&mut self, command: AppUiCommand) {
-        let message = format!(
-            "{} was not sent because session/open was rejected; open the intended session successfully before retrying",
-            command.method()
-        );
+        let message = match self.session_open_rejection_reason.as_deref() {
+            Some(reason) => format!(
+                "{} was not sent because session/open was rejected ({reason}); open the intended session successfully before retrying",
+                command.method()
+            ),
+            None => format!(
+                "{} was not sent because session/open was rejected; open the intended session successfully before retrying",
+                command.method()
+            ),
+        };
         if matches!(command, AppUiCommand::HydrateSession(_)) {
             self.queue.push_back(command_error_event(
                 &command,
@@ -5230,6 +5246,14 @@ fn response_is_rpc_error(text: &str) -> bool {
                 .map(|frame| frame.contains_key("error") && !frame.contains_key("result"))
         })
         .unwrap_or(false)
+}
+
+/// The human-readable reason from a JSON-RPC error response frame, reusing the
+/// same `data.message`-first precedence as every other error the client shows.
+fn rpc_error_reason_from_frame(text: &str) -> Option<String> {
+    let frame = serde_json::from_str::<Value>(text).ok()?;
+    let error = frame.get("error")?;
+    Some(rpc_error_message(error))
 }
 
 fn opened_session_from_client_event(event: Option<&ClientEvent>) -> Option<SessionKey> {
@@ -13694,6 +13718,54 @@ wait
                 _ => None,
             })
             .collect()
+    }
+
+    /// A follow-up refused because `session/open` was rejected named only
+    /// itself ("session/status/read was not sent because session/open was
+    /// rejected"), so the operator saw the first innocent command and never
+    /// the actual cause — e.g. that the requested profile does not exist on
+    /// this server. The refusal must carry the server's reason.
+    #[test]
+    fn rejected_followups_name_the_session_open_failure_reason() {
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch::default());
+        let request_id = arm_session_open_barrier(&mut backend, "local:missing");
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32004,
+                "message": "profile 'alan' is not configured for this AppUI session"
+            }
+        });
+        let _ = backend
+            .decode_rpc_text(&frame.to_string())
+            .expect("rejection decodes");
+        assert!(backend.session_open_required);
+        backend.queue.clear();
+
+        backend.reject_command_without_confirmed_open(AppUiCommand::ReadSessionStatus(
+            crate::model::SessionStatusReadParams {
+                session_id: SessionKey("local:missing".into()),
+            },
+        ));
+
+        let message = backend
+            .queue
+            .iter()
+            .find_map(|event| match event {
+                ClientEvent::App(event) => match event.as_ref() {
+                    AppUiEvent::Error(error) if error.code == "session_open_rejected" => {
+                        Some(error.message.clone())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("session_open_rejected error");
+        assert!(
+            message.contains("profile 'alan' is not configured"),
+            "the refusal must name why the open failed, got: {message}"
+        );
     }
 
     /// P1-4: a `session/open` the server DEFINITELY rejects (an RPC error
