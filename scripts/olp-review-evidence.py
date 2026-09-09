@@ -1544,13 +1544,18 @@ def _verify_product_receipt(
     if manifest_head is not None and head != manifest_head:
         return None, f"{sel}:summary-head-not-manifest({head[:8]}!={manifest_head[:8]})"
     if observed == "fail":
-        if not isinstance(cargo_exit, int) or cargo_exit == 0:
+        if isinstance(cargo_exit, bool) or not isinstance(cargo_exit, int) or cargo_exit == 0:
             return None, f"{sel}:summary-fail-with-zero-exit"
         if rc.get("exit_code") != cargo_exit:
             return None, f"{sel}:receipt-exit-mismatch"
     else:
         if rc.get("exit_code") != 0:
             return None, f"{sel}:receipt-pass-with-nonzero-exit"
+        # PR#632 P2-B: pass 的 summary cargo_exit 必须为真 int 0(bool
+        # False 冒充 0 一并拒绝)且与 receipt 一致 —— 非零/null/布尔
+        # (矛盾)不得当可信 pass(归 harness 证据错误)。
+        if isinstance(cargo_exit, bool) or cargo_exit != 0:
+            return None, f"{sel}:summary-pass-with-cargo-exit({cargo_exit!r})"
     # stdout/stderr 工件在场 + hash 绑定
     artifacts = rc.get("artifacts")
     if not isinstance(artifacts, dict):
@@ -1735,15 +1740,35 @@ def aggregate_pr_classification(
             verified, harness_reason = _verify_product_receipt(
                 r, manifest_heads.get(pr_key)
             )
+            # Python bool 是 int 子类: adapter_exit/cargo_exit 必须是真
+            # int —— False 冒充 0(True 冒充 1)与字段一致性相悖,拒绝。
+            adapter_exit_int = (
+                isinstance(adapter_exit, int) and not isinstance(adapter_exit, bool)
+            )
+            cargo_exit_int = (
+                isinstance(cargo_exit, int) and not isinstance(cargo_exit, bool)
+            )
             if (
                 verified is not None
                 and observed == "fail"
+                and adapter_exit_int
                 and adapter_exit == 0
-                and isinstance(cargo_exit, int)
+                and cargo_exit_int
                 and cargo_exit != 0
             ):
                 product_fails.append(verified)
-            elif observed == "pass" and verified is not None:
+            elif (
+                observed == "pass"
+                and verified is not None
+                and adapter_exit_int
+                and adapter_exit == 0
+                and cargo_exit_int
+                and cargo_exit == 0
+            ):
+                # PR#632 P2-B: pass 记录同样要求 adapter 成功 + cargo exit 0
+                # —— adapter 非零(harness 故障)或 summary cargo_exit 非 0/
+                # 缺失(与 pass 声明矛盾)均不得当可信 pass,归 harness
+                # 证据错误;混合 existing fail + 坏 pass → blocked/unassessed。
                 continue
             else:
                 # harness 侧故障(adapter 未跑完/收据缺失/不一致/外来伪装)

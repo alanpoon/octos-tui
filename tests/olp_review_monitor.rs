@@ -2114,3 +2114,100 @@ fn olp_review_monitor_v3_missing_goal_thread_not_running() {
         "缺 goal 文件时未完 thread 不得证明归属 running: {peers}"
     );
 }
+
+/// PR#632 P2-A 回归: 有效 lifetime 但 peer goal 文件属于其他 review/goal
+/// → 不得晋升 running/idle(unknown fail-closed)。此前 ident_ok 只在
+/// lifetime 校验失败后才看,跨 goal 的有效 lifetime 被误显示为当前视角
+/// running/idle;同 goal 正向对照保持。
+#[test]
+fn olp_review_monitor_valid_lifetime_cross_goal_not_promoted() {
+    let t = TmpDir::new("p2a-crossgoal");
+    let d = t.path().to_path_buf();
+    std::fs::create_dir_all(&d).unwrap();
+    let profile = "octosfix";
+    let peers_root = d
+        .join("runtime")
+        .join("profiles")
+        .join(profile)
+        .join("data")
+        .join("peers");
+    let master = "master-sess-1";
+    let mk = |slug: &str, goal: &str, phase: &str| {
+        let dir = peers_root.join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("originator"), format!("{master}\n")).unwrap();
+        std::fs::write(dir.join("goal"), format!("{goal}\n")).unwrap();
+        let mut lt = serde_json::json!({
+            "version": 1,
+            "task_id": "task-42",
+            "registry_key": format!("{profile}:peer:{slug}"),
+            "master": master,
+            "generation": 7,
+            "phase": phase,
+            "turn_id": "turn-9"
+        });
+        if phase == "idle" {
+            let rm = dir.join("result.md");
+            std::fs::write(&rm, b"idle body\n").unwrap();
+            lt["result_digest"] = serde_json::json!(sha256_bytes(b"idle body\n"));
+        }
+        write_json(&dir.join("lifetime.json"), lt);
+        dir
+    };
+    // 当前视角 goal 由 review-state.json 提供(P2-A 的归属比对输入)
+    std::fs::write(
+        d.join("review-state.json"),
+        r#"{"runtime":"/tmp/rt-p2a","session":"master-sess-1","goal":"goal_01"}"#,
+    )
+    .unwrap();
+    // 同 goal 正向: running/idle 均按 lifetime 显示
+    mk("p-same-running", "goal_01", "running");
+    mk("p-same-idle", "goal_01", "idle");
+    // 跨 goal: lifetime 形状有效但 goal 文件=goal_99 → unknown
+    mk("p-cross-running", "goal_99", "running");
+    mk("p-cross-idle", "goal_99", "idle");
+
+    let out = Command::new("python3")
+        .arg("-B")
+        .arg(script())
+        .arg(&d)
+        .arg("--runtime-dir")
+        .arg(d.join("runtime"))
+        .arg("--profile")
+        .arg(profile)
+        .arg("--session")
+        .arg(master)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "render failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let peers = &v["current-turn"]["peers"];
+    assert_eq!(
+        peers["p-same-running"]["execution"].as_str().unwrap_or("?"),
+        "running",
+        "同 goal 有效 lifetime 应 running: {peers}"
+    );
+    assert_eq!(
+        peers["p-same-idle"]["execution"].as_str().unwrap_or("?"),
+        "idle",
+        "同 goal 有效 idle lifetime 应 idle: {peers}"
+    );
+    assert_eq!(
+        peers["p-cross-running"]["execution"]
+            .as_str()
+            .unwrap_or("?"),
+        "unknown",
+        "跨 goal 有效 lifetime 不得晋升 running: {peers}"
+    );
+    assert_eq!(
+        peers["p-cross-idle"]["execution"].as_str().unwrap_or("?"),
+        "unknown",
+        "跨 goal 有效 lifetime 不得晋升 idle: {peers}"
+    );
+}

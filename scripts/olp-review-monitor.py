@@ -791,13 +791,22 @@ def collect_peers(
             entry["execution_source"] = "closed-marker"
         elif peer_dir is not None:
             rec, reason = trusted_lifetime(peer_dir, profile, slug, session)
-            if rec is not None:
+            if rec is not None and ident_ok:
+                # PR#632 P2-A: 有效 lifetime 晋升前同样要求归属 —— 同
+                # session 但 peer goal 文件属于其他 review/goal 的
+                # lifetime 不是本视角证据,不得显示 running/idle
+                # (ident_ok 在此分支前已算好,此前只在 lifetime 失败后
+                # 才看,跨 goal 有效 lifetime 被误晋升)。
                 entry["execution"] = PHASE_TO_EXECUTION[rec["phase"]]
                 entry["execution_source"] = "lifetime"
                 entry["task_id"] = rec["task_id"]
                 entry["generation"] = rec["generation"]
                 entry["turn_id"] = rec["turn_id"]
                 entry["master_session_id"] = rec["master"]
+            elif rec is not None and not ident_ok:
+                # 有效形状但归属矛盾(goal/originator 属其他视角) →
+                # fail-closed unknown,不走 thread 兜底。
+                entry["execution_reason"] = ident_reason or "peer-identity-mismatch"
             elif not ident_ok:
                 # 身份文件矛盾优先于一切 fallback: 证据属于别的 master/goal,
                 # unknown 且不再走 active-thread 兜底(fail-closed)。

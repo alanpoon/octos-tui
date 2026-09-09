@@ -387,6 +387,18 @@ Rule: review-monitor — Herdr 监控:区块分离与身份防混
     errored/interrupted/rate_limited 四值如实分层;伪造值(fabricated 等)
     与非终止态不折叠;pending 后续轮不覆盖已完成轮的 last-outcome
 
+场景: 有效 lifetime 跨 goal 不得晋升(critical)
+  测试:
+    包: octoscode
+    过滤: olp_review_monitor_valid_lifetime_cross_goal_not_promoted
+  假设 peer 目录 lifetime.json 形状完全有效(originator/master/registry/
+    phase/result_digest 一致)但 goal 文件属于其他 review(goal_99),
+    当前视角 goal_01(review-state.json 提供)
+  当 渲染监控
+  那么 跨 goal 的有效 lifetime 显示 unknown(fail-closed,不晋升
+    running/idle);同 goal 正向对照 running/idle 保持 —— lifetime
+    晋升必须同时通过 peer 自身身份文件归属,不只 lifetime 形状校验
+
 场景: lifetime 严格校验(critical)
   测试:
     包: octoscode
@@ -457,6 +469,18 @@ Rule: review-monitor — Herdr 监控:区块分离与身份防混
     (receipt/HEAD/probe/BASE/selector 锚)不放宽
 
 Rule: review-regression — 前轮八反例回归数据集
+
+场景: pass selector 一致性门(critical)
+  测试:
+    包: octoscode
+    过滤: olp_review_classify_pass_selector_consistency_gates
+  假设 某 PR 一个 selector 为真实 existing fail(receipt 完整),另一
+    selector 自报 pass 但 summary adapter_exit=7(或 cargo_exit=101/null
+    与 pass 声明矛盾;receipt 本身合法)
+  当 classify 聚合
+  那么 坏 pass selector 归 harness 证据错误,该 PR 必须 blocked/
+    unassessed —— 不得因另一 selector 有 existing 双执行证据而判
+    residual;合法 pass(adapter 0/cargo 0)不落 harness 故障
 
 场景: 八反例回归分类(critical)
   测试:

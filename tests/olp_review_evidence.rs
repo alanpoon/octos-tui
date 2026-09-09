@@ -304,8 +304,46 @@ fn make_cargo_fixture(tag: &str, tests_rs: &str) -> (TmpDir, PathBuf, String) {
     if seed.exists() {
         std::fs::copy(&seed, repo.join("Cargo.lock")).unwrap();
     }
+    // git init 必须最先执行: identity 配置写的是本 fixture 仓库的
+    // .git/config(--local),init 之前配置会失败或误写父 repo。
+    {
+        let out = run_deadline(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&repo),
+            30,
+            "git init",
+        );
+        assert!(
+            out.status.success(),
+            "git init failed\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // fixture-local git identity(显式 --local): CI(Linux 无全局 git
+    // 配置)与本机(ROOT 关闭 global/system 后)都必须能 commit;
+    // 只写本 fixture 仓库,任何时刻不触碰父 repo/用户 global/system。
+    // ROOT 复现: exit=128 "Author identity unknown ... auto-detection
+    // is disabled"(../pr-followup-20260909/632-git-explicit-identity-repro.json)。
+    for cfg in [
+        ("user.name", "olp-fixture"),
+        ("user.email", "olp-fixture@example.invalid"),
+    ] {
+        let out = run_deadline(
+            Command::new("git")
+                .args(["config", "--local", cfg.0, cfg.1])
+                .current_dir(&repo),
+            15,
+            &format!("git config --local {}", cfg.0),
+        );
+        assert!(
+            out.status.success(),
+            "git config --local {:?} failed\nstderr: {}",
+            cfg,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
     for args in [
-        vec!["init", "--quiet"],
         vec!["add", "Cargo.toml", "tests/fixture.rs"],
         vec!["commit", "--quiet", "-m", "fixture init"],
     ] {
@@ -314,7 +352,12 @@ fn make_cargo_fixture(tag: &str, tests_rs: &str) -> (TmpDir, PathBuf, String) {
             30,
             &format!("git {}", args[0]),
         );
-        assert!(out.status.success(), "git {:?} failed", args);
+        assert!(
+            out.status.success(),
+            "git {:?} failed\nstderr: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     let head = fixture_head(&repo);
     let cache_t = cache_dir().join("target");
@@ -3706,7 +3749,12 @@ fn bump_fixture_head(repo: &Path, tag: &str) -> String {
             30,
             &format!("git {}", args[0]),
         );
-        assert!(out.status.success(), "git {:?} failed", args);
+        assert!(
+            out.status.success(),
+            "git {:?} failed\nstderr: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     fixture_head(repo)
 }
@@ -4049,4 +4097,157 @@ fn olp_review_helper_identical_slot_logs_both_bound() {
     assert_eq!(v["ok"].as_bool(), Some(true), "同字节双日志应双侧绑定: {v}");
     assert!(v["base_log"].as_str().is_some(), "base_log 应绑定: {v}");
     assert!(v["head_log"].as_str().is_some(), "head_log 应绑定: {v}");
+}
+
+/// PR#632 P2-B 回归(结构校验 fixture,测试级别声明): 同一 PR 内
+/// "真实 existing fail selector(带有效 BASE/HEAD 双执行 slot)+ 坏 pass
+/// selector(adapter_exit=7 / cargo_exit=101 / False 冒充)" 不得判
+/// residual;先断言 good-pass 时 residual/existing,再仅改 p 的退出码
+/// 字段断言 blocked/unassessed 且 harness_fault 含 p。另覆盖 bool
+/// 冒充(False 是 int 子类,不得当 0)。
+#[test]
+fn olp_review_classify_pass_selector_consistency_gates() {
+    let t = TmpDir::new("p2b-pass");
+    let d = t.path().to_path_buf();
+    let head = "9bcf4099c2719cd8ee63090a1849a2c6f3766999".to_string();
+    let base = "0a174d95ddec2b123adb3498432e29eb13affb81".to_string();
+    let write_receipt = |sel: &str, qualified: &str, observed: &str, exit: i64| -> PathBuf {
+        let body = if observed == "pass" {
+            format!("test {qualified} ... ok\ntest result: ok. 1 passed\n")
+        } else {
+            format!("test {qualified} ... FAILED\ntest result: FAILED. 0 passed; 1 failed\n")
+        };
+        let so = d.join(format!("{sel}.stdout.log"));
+        let se = d.join(format!("{sel}.stderr.log"));
+        std::fs::write(&so, &body).unwrap();
+        std::fs::write(&se, "").unwrap();
+        let rc = serde_json::json!({
+            "receipt_kind": "cargo-test-execution",
+            "selector": sel,
+            "selector_qualified": qualified,
+            "matched_tests": [qualified],
+            "observed": observed,
+            "exit_code": exit,
+            "head_before": head,
+            "head_after": head,
+            "test_source": d.join("fixture.rs").to_str().unwrap(),
+            "test_target_sha256": sha256_hex(&d.join("fixture.rs")),
+            "artifacts": {"stdout": so.to_str().unwrap(), "stderr": se.to_str().unwrap()},
+            "stdout_sha256": sha256_hex(&so),
+            "stderr_sha256": sha256_hex(&se),
+        });
+        let rp = d.join(format!("{sel}-{observed}.receipt.json"));
+        std::fs::write(&rp, serde_json::to_string(&rc).unwrap()).unwrap();
+        rp
+    };
+    // slot 用的 probe 源 + 双执行日志(q 在 BASE/HEAD 同 probe 双 FAIL)
+    let fixture_rs = d.join("fixture.rs");
+    std::fs::write(
+        &fixture_rs,
+        "mod tests { #[test] fn q() { assert!(false); } }\n",
+    )
+    .unwrap();
+    let probe = d.join("probe-q.rs");
+    std::fs::copy(&fixture_rs, &probe).unwrap();
+    let log_body = "test tests::q ... FAILED\ntest result: FAILED. 0 passed; 1 failed\n";
+    let base_log = d.join("q-base.log");
+    let head_log = d.join("q-head.log");
+    std::fs::write(&base_log, log_body).unwrap();
+    std::fs::write(&head_log, log_body).unwrap();
+    let fail_rc = write_receipt("q", "tests::q", "fail", 101);
+    let pass_rc = write_receipt("p", "tests::p", "pass", 0);
+    let slot = serde_json::json!({
+        "pr_head": head,
+        "base": base,
+        "probe": probe.to_str().unwrap(),
+        "probe_sha256": sha256_hex(&probe),
+        "base_log_sha256": sha256_hex(&base_log),
+        "head_log_sha256": sha256_hex(&head_log),
+        "base_exit": 101,
+        "head_exit": 101,
+        "classification": "existing/residual: same probe fails at BASE and HEAD"
+    });
+    let slot_path = d.join("slot.json");
+    std::fs::write(&slot_path, serde_json::to_string(&slot).unwrap()).unwrap();
+    let manifest = d.join("MANIFEST.json");
+    std::fs::write(
+        &manifest,
+        serde_json::to_string(&serde_json::json!({"prs": {"629": {
+            "head": head, "base": base,
+            "outer_recommendation": "conditional-approve-scope-and-specs"}}}))
+        .unwrap(),
+    )
+    .unwrap();
+    let mk_summary = |adapter_p: serde_json::Value, cargo_p: serde_json::Value| -> PathBuf {
+        let tag = format!("{}-{}", adapter_p, cargo_p).replace(['"', '\\'], "");
+        let summary = serde_json::json!({"results": [
+            {"pr": "629", "head": head, "selector": "q", "adapter_exit": 0,
+             "observed": "fail", "cargo_exit": 101, "receipt": fail_rc.to_str().unwrap()},
+            {"pr": "629", "head": head, "selector": "p", "adapter_exit": adapter_p,
+             "observed": "pass", "cargo_exit": cargo_p, "receipt": pass_rc.to_str().unwrap()},
+        ]});
+        let sp = d.join(format!("summary-{tag}.json"));
+        std::fs::write(&sp, serde_json::to_string(&summary).unwrap()).unwrap();
+        sp
+    };
+    let run_classify = |sp: &Path| -> serde_json::Value {
+        let out = Command::new("python3")
+            .arg("-B")
+            .arg(script())
+            .arg("classify")
+            .arg("--manifest")
+            .arg(&manifest)
+            .arg("--replay-summary")
+            .arg(sp)
+            .arg("--slot")
+            .arg(&slot_path)
+            .arg("--slot-log-dir")
+            .arg(&d)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "classify 失败: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap()
+    };
+    // 1) good-pass: q 为 existing + p 合法 → residual/existing
+    let v = run_classify(&mk_summary(serde_json::json!(0), serde_json::json!(0)));
+    let e = &v["prs"]["629"];
+    assert_eq!(
+        e["classification"].as_str().unwrap_or("?"),
+        "residual",
+        "good-pass 基线应 residual: {e}"
+    );
+    assert_eq!(
+        e["introduced_vs_existing"].as_str().unwrap_or("?"),
+        "existing",
+        "q 有有效 slot 双执行 → existing: {e}"
+    );
+    // 2) 坏 pass 变体: 只改 p 的退出码字段 → blocked/unassessed + harness p
+    for (adapter_p, cargo_p) in [
+        (serde_json::json!(7), serde_json::json!(0)),
+        (serde_json::json!(0), serde_json::json!(101)),
+        (serde_json::json!(0), serde_json::Value::Null),
+        (serde_json::json!(false), serde_json::json!(0)),
+    ] {
+        let v = run_classify(&mk_summary(adapter_p.clone(), cargo_p.clone()));
+        let e = &v["prs"]["629"];
+        assert_eq!(
+            e["classification"].as_str().unwrap_or("?"),
+            "blocked",
+            "坏 pass(adapter={adapter_p},cargo={cargo_p})必须 blocked"
+        );
+        assert_eq!(
+            e["introduced_vs_existing"].as_str().unwrap_or("?"),
+            "unassessed",
+            "坏 pass 不得继承 existing"
+        );
+        let hf = e["harness_fault_selectors"].as_array().unwrap();
+        assert!(
+            hf.iter().any(|h| h.as_str() == Some("p")),
+            "p 应为 harness 故障: {hf:?}"
+        );
+    }
 }
