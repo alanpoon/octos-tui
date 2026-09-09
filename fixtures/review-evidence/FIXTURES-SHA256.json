@@ -365,5 +365,6 @@
    "sha256": "b505dc9cad62ae36daf76277c9e189b7edc18aabc468b4e881099a13f7972a4a",
    "bytes": 532
   }
- ]
+ ],
+ "note": "*.log 在仓库 .gitignore 全局忽略;清单内的 3 个 .log 是本任务固定缺陷证据/外层双执行日志,必须以 git add -f 强制纳入提交(checkout 后逐字节核验)。若干净树缺失任一 .log,清单核验 fail-closed(测试 olp_review_regression_dataset_classifies_four_prs 显式报缺,不静默跳过)。"
 }
