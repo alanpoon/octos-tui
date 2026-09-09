@@ -67,6 +67,27 @@ const AGENT_TERMINAL_LINGER: std::time::Duration = std::time::Duration::from_sec
 /// surface froze on "Testing connection…" with every edit and re-dispatch
 /// blocked. Generous: a real `profile/llm/test` does one provider roundtrip.
 const PROVIDER_PENDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// The server's RUNTIME profile identity when no profile is scoped
+/// (`MAIN_PROFILE_ID` on the server side). It is a valid thing to run under and
+/// to report in `profile/llm/list`, but NOT a persistable profile: the server's
+/// own slug validator accepts only `[a-z0-9-]`, so the leading underscore makes
+/// every write naming it fail with an opaque `-32603`. Treat it as "no profile
+/// to save into" at any persistence boundary.
+const MAIN_RUNTIME_PROFILE_ID: &str = "_main";
+
+/// True when `profile_id` is one the server's profile store can actually
+/// persist. Mirrors its slug rule — lowercase ASCII, digits and hyphens only —
+/// which is what rejects [`MAIN_RUNTIME_PROFILE_ID`] and any other
+/// underscore-prefixed runtime identity. An id failing this can be run under
+/// but never saved into, so a write naming it is refused client-side with an
+/// actionable message instead of an opaque `-32603` from the server.
+fn is_persistable_profile_id(profile_id: &str) -> bool {
+    !profile_id.is_empty()
+        && profile_id != MAIN_RUNTIME_PROFILE_ID
+        && profile_id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
 /// How long a staged-submit FIFO gate stays authoritative without its
 /// turn/started or terminal arriving. Past this, `submit_next_pending_if_idle`
 /// treats the marker as stale (the in-flight turn/start died in some way the
@@ -4892,8 +4913,15 @@ impl Store {
     /// Test/fetch_models deliberately are NOT gated: they never reach the
     /// profile store, so they work unscoped and are useful before a profile
     /// exists.
+    ///
+    /// Presence is NOT sufficient. `profile/llm/list` reports the server's
+    /// RUNTIME identity, so a response naming `_main` seeds the onboarding
+    /// cache and `current_profile_for_onboarding` starts returning
+    /// `Some("_main")`. That is a real thing to run under but not a persistable
+    /// profile, and a write naming it fails the same slug validator as the
+    /// omitted-field case. Gate on persistability at the write boundary.
     fn onboarding_profile_id_is_resolved(&mut self, profile_id: Option<&str>) -> bool {
-        if profile_id.is_some() {
+        if profile_id.is_some_and(is_persistable_profile_id) {
             return true;
         }
         let message = t!("status.onboarding_profile_unresolved").into_owned();
@@ -24588,6 +24616,77 @@ now analyzing the bus module"
             t!("status.onboarding_profile_unresolved").into_owned()
         );
         assert!(store.state.onboarding.provider_pending.is_none());
+    }
+
+    /// Residual scope gap on the `Some(_)` guard: a `profile/llm/list`
+    /// response naming the server's RUNTIME profile (`_main`) seeds
+    /// `profile_llm_state`, so `current_profile_for_onboarding` starts
+    /// returning `Some("_main")`. A present-but-unpersistable id then passed
+    /// the guard and the upsert reached the same invalid-slug boundary the
+    /// omitted-field case did — `_main` fails the server's `[a-z0-9-]` slug
+    /// validator either way. Unlike the test-result path, this one needs no
+    /// non-empty provider state to seed.
+    #[test]
+    fn onboarding_save_refuses_a_runtime_only_profile_id_from_the_list_response() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT]);
+        store.state.sessions[0].profile_id = None;
+        assert!(store.current_profile_for_onboarding().is_none());
+
+        store.apply_client_event(ClientEvent::ProfileLlmList(ProfileLlmListClientEvent {
+            result: crate::model::ProfileLlmListResult {
+                profile_id: Some(MAIN_RUNTIME_PROFILE_ID.into()),
+                primary: None,
+                fallbacks: Vec::new(),
+                llm: None,
+                runtime_policy_stamp: None,
+            },
+            message: "Loaded profile LLM settings".into(),
+        }));
+        assert_eq!(
+            store.current_profile_for_onboarding().as_deref(),
+            Some(MAIN_RUNTIME_PROFILE_ID),
+            "the list response seeds the runtime id as the onboarding profile"
+        );
+
+        store.state.composer =
+            "/onboard select moonshot kimi-k2.5 autodl https://example.test/v1 AUTODL_API_KEY"
+                .into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/onboard key sk-test-secret".into();
+        assert!(store.compose_command().is_none());
+
+        store.state.composer = "/onboard save".into();
+        assert!(
+            store.compose_command().is_none(),
+            "a runtime-only profile id must not be persisted"
+        );
+        assert_eq!(
+            store.state.status,
+            t!("status.onboarding_profile_unresolved").into_owned()
+        );
+        assert!(store.state.onboarding.provider_pending.is_none());
+    }
+
+    #[test]
+    fn persistable_profile_id_rejects_runtime_and_malformed_slugs() {
+        for ok in ["alan", "coding", "agent-1", "a", "x9"] {
+            assert!(is_persistable_profile_id(ok), "{ok} is a persistable slug");
+        }
+        for bad in [
+            "",                      // no id at all
+            MAIN_RUNTIME_PROFILE_ID, // runtime identity, not a profile
+            "_other",                // any underscore-prefixed runtime id
+            "Alan",                  // uppercase fails the server slug rule
+            "has space",
+            "has_underscore",
+            "dot.ted",
+        ] {
+            assert!(
+                !is_persistable_profile_id(bad),
+                "{bad:?} must not reach the write boundary"
+            );
+        }
     }
 
     #[test]
