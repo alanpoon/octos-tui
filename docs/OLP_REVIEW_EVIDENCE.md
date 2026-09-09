@@ -53,6 +53,29 @@ python3 scripts/olp-review-evidence.py freeze <review_dir> \
 
 ## challenge — 行为证据(内容校验为门、执行为本)
 
+**推荐路径 — `--live-cargo`(唯一 live 执行入口)**:
+
+```bash
+python3 scripts/olp-review-evidence.py challenge <review_dir> \
+  --claim <claim_id> --live-cargo \
+  --selector <精确测试名> --expect pass|fail \
+  [--lib] [--test-target <集成测试名>] [--exec-repo <repo>]
+  [--manifest <Cargo.toml>] [--cargo-target-dir <dir>] [--timeout 300]
+```
+
+由本入口实时执行**固定的生产 Cargo adapter**
+(`scripts/olp-review-evidence-cargo.py`):repo/manifest/精确 selector/
+HEAD/source 绑定与完整输出工件/退出码全部由 adapter 产生并写
+`live-evidence/*.receipt.json`;本入口只转发参数、约束 deadline 并复核
+自产 receipt(selector/HEAD 一致),不引入任意 shell 旁路。**外部传入
+receipt/imported 日志不构成执行证明。**`--selector` 必须是 adapter
+`--list` 唯一定位的精确测试名(zero-match 前置拒绝 `no-tests-matched`);
+`--expect` 显式声明预期 pass/fail;真实执行但结果与预期相反
+(`expectation-violated`)仍如实记录为行为证据。`--lib` 走 src/ 单元测试
+路径(源文件 SHA256 绑定),集成测试省略。
+
+**兼容路径 — 显式 `--evidence` 日志**:
+
 ```bash
 python3 scripts/olp-review-evidence.py challenge <review_dir> \
   --evidence ev.log --claim <claim_id> \
@@ -62,7 +85,7 @@ python3 scripts/olp-review-evidence.py challenge <review_dir> \
   --run-dir <repo> [--timeout 300] [--imported]
 ```
 
-**判定顺序**:
+`--live-cargo` 与 `--imported` 互斥。**判定顺序**:
 
 1. **内容门**: 证据含结构锚(测试名行 + panicked at + FAILED 汇总,
    或通过形态 `test result: ok.`);纯文档/字符串断言 →
@@ -87,12 +110,16 @@ python3 scripts/olp-review-evidence.py challenge <review_dir> \
 ```bash
 python3 scripts/olp-review-evidence.py cross <review_dir> \
   --cross-report cross.md --cross-slug <slug> \
-  --native-root <runtime>/data/peers --expect-claims X,Y,Z
+  --native-root <runtime>/data/peers --expect-claims X,Y,Z \
+  [--allow-operator-refute]
 ```
 
-前置: frozen + challenge 已接纳。cross 报告须逐 claim 覆盖
-(`missing-claim-coverage`);errored/pending 拒绝;同样要求外部权威
-收据。cross 以新证据/行号反驳 flip → `challenge-refuted` 回边。
+前置: frozen + challenge 已接纳。cross 报告须含结构化 `cross_claims`
+块(`cross_claims: [{id, verdict, evidence, ...}]`),逐 claim 覆盖
+(`missing-claim-coverage`;无块 → 覆盖校验拒绝);errored/pending 拒绝;
+同样要求外部权威收据。**文字+行号反驳不得覆盖已复现失败** —— 结构化
+refute 仅在已验证新行为证据或显式 `--allow-operator-refute` 人工裁决
+下生效,否则 `challenge-refuted` 回边只认新重放行为证据。
 
 ## status — 汇总
 
@@ -103,6 +130,35 @@ python3 scripts/olp-review-evidence.py status <review_dir>
 - 无执行证据的两模型一致 approve → `pending-behavioral-evidence`
 - PR 级聚合 = f(claim × severity × introduced_vs_existing),
   期望分类来自外层 MANIFEST `outer_recommendation`(禁 PR 编号硬编码)
+
+## 监控入口 — Herdr pane 可读
+
+```bash
+python3 scripts/olp-review-monitor.py <review_dir> \
+  [--runtime-dir <runtime>] [--profile <profile>] \
+  [--board <ack-board.md>] [--session <wire-session>] \
+  [--format human|json]
+```
+
+四区块: lifecycle / current-turn / last-outcome / deliverables。核心
+身份语义(fail-closed,详见 spec `Rule: review-monitor`):
+
+- **runtime 身份是复合标识**(runtime 路径+session+goal),裸 `goal_01`
+  不是身份;`--profile` 缺省时不扫描 foreign profile 兜底。
+- **thread 晋升 running 需正向身份证明**: 未完 native thread
+  (v/session_id/thread_id/next_seq/completed=false,无 active 键)要晋升
+  peer 为 running,peer 目录 `originator`(wire master 同源)与 `goal`
+  文件必须对当前视角已知字段**实际匹配**——缺失即 unknown
+  (`peer-*-unproven-missing`),信息不足 ≠ 归属证明;与当前视角矛盾的
+  一律 unknown。身份逐键一致的合法绑定仍 running(正向对照)。
+- **终止态只信 native 证据**: result-N.md+turns.txt 交叉一致的
+  completed/errored/interrupted/rate_limited 四值如实分层;快照自报
+  outcome/outcome_source 仅作 `snapshot-outcome-untrusted:*` notes,
+  不构成终止权威。lifetime.json 逐字段严格校验(originator==master 等)。
+- **negative_events 归属过滤**: 按当前 profile+goal(+ 事件携带的
+  originator session)过滤;当前 profile 缺失不扫 foreign。
+- ACK 缓存写自身 `monitor-state.json`(原子),与 `olp-watch-board.sh`
+  契约互不干扰;监控绝不改写 review-state.json。
 
 ## 判词状态机(claim 级两层词表)
 
@@ -119,8 +175,10 @@ unverified          not-replayed(imported 未独立复验)
 
 ## 测试真实性边界
 
-- `tests/olp_review_evidence.rs`(23 tests): 子进程真实调用生产入口;
-  外层反例回归 4 条先 RED 后修(证据 `.octos/red-proof/`)。
+- `tests/olp_review_evidence.rs`(42 pass / 1 ignored,23+1 场景):
+  子进程真实调用生产入口;外层反例回归先 RED 后修(证据 `.octos/red-proof/`)。
+- `olp_review_k3_full_happy_path_accepted` 替代旧假日志 approve 路线
+  (python 假 cargo 日志违反合约 3,已 REMOVED)。
 - `olp_review_real_store_harness_executes_historical_negative_probes`:
   临时 clone 固定 PR 合成树 + `include!` 外层诊断反例源码,真实 cargo
   编译执行 8 探针(约 30s,独立昂贵验收,不在每个单测重复)。

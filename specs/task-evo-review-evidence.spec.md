@@ -61,9 +61,15 @@ satisfies: [REQ-OLP-REVIEW-EVIDENCE]
   - challenge-flip vs blocked-on-evidence 判别式: 反例在 PR HEAD 上**真实执行
     复现失败**(executed probe FAIL) → blocked-on-evidence;证据仅证明
     理论可达/遗留路径(legacy path) → flip,PR 级聚合为 residual。
+    legacy path 的判定依据 = 同一 probe 在 BASE 与 HEAD 的**独立执行对照**
+    (两者均 FAIL 且失败形态同构)或外层 ASSESSMENT 显式标注,
+    禁止仅凭证据描述措辞推断。
   - PR 级 = f(claim 级 × severity × introduced_vs_existing) 聚合;分类输入
     来自外层独立评估(MANIFEST outer_recommendation / ASSESSMENT),工具只做
     聚合派生,禁止按 PR 编号硬编码。
+    introduced_vs_existing 的参考证据锚: 同 probe BASE/HEAD 双执行 receipt
+    (如 ../outer-verification-slot.json + base/head 双日志)为 existing/residual
+    的实证;缺双执行证据时该维度=unassessed,聚合结果保守降级不得标 clean。
 - 监控分离 lifecycle / current turn / last outcome / 交付物验收四个区块;
   runtime 身份必须含 runtime 路径+session 等复合标识,不能仅显示 goal_01。
   last-outcome 指最近**终止**结果: 旧 completed + 新 running 时保留
@@ -248,7 +254,7 @@ Rule: review-cross — 交叉互审门槛与逐项裁决
   层级: 集成(真实子进程调用生产入口)
   测试:
     包: octoscode
-    过滤: olp_review_approve_with_executed_evidence
+    过滤: olp_review_k3_full_happy_path_accepted
   假设 两份首审一致 approve 且绑定经生产入口真实执行通过的行为证据,交叉
     覆盖齐全
   当 走完 freeze→challenge→cross 完整流程
@@ -263,6 +269,134 @@ Rule: review-cross — 交叉互审门槛与逐项裁决
   那么 该判词显示 pending-behavioral-evidence 而非 approved
 
 Rule: review-monitor — Herdr 监控:区块分离与身份防混
+
+场景: 真实 native wire thread 识别(completed=false 精确绑定才 running)(critical)
+  测试:
+    包: octoscode
+    过滤: olp_review_monitor_v3_real_wire_thread_recognition
+  假设 真实 native thread wire 文件(v/session_id/thread_id/next_seq/completed,
+    无 active 键;session_id 带 NUL+~cwd-hash),peer 目录 originator 与
+    goal_01 均与当前 master 视角一致
+  当 渲染监控(同一 wire master session/cwd 视角)
+  那么 本 session 未完流(completed=false)→ running;completed=true → 非
+    running;别的 session 同 slug 形状未完流 → unknown;同 channel 但 cwd
+    哈希不同 → 不绑定;next_seq 是流事件序号永不与 result turn 比较
+
+场景: peer originator 指向别的 wire master 不得 running(critical)
+  测试:
+    包: octoscode
+    过滤: olp_review_monitor_v3_foreign_originator_thread_not_running
+  假设 同 profile/channel/cwd 的 peer 目录,originator 文件为
+    `octosfix:local:tui#other-master`(真实 native originator 通常无 cwd
+    后缀,如 `octosfix:local:tui#coding`),goal 文件与当前 goal 一致,
+    无 lifetime.json,且存在 NUL+~cwd-hash 与当前 master session 一致的
+    未完 native thread
+  当 以当前 master/session/goal 视角渲染监控
+  那么 该 peer execution=unknown(reason=peer-originator-mismatch),
+    不得凭该 thread 晋升 running —— thread fallback 必须先与 peer 自身
+    身份文件绑定,而非只拒绝 lifetime 存在时的矛盾
+
+场景: peer goal 文件与当前视角 goal 不一致不得 running(critical)
+  测试:
+    包: octoscode
+    过滤: olp_review_monitor_v3_peer_goal_file_mismatch_not_running
+  假设 同 master 同 cwd 的 peer 目录,originator 与当前 wire master 同源,
+    但 goal 文件为 goal_99 而当前视角为 goal_01,无 lifetime.json,
+    存在精确绑定当前 master session 的未完 native thread
+  当 以 goal_01 视角渲染监控
+  那么 该 peer execution=unknown(reason=peer-goal-mismatch),不得凭该
+    thread 晋升 running
+
+场景: 缺失身份文件时未完 thread 不得证明归属(信息不足≠归属证明)(critical)
+  测试:
+    包: octoscode
+    过滤: olp_review_monitor_v3_missing_originator_thread_not_running
+    过滤: olp_review_monitor_v3_missing_goal_thread_not_running
+  假设 peer 目录与当前 profile/goal_01 视角下存在精确 cwd 绑定的未完
+    native thread,但(反例1)有 goal 文件而缺 originator 文件,或
+    (反例2)originator 正确而缺 goal 文件
+  当 以明确 master session+goal_01 视角渲染监控
+  那么 两反例均 execution=unknown(fail-closed,reason=
+    peer-originator-unproven-missing / peer-goal-unproven-missing);
+    身份不再只做"存在即冲突拒绝",thread 晋升 running 前必须对当前视角
+    已知身份字段给出实际 native 匹配证据;无 lifetime 时 native thread
+    不是可绕过身份的权威。当前视角身份字段未知时不强求对应文件
+    (无 goal context 的通用视角沿用旧语义)
+
+场景: 快照自报 outcome/outcome_source 不作终止权威(critical)
+  测试:
+    包: octoscode
+    过滤: olp_review_monitor_v3_unverified_self_claim_outcome_not_terminal
+  假设 runtime-evidence.json 只含 {slug, outcome: completed,
+    outcome_source: unverified-self-claim},无 native result-N.md+turns.txt
+  当 渲染监控
+  那么 该 peer last-outcome state=unknown,自报值与来源仅作
+    snapshot-outcome-untrusted:* notes 保留(可观测但不采信);
+    不得信自报来源字符串而显示 completed。有 native 证据时四值终止
+    分层(completed/errored/interrupted/rate_limited)维持不变,
+    review-freeze 只认 completed 的准入语义在另一层不受影响
+
+场景: 身份逐键一致的精确未完 native thread 仍识别 running(critical)
+  测试:
+    包: octoscode
+    过滤: olp_review_monitor_v3_matching_originator_goal_thread_still_running
+  假设 peer 目录 originator 文件与当前 wire master 同源(无 cwd 后缀的
+    `octosfix:local:tui#coding`),goal 文件与当前 goal 一致,无 lifetime.json,
+    存在 session_id 带 NUL+~cwd-hash 且与 master channel/cwd 一致的
+    未完 native thread
+  当 渲染监控
+  那么 该 peer execution=running(active-thread)—— 收紧身份绑定不得
+    误伤合法正向绑定(真实 native 形状参考 ../native-observation-shapes.json:
+    thread session_id 含真实 NUL 字节,originator 文件无 cwd 后缀)
+
+场景: runtime-evidence 快照身份防混(v3 组)(critical)
+  测试:
+    包: octoscode
+    过滤: olp_review_monitor_v3_bare_snapshot_not_identity_authority
+    过滤: olp_review_monitor_v3_foreign_snapshot_rejected
+    过滤: olp_review_monitor_v3_complete_snapshot_wrong_goal_profile_unknown
+    过滤: olp_review_monitor_v3_snapshot_identity_incomplete
+  假设 runtime-evidence 快照分别为: 只有 slug+active_thread 的裸快照;
+    foreign runtime/session 全字段;完整身份但 goal/profile 与当前视角
+    不符;带身份键但逐键不完整
+  当 渲染监控(当前 runtime/profile/goal 视角)
+  那么 均不采信为 running/身份权威(unknown 或拒绝);复合身份=runtime 路径
+    +session+goal+profile 逐键一致才绑定,active_thread 字符串本身不是
+    身份,也不是 liveness 广播
+
+场景: negative_events 归属过滤(v3 组)(critical)
+  测试:
+    包: octoscode
+    过滤: olp_review_monitor_v3_negative_events_no_profile_no_fallback
+    过滤: olp_review_monitor_v3_negative_events_profile_goal_filtered
+  假设 事件文件分属当前 profile 与 foreign profile/其他 goal/其他 session
+  当 读取负向事件
+  那么 当前 profile 缺失时不得扫描 foreign profile 兜底;事件按当前
+    profile+goal(+ originator session,事件携带时)过滤,他人 goal 的
+    blocked 不得计入当前视角
+
+场景: 终止绑定与四值分层(v3 组)(critical)
+  测试:
+    包: octoscode
+    过滤: olp_review_monitor_v3_terminal_binding_strict
+    过滤: olp_review_monitor_v3_terminal_outcome_four_value_display
+    过滤: olp_review_monitor_v3_pending_followup_keeps_previous_turn
+  假设 native result-N.md+turns.txt 存在/缺失/伪造各形态
+  当 计算终止态
+  那么 只有 turns.txt 与 result-N 一致的 completed 才可信;completed/
+    errored/interrupted/rate_limited 四值如实分层;伪造值(fabricated 等)
+    与非终止态不折叠;pending 后续轮不覆盖已完成轮的 last-outcome
+
+场景: lifetime 严格校验(critical)
+  测试:
+    包: octoscode
+    过滤: olp_review_monitor_lifetime_strict_validation
+  假设 peers 目录含 lifetime.json(逐字段校验:originator==master、
+    phase/turn/generation 形状)与伪造形态
+  当 解析 lifetime
+  那么 Pending→queued、Running→running、Failed→failed 按 phase 映射;
+    originator 不符/lifetime 记录 master 非当前 session → 不采信,
+    不因存在而晋升
 
 场景: 监控分离四区块且 runtime 身份完整(critical)
   测试:
@@ -308,11 +442,17 @@ Rule: review-regression — 前轮八反例回归数据集
     包: octoscode
     过滤: olp_review_regression_dataset_classifies_four_prs
   假设 使用前轮真实 8 反例数据集( fixtures/review-evidence/ ),期望分类来自
-    MANIFEST outer_recommendation 外层独立写入
-  当 跑完整 freeze→challenge→cross 流程(至少一条集成测试调用真实运行入口
-    执行历史生产渲染/事件反例)
-  那么 #627/#628/#630 判为 blocked(阻塞问题成立),#629 判为 residual,
-    且每个判词绑定证据文件与反例名;harness 成功与产品测试失败状态分别记录
+    MANIFEST outer_recommendation 外层独立写入;
+    #629 的 residual 判定绑定真实双执行证据: BASE(0a174d95)与 HEAD(9bcf4099)
+    同 probe 独立执行均 FAIL(receipt ../outer-verification-slot.json,
+    日志 ../outer-629-base.log / ../outer-629-head.log,复现源 ../residual-629-repro.rs)
+  当 跑完整 freeze→challenge→cross 流程(正常小测试用真实最小 Cargo fixture
+    经生产 adapter 同路径执行;真实 Store 八探针为外层 prepared-replay-slots
+    单次集成重放绑定收据,不要求每个小测试递归编译全仓)
+  那么 #627/#628/#630 判为 blocked(阻塞问题成立),#629 判为 residual 且其
+    判词引用上述双执行 receipt/日志文件;分类引擎从 MANIFEST 外层字段与
+    双执行对照派生,不含 PR 编号条件分支;每个判词绑定证据文件与反例名;
+    harness 成功与产品测试失败状态分别记录
     (旧代码 101+8failed 是缺陷证据,不是回归通过)
 
 场景: watch-board 正哨保持不变(critical)

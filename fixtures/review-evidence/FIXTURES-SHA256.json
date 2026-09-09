@@ -2,7 +2,7 @@
  "provenance": "fixture 复制品 — 从前轮真实评审证据复制,内容与源逐字节一致(见 source_sha256_check)",
  "source_root": "/Users/zhangalex/Work/Projects/FW/octoscode/.octos/reviews/pr-627-630-20260909",
  "source_manifest_protocol": "olp/v2",
- "derived_note": "源 MANIFEST.json 的 combined_file_sha256 为 [hex-redacted];本清单为复制后自算哈希,源对账经 source_sha256_check=byte-identical",
+ "derived_note": "源 MANIFEST.json 的 combined_file_sha256 为 [hex-redacted];本清单为复制后自算哈希,源对账经 source_sha256_check=byte-identical outer-verification/ 为外层独立执行证据的只读复制,哈希入本清单。",
  "source_sha256_check": "byte-identical(源/fixture 逐一 SHA256 相等)",
  "files": [
   {
@@ -339,6 +339,31 @@
    "path": "pr-630/runtime-evidence.json",
    "sha256": "3dd9c51863afb3e29456112e0607feebe5da54b3ef6a62f77b1dadeaac7c86fb",
    "bytes": 1682
+  },
+  {
+   "path": "outer-verification/outer-verification-slot.json",
+   "sha256": "143c5afb33e586a7efdff292f488c9de5eb3f0a7e0c8fbfca2c5426acf9ac0e8",
+   "bytes": 1166
+  },
+  {
+   "path": "outer-verification/outer-629-base.log",
+   "sha256": "86c806aa9f90dccc9e7ceea64408bac3839f6ee0e99991d81764cefbe5719ad9",
+   "bytes": 1407
+  },
+  {
+   "path": "outer-verification/outer-629-head.log",
+   "sha256": "46a71bf778d034de9ef9bf4292aa62f2469a6581d9c91c8d75782c96cffb52c3",
+   "bytes": 1407
+  },
+  {
+   "path": "outer-verification/residual-629-repro.rs",
+   "sha256": "172d25638df5af31b8e8915663148e5ef1abe12c837c63f86c4c1f6f4fba8a86",
+   "bytes": 990
+  },
+  {
+   "path": "outer-verification/README.md",
+   "sha256": "b505dc9cad62ae36daf76277c9e189b7edc18aabc468b4e881099a13f7972a4a",
+   "bytes": 532
   }
  ]
 }
