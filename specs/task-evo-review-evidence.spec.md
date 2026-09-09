@@ -488,7 +488,7 @@ Rule: review-regression — 前轮八反例回归数据集
     过滤: olp_review_regression_dataset_classifies_four_prs
   假设 使用前轮真实 8 反例数据集( fixtures/review-evidence/ ),期望分类来自
     MANIFEST outer_recommendation 外层独立写入;
-    #629 的 residual 判定绑定真实双执行证据: BASE(0a174d95)与 HEAD(9bcf4099)
+    PR #629 的 residual 判定绑定真实双执行证据: BASE(0a174d95)与 HEAD(9bcf4099)
     同 probe 独立执行均 FAIL(receipt ../outer-verification-slot.json,
     日志 ../outer-629-base.log / ../outer-629-head.log,复现源 ../residual-629-repro.rs)
   当 跑完整 freeze→challenge→cross 流程(正常小测试用真实最小 Cargo fixture
