@@ -1104,17 +1104,12 @@ impl Store {
                     cwd = Some(value.to_owned());
                     cursor = cursor[value_end..].trim_start();
                 }
-                // `--model <id>`: a raw model id (the same vocabulary the
-                // `/model` menu's `ModelSelectParams::model` already uses),
-                // not a new tier keyword — no catalog lookup or validation
-                // here, this only stashes the id; `apply_peer_prepared_event`
-                // carries it into the peer's `PeerKickoff`, and the
-                // `session/opened` handler fires the actual `model/select`
-                // once the peer's session id exists.
+                // The server resolves the configured model and persists it
+                // during preparation, before the peer can start its first turn.
                 "--model" => {
                     let value_end = cursor.find(char::is_whitespace).unwrap_or(cursor.len());
                     let value = &cursor[..value_end];
-                    if value.is_empty() {
+                    if value.is_empty() || value.starts_with("--") {
                         self.state.status = t!("status.peer_usage").into_owned();
                         return SlashDispatchOutcome::Rejected;
                     }
@@ -1153,6 +1148,12 @@ impl Store {
             return SlashDispatchOutcome::Rejected;
         }
 
+        if model.is_some()
+            && !self.require_appui_feature(crate::model::APPUI_FEATURE_PEER_MODEL_OVERRIDE_V1)
+        {
+            return SlashDispatchOutcome::Rejected;
+        }
+
         // Single-slot stash ⇒ single in-flight prepare (K3 review, high): a
         // second `/peer` overwriting the stash would hand the FIRST result the
         // SECOND brief — the first peer's session would run the wrong task and
@@ -1180,12 +1181,12 @@ impl Store {
         self.state.pending_peer_prepare = Some(crate::model::PendingPeerPrepare {
             brief: brief.to_owned(),
             go,
-            model,
             created: std::time::Instant::now(),
         });
         self.state.status = t!("status.peer_preparing").into_owned();
         SlashDispatchOutcome::accepted(Some(AppUiCommand::PeerPrepare(
             crate::model::PeerPrepareParams {
+                model_override: model.map(|model_id| crate::model::PeerModelOverride { model_id }),
                 brief: brief.to_owned(),
                 n,
                 title: None,
@@ -1394,7 +1395,6 @@ impl Store {
                         brief_path: entry.brief_path.clone(),
                         go: pending.go && index == 0,
                         agent_staged: false,
-                        model: pending.model.clone(),
                         created: std::time::Instant::now(),
                     },
                 );
@@ -1435,7 +1435,6 @@ impl Store {
                 brief_path: result.brief_path,
                 go: pending.go,
                 agent_staged: false,
-                model: pending.model,
                 created: std::time::Instant::now(),
             },
         );
@@ -1504,7 +1503,6 @@ impl Store {
                 brief_path: event.brief_path,
                 go: false,
                 agent_staged: true,
-                model: None,
                 created: std::time::Instant::now(),
             },
         );
@@ -11939,26 +11937,6 @@ impl Store {
                 // Stale entries (>TTL, dead open) were pruned by the take — a
                 // late open then degrades to a normal focused session open.
                 let mut peer_kickoff = self.state.take_pending_peer_kickoff(&session_id);
-                // `--model <id>` (carried on the kickoff, not `peer/prepare`
-                // itself): fire the same `model/select` the `/model` menu
-                // uses, targeted at the just-minted peer session id. Queued
-                // on the generic follow-up queue rather than returned
-                // directly — this arm's own return value is claimed below by
-                // the kickoff prompt submission (or the generic session
-                // open), and both the background- and `--go`-peer branches
-                // need this applied identically, so it runs once here before
-                // either branches off.
-                if let Some(model) = peer_kickoff.as_ref().and_then(|k| k.model.clone()) {
-                    self.state
-                        .enqueue_autonomy_hydration(AppUiCommand::SelectModel(
-                            crate::model::ModelSelectParams {
-                                session_id: session_id.clone(),
-                                model,
-                                provider: None,
-                                route: None,
-                            },
-                        ));
-                }
                 // Restore the server-persisted per-session reasoning effort so
                 // /thinking + its menu reflect it after a full restart (the server
                 // is the source of truth; `None` means no override is stored).
@@ -17537,9 +17515,10 @@ mod tests {
 
     fn peer_capable_store() -> Store {
         let mut store = store_with_empty_session();
-        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
-            crate::model::APPUI_METHOD_PEER_PREPARE,
-        ]));
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [crate::model::APPUI_METHOD_PEER_PREPARE],
+            [crate::model::APPUI_FEATURE_PEER_MODEL_OVERRIDE_V1],
+        ));
         store
     }
 
@@ -17738,15 +17717,17 @@ mod tests {
             panic!("expected a PeerPrepare command, got {command:?}");
         };
         assert_eq!(params.brief, "fix the thing");
-        // `--model` never crosses the wire in `peer/prepare` — like `--go`,
-        // it is stashed client-side and applied via `model/select` once the
-        // peer's session opens (see `peer_session_opened_with_model_...`).
-        let pending = store
-            .state
-            .pending_peer_prepare
-            .as_ref()
-            .expect("dispatch stashes the pending prepare");
-        assert_eq!(pending.model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(
+            params
+                .model_override
+                .as_ref()
+                .map(|choice| choice.model_id.as_str()),
+            Some("deepseek-v4-pro")
+        );
+        assert_eq!(
+            serde_json::to_value(&params).unwrap()["model_override"],
+            serde_json::json!({"model_id": "deepseek-v4-pro"})
+        );
     }
 
     #[test]
@@ -17899,7 +17880,6 @@ mod tests {
             brief_path: "/repo/.octos/peers/fix-nav/BRIEF.md".into(),
             go: false,
             agent_staged: false,
-            model: None,
             created: std::time::Instant::now(),
         };
         store
@@ -18031,58 +18011,68 @@ mod tests {
         );
     }
 
-    /// `--model <id>` (no server-side `peer/prepare` field for it): landing
-    /// the peer session must queue a `model/select` targeted at the peer's
-    /// OWN session id on the generic follow-up queue, alongside — not instead
-    /// of — the kickoff prompt this arm already returns directly.
     #[test]
-    fn peer_session_opened_with_model_enqueues_select_model() {
-        let mut store = peer_capable_store();
-        let peer_key = prepare_peer(&mut store, "/peer --go --model deepseek-v4-pro fix the nav");
-
-        let command = peer_session_opened(&mut store, &peer_key);
-        assert!(
-            matches!(command, Some(AppUiCommand::SubmitPrompt(_))),
-            "the kickoff prompt is still this arm's direct return value, got {command:?}"
-        );
-        assert!(
-            store
-                .state
-                .pending_autonomy_hydration
-                .iter()
-                .any(|queued| matches!(
-                    queued,
-                    AppUiCommand::SelectModel(params)
-                        if params.session_id == peer_key
-                            && params.model == "deepseek-v4-pro"
-                )),
-            "expected a queued model/select for the peer session, got {:?}",
-            store.state.pending_autonomy_hydration
-        );
+    fn peer_session_opened_with_model_never_changes_profile_model() {
+        for go in ["", "--go "] {
+            let mut store = peer_capable_store();
+            let peer_key = prepare_peer(
+                &mut store,
+                &format!("/peer {go}--model deepseek-v4-pro fix the nav"),
+            );
+            let command = peer_session_opened(&mut store, &peer_key);
+            assert!(matches!(command, Some(AppUiCommand::SubmitPrompt(_))));
+            assert!(
+                !store
+                    .state
+                    .pending_autonomy_hydration
+                    .iter()
+                    .any(|queued| matches!(queued, AppUiCommand::SelectModel(_)))
+            );
+        }
     }
 
-    /// Same wiring for a `--go`-less (background) peer — the model applies
-    /// regardless of whether the peer stole focus.
     #[test]
-    fn peer_session_opened_without_go_still_enqueues_select_model() {
+    fn peer_slash_model_requires_backend_support_before_staging() {
         let mut store = peer_capable_store();
-        let peer_key = prepare_peer(&mut store, "/peer --model deepseek-v4-pro fix the nav");
-
-        peer_session_opened(&mut store, &peer_key);
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_PEER_PREPARE,
+        ]));
+        let outcome = store.dispatch_peer_slash("/peer --model strong fix it");
+        assert!(matches!(outcome, SlashDispatchOutcome::Rejected));
+        assert!(store.state.pending_peer_prepare.is_none());
         assert!(
             store
                 .state
-                .pending_autonomy_hydration
-                .iter()
-                .any(|queued| matches!(
-                    queued,
-                    AppUiCommand::SelectModel(params)
-                        if params.session_id == peer_key
-                            && params.model == "deepseek-v4-pro"
-                )),
-            "background peers get the requested model too, got {:?}",
-            store.state.pending_autonomy_hydration
+                .status
+                .contains(crate::model::APPUI_FEATURE_PEER_MODEL_OVERRIDE_V1)
         );
+        assert!(matches!(
+            store.dispatch_peer_slash("/peer fix it").into_command(),
+            Some(AppUiCommand::PeerPrepare(_))
+        ));
+    }
+
+    #[test]
+    fn peer_slash_model_rejects_another_flag_as_value() {
+        let mut store = peer_capable_store();
+        assert!(matches!(
+            store.dispatch_peer_slash("/peer --model --go fix it"),
+            SlashDispatchOutcome::Rejected
+        ));
+        assert!(store.state.pending_peer_prepare.is_none());
+    }
+
+    #[test]
+    fn peer_slash_model_is_part_of_fleet_preparation() {
+        let mut store = peer_capable_store();
+        let Some(AppUiCommand::PeerPrepare(params)) = store
+            .dispatch_peer_slash("/peer --n 3 --model strong review it")
+            .into_command()
+        else {
+            panic!("expected peer preparation");
+        };
+        assert_eq!(params.n, Some(3));
+        assert_eq!(params.model_override.unwrap().model_id, "strong");
     }
 
     /// No `--model` flag ⇒ no spurious `model/select` — the server's default
@@ -18271,7 +18261,6 @@ mod tests {
                 brief_path: "/repo/.octos/peers/fix-nav/BRIEF.md".into(),
                 go: false,
                 agent_staged: false,
-                model: None,
                 created: std::time::Instant::now(),
             },
         );
