@@ -2033,6 +2033,7 @@ impl ProtocolAppUiBackend {
                 .cloned()
                 .or_else(|| self.launch.cwd.clone());
             AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id,
                 topic: None,
                 profile_id: self.launch.profile_id.clone(),
@@ -2102,6 +2103,7 @@ impl ProtocolAppUiBackend {
             return None;
         }
         Some(AppUiCommand::OpenSession(SessionOpenParams {
+            client_commands: None,
             session_id: params.session_id.clone(),
             topic: None,
             profile_id: self.launch.profile_id.clone(),
@@ -2841,6 +2843,7 @@ impl AppUiBackend for ProtocolAppUiBackend {
         if let Some(session_id) = self.launch.session_id.clone() {
             self.send(AppUiCommand::OpenSession(
                 octos_core::ui_protocol::SessionOpenParams {
+                    client_commands: None,
                     session_id,
                     topic: None,
                     profile_id: self.launch.profile_id.clone(),
@@ -5606,6 +5609,7 @@ impl MockAppUiBackend {
                     .into(),
         }));
         self.enqueue_protocol(UiNotification::TurnCompleted(TurnCompletedEvent {
+            token_usage: None,
             session_id: session_id.clone(),
             topic: None,
             turn_id,
@@ -6194,6 +6198,8 @@ impl AppUiBackend for MockAppUiBackend {
             AppUiCommand::ListSessions(_) => {
                 self.queue
                     .push_back(ClientEvent::SessionList(SessionListResult {
+                        profile_id: None,
+                        workspace_root: None,
                         sessions: serde_json::json!([
                             {
                                 "id": "local:mock#alpha",
@@ -6236,6 +6242,9 @@ impl AppUiBackend for MockAppUiBackend {
                             context_state: None,
                             replayed_tool_envelopes: None,
                             messages: Some(vec![HydratedMessage {
+                                tool_call_id: None,
+                                tool_calls: Vec::new(),
+                                tool_name: None,
                                 seq: 1,
                                 role: "user".into(),
                                 content: "first mock prompt".into(),
@@ -6684,6 +6693,7 @@ fn mock_approval_risk(kind: &str) -> &'static str {
 fn mock_approval_details(kind: &str) -> ApprovalTypedDetails {
     match kind {
         approval_kinds::DIFF => ApprovalTypedDetails {
+            host_tool: None,
             kind: approval_kinds::DIFF.into(),
             command: None,
             sandbox: None,
@@ -6700,6 +6710,7 @@ fn mock_approval_details(kind: &str) -> ApprovalTypedDetails {
             sandbox_escalation: None,
         },
         approval_kinds::FILESYSTEM => ApprovalTypedDetails {
+            host_tool: None,
             kind: approval_kinds::FILESYSTEM.into(),
             command: None,
             sandbox: None,
@@ -6714,6 +6725,7 @@ fn mock_approval_details(kind: &str) -> ApprovalTypedDetails {
             sandbox_escalation: None,
         },
         approval_kinds::NETWORK => ApprovalTypedDetails {
+            host_tool: None,
             kind: approval_kinds::NETWORK.into(),
             command: None,
             sandbox: None,
@@ -6728,6 +6740,7 @@ fn mock_approval_details(kind: &str) -> ApprovalTypedDetails {
             sandbox_escalation: None,
         },
         approval_kinds::SANDBOX_ESCALATION => ApprovalTypedDetails {
+            host_tool: None,
             kind: approval_kinds::SANDBOX_ESCALATION.into(),
             command: None,
             sandbox: None,
@@ -7579,6 +7592,7 @@ mod tests {
         let request = rpc_request_from_command(
             "tui-7".into(),
             AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 // Ordinary chat turn: context-scoped tools stay unadvertised.
                 tool_context: None,
                 session_id: SessionKey("local:test".into()),
@@ -7609,6 +7623,7 @@ mod tests {
         let request = rpc_request_from_command(
             "tui-9".into(),
             AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 // Ordinary chat turn: context-scoped tools stay unadvertised.
                 tool_context: None,
                 session_id: SessionKey("local:test".into()),
@@ -9570,6 +9585,7 @@ mod tests {
         let read_style_commands = [
             AppUiCommand::ListConfigCapabilities(ConfigCapabilitiesListParams {}),
             AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: session_id.clone(),
                 topic: None,
                 sandbox: None,
@@ -9606,7 +9622,10 @@ mod tests {
                 after: None,
                 include: Vec::new(),
             }),
-            AppUiCommand::ListSessions(octos_core::ui_protocol::SessionListParams { cwd: None }),
+            AppUiCommand::ListSessions(octos_core::ui_protocol::SessionListParams {
+                profile_id: None,
+                cwd: None,
+            }),
             AppUiCommand::GetThreadGraph(ThreadGraphGetParams {
                 session_id: session_id.clone(),
                 at: None,
@@ -9647,6 +9666,7 @@ mod tests {
 
         let mutating_commands = [
             AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 // Ordinary chat turn: context-scoped tools stay unadvertised.
                 tool_context: None,
                 session_id: session_id.clone(),
@@ -11109,6 +11129,7 @@ mod tests {
             .expect("session opened event");
         let request = exchange
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: session_id.clone(),
                 topic: None,
                 sandbox: None,
@@ -11593,6 +11614,7 @@ mod tests {
         // This seam tests a hydrate writer failure in an ALREADY opened
         // scope; unknown-scope hydration has a separate session/open gate.
         backend.remember_confirmed_session_scope(SessionOpenParams {
+            client_commands: None,
             session_id: SessionKey("local:hydrate-send".into()),
             topic: None,
             profile_id: None,
@@ -11925,6 +11947,7 @@ mod tests {
 
         let request = backend
             .build_tracked_request(AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 // Ordinary chat turn: context-scoped tools stay unadvertised.
                 tool_context: None,
                 session_id: SessionKey("local:test".into()),
@@ -12032,6 +12055,7 @@ mod tests {
         let session_id = SessionKey("local:test".into());
         let request = backend
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: session_id.clone(),
                 topic: None,
                 sandbox: None,
@@ -12655,6 +12679,7 @@ mod tests {
         });
         let request = backend
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: SessionKey("local:test".into()),
                 topic: None,
                 sandbox: None,
@@ -12737,6 +12762,7 @@ mod tests {
         });
         let request = backend
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: SessionKey("local:test".into()),
                 topic: None,
                 sandbox: None,
@@ -12766,7 +12792,10 @@ mod tests {
         });
         let request = backend
             .build_tracked_request(AppUiCommand::ListSessions(
-                octos_core::ui_protocol::SessionListParams { cwd: None },
+                octos_core::ui_protocol::SessionListParams {
+                    profile_id: None,
+                    cwd: None,
+                },
             ))
             .expect("request builds");
 
@@ -12789,7 +12818,10 @@ mod tests {
         });
         let request = backend
             .build_tracked_request(AppUiCommand::ListSessions(
-                octos_core::ui_protocol::SessionListParams { cwd: None },
+                octos_core::ui_protocol::SessionListParams {
+                    profile_id: None,
+                    cwd: None,
+                },
             ))
             .expect("request builds");
 
@@ -12819,6 +12851,7 @@ mod tests {
         );
         let open = |session_id: &str, cwd: Option<&str>| {
             AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: SessionKey(session_id.into()),
                 topic: None,
                 profile_id: Some("dev".into()),
@@ -12922,6 +12955,7 @@ mod tests {
 
         let request = backend
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: session_id.clone(),
                 topic: None,
                 sandbox: None,
@@ -13147,6 +13181,7 @@ mod tests {
 
         // 2. An explicit open carries its OWN cwd, not the launch one.
         backend.record_reopen_target(&AppUiCommand::OpenSession(SessionOpenParams {
+            client_commands: None,
             session_id: SessionKey("local:other".into()),
             topic: None,
             profile_id: Some("research".into()),
@@ -13249,6 +13284,7 @@ done
         backend.refresh_capabilities_on_reconnect = true;
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 tool_context: None,
                 session_id: session_id.clone(),
                 turn_id: TurnId::new(),
@@ -13421,6 +13457,7 @@ wait
         ] {
             backend
                 .send(AppUiCommand::OpenSession(SessionOpenParams {
+                    client_commands: None,
                     session_id: SessionKey(session.into()),
                     topic: None,
                     profile_id: Some(
@@ -13474,6 +13511,7 @@ wait
         for session in ["local:master", "local:peer"] {
             backend
                 .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                    origin: None,
                     tool_context: None,
                     session_id: SessionKey(session.into()),
                     turn_id: TurnId::new(),
@@ -13685,6 +13723,7 @@ wait
         backend.disconnected_status_reported = true;
         let prompt = |session: &str| {
             AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 tool_context: None,
                 session_id: SessionKey(session.into()),
                 turn_id: TurnId::new(),
@@ -13725,6 +13764,7 @@ wait
         );
         backend
             .send(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: SessionKey("local:peer".into()),
                 topic: None,
                 profile_id: Some("dev".into()),
@@ -13763,6 +13803,7 @@ wait
         let session_id = SessionKey("local:barrier".into());
         let request = backend
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: session_id.clone(),
                 topic: None,
                 profile_id: Some("dev".into()),
@@ -13781,7 +13822,10 @@ wait
         });
         backend
             .deferred_until_reconnect_open
-            .push_back(AppUiCommand::ListSessions(SessionListParams { cwd: None }));
+            .push_back(AppUiCommand::ListSessions(SessionListParams {
+                profile_id: None,
+                cwd: None,
+            }));
         (backend, request_id)
     }
 
@@ -13791,6 +13835,7 @@ wait
     fn arm_session_open_barrier(backend: &mut ProtocolAppUiBackend, session_id: &str) -> String {
         let session_id = SessionKey(session_id.into());
         let command = AppUiCommand::OpenSession(SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: Some("dev".into()),
@@ -14008,6 +14053,7 @@ done
         backend.refresh_capabilities_on_reconnect = true;
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 tool_context: None,
                 session_id: session_id.clone(),
                 turn_id: TurnId::new(),
@@ -14126,6 +14172,7 @@ done
         backend.refresh_capabilities_on_reconnect = true;
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 tool_context: None,
                 session_id: session_id.clone(),
                 turn_id: TurnId::new(),
@@ -14263,7 +14310,10 @@ done
         backend.disconnected_status_reported = true;
         backend.refresh_capabilities_on_reconnect = true;
         backend
-            .send(AppUiCommand::ListSessions(SessionListParams { cwd: None }))
+            .send(AppUiCommand::ListSessions(SessionListParams {
+                profile_id: None,
+                cwd: None,
+            }))
             .expect("child launch + deferred list");
 
         let mut seen = Vec::new();
@@ -14282,6 +14332,7 @@ done
 
         let prompt = || {
             AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 tool_context: None,
                 session_id: SessionKey("local:rejected".into()),
                 turn_id: TurnId::new(),
@@ -14299,6 +14350,7 @@ done
         // with a follow-up command queued behind the barrier.
         backend
             .send(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: SessionKey("local:rejected".into()),
                 topic: None,
                 profile_id: Some("dev".into()),
@@ -14312,7 +14364,10 @@ done
             "every open arms the scoped barrier"
         );
         backend
-            .send(AppUiCommand::ListSessions(SessionListParams { cwd: None }))
+            .send(AppUiCommand::ListSessions(SessionListParams {
+                profile_id: None,
+                cwd: None,
+            }))
             .expect("list defers behind the barrier");
         backend.send(prompt()).expect("submit defers");
         assert_eq!(backend.deferred_until_reconnect_open.len(), 2);
@@ -14406,6 +14461,7 @@ done
         );
         backend
             .send(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: launch_session.clone(),
                 topic: None,
                 profile_id: Some("dev".into()),
@@ -14492,6 +14548,7 @@ done
         let mut exchange = ProtocolExchange::default();
         let open = exchange
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: SessionKey("local:context".into()),
                 topic: None,
                 profile_id: None,
@@ -14610,6 +14667,7 @@ done
         // An explicitly recorded reopen target (e.g. after /resume) also gets
         // its cwd corrected to the confirmed root.
         backend.record_reopen_target(&AppUiCommand::OpenSession(SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: Some("coding".into()),
@@ -14681,6 +14739,7 @@ done
         // records the reopen target via `record_reopen_target` before any
         // network I/O; drive that helper directly so the test never dials out.
         backend.record_reopen_target(&AppUiCommand::OpenSession(SessionOpenParams {
+            client_commands: None,
             session_id: resumed_session.clone(),
             topic: None,
             profile_id: Some("research".into()),
@@ -14842,6 +14901,7 @@ done
 
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 // Ordinary chat turn: context-scoped tools stay unadvertised.
                 tool_context: None,
                 session_id: session_id.clone(),
@@ -14906,6 +14966,7 @@ done
 
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 // Ordinary chat turn: context-scoped tools stay unadvertised.
                 tool_context: None,
                 session_id: session,
@@ -14941,6 +15002,7 @@ done
         let turn_id = TurnId::new();
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 // Ordinary chat turn: context-scoped tools stay unadvertised.
                 tool_context: None,
                 session_id: session_id.clone(),
@@ -15095,6 +15157,7 @@ done
 
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 // Ordinary chat turn: context-scoped tools stay unadvertised.
                 tool_context: None,
                 session_id,

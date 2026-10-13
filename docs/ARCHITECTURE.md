@@ -388,6 +388,7 @@ This list is kept complete by `tests/docs_drift.rs`.
 | `ContextCompactionCompleted` | `context/compaction_completed` |
 | `ContextCompactionStarted` | `context/compaction_started` |
 | `ContextNormalizationReported` | `context/normalization_reported` |
+| `ContextStateReported` | `context/state_reported` (ignored; `context.state.v1` is not negotiated) |
 
 ### `message/`
 

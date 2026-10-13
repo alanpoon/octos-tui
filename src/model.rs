@@ -12089,6 +12089,7 @@ mod tests {
         use octos_core::ui_protocol::SessionOpenParams;
         let open = |id: &str| {
             AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: SessionKey(id.into()),
                 topic: None,
                 profile_id: None,
@@ -12100,6 +12101,7 @@ mod tests {
         let mut state = AppState::new(Vec::new(), 0, "ready".into(), None, false);
         for _ in 0..16 {
             state.enqueue_autonomy_hydration(AppUiCommand::ListSessions(SessionListParams {
+                profile_id: None,
                 cwd: None,
             }));
         }
@@ -12140,12 +12142,14 @@ mod tests {
         let mut state = AppState::new(Vec::new(), 0, "ready".into(), None, false);
         for _ in 0..15 {
             state.enqueue_autonomy_hydration(AppUiCommand::ListSessions(SessionListParams {
+                profile_id: None,
                 cwd: None,
             }));
         }
         state
             .pending_autonomy_hydration
             .push_front(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: session_id.clone(),
                 topic: None,
                 profile_id: None,
@@ -12160,6 +12164,7 @@ mod tests {
         );
 
         state.enqueue_autonomy_hydration(AppUiCommand::SubmitPrompt(TurnStartParams {
+            origin: None,
             tool_context: None,
             session_id: session_id.clone(),
             turn_id: TurnId::new(),
@@ -12204,6 +12209,7 @@ mod tests {
         let mut state = AppState::new(Vec::new(), 0, "ready".into(), None, false);
         for index in 0..16 {
             state.enqueue_autonomy_hydration(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: SessionKey(format!("local:{index}")),
                 topic: None,
                 profile_id: None,
@@ -12253,6 +12259,7 @@ mod tests {
             }));
         }
         state.enqueue_local_session_open_front(AppUiCommand::OpenSession(SessionOpenParams {
+            client_commands: None,
             session_id: SessionKey("local:active".into()),
             topic: None,
             profile_id: None,
@@ -13206,7 +13213,10 @@ mod tests {
         // historical empty object `{}`, byte-identical to what old clients
         // sent, so an OLD server (no per-project session storage) still
         // deserializes it unchanged (`cwd: None` -> legacy global listing).
-        let params = SessionListParams { cwd: None };
+        let params = SessionListParams {
+            profile_id: None,
+            cwd: None,
+        };
         let wire = serde_json::to_value(&params).expect("SessionListParams serializes");
         assert_eq!(wire, serde_json::json!({}));
     }
@@ -13218,6 +13228,7 @@ mod tests {
         // `session.workspace_cwd.v1` feature) honors to scope the listing to
         // the project rooted at that path.
         let params = SessionListParams {
+            profile_id: None,
             cwd: Some("/tmp/project".into()),
         };
         let wire = serde_json::to_value(&params).expect("SessionListParams serializes");
