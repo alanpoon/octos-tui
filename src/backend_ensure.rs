@@ -695,7 +695,7 @@ pub(crate) const REQUIRED_OCTOS_RELEASE: &str = "v2.0.3";
 /// Test-only: its whole job is to be compared against Cargo.toml, so it would
 /// be dead weight in a real build.
 #[cfg(test)]
-pub(crate) const REQUIRED_OCTOS_CORE_REV: &str = "d4299d6c57aa28dcf4c39d253de02b920ab862dd";
+pub(crate) const REQUIRED_OCTOS_CORE_REV: &str = "499ed137bb2ce990dd51a950c322237d3d1173c0";
 /// Env var overriding the octos release tag to install (fork / pinned build).
 const OCTOS_RELEASE_ENV: &str = "OCTOSCODE_OCTOS_RELEASE";
 /// The octos server-bundle asset name for THIS build's target platform, or
