@@ -21,7 +21,7 @@ path = "src/main.rs"
 # Pin the exact commit behind the matching octos release tag recorded in
 # `backend_ensure`, so source builds and auto-provisioned binaries share one
 # protocol revision.
-octos-core = { git = "https://github.com/octos-org/octos", rev = "d4299d6c57aa28dcf4c39d253de02b920ab862dd" }
+octos-core = { git = "https://github.com/octos-org/octos", rev = "499ed137bb2ce990dd51a950c322237d3d1173c0" }
 # Startup splash animation engine (specs/task-startup-splash.spec). Git dep +
 # optional local patch, same pattern as octos-core above. ttfx itself only
 # depends on clap + terminal_size.
