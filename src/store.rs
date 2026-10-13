@@ -1384,6 +1384,7 @@ impl Store {
                     },
                 );
                 let open = AppUiCommand::OpenSession(octos_core::ui_protocol::SessionOpenParams {
+                    client_commands: None,
                     session_id,
                     topic: None,
                     profile_id: Some(entry.profile_id.clone()),
@@ -1430,6 +1431,7 @@ impl Store {
         .into_owned();
         Some(AppUiCommand::OpenSession(
             octos_core::ui_protocol::SessionOpenParams {
+                client_commands: None,
                 session_id,
                 topic: None,
                 profile_id: Some(result.profile_id),
@@ -1494,6 +1496,7 @@ impl Store {
         self.state.status = t!("status.peer_staged_by_agent", slug = display_name).into_owned();
         Some(AppUiCommand::OpenSession(
             octos_core::ui_protocol::SessionOpenParams {
+                client_commands: None,
                 session_id,
                 topic: None,
                 profile_id: Some(event.profile_id),
@@ -1718,6 +1721,7 @@ impl Store {
         let slug = self.peer_slug_for_key(&session_id);
         self.state.status = t!("status.peer_started", slug = slug).into_owned();
         Some(AppUiCommand::SubmitPrompt(TurnStartParams {
+            origin: None,
             // Ordinary chat turn: context-scoped tools stay unadvertised.
             tool_context: None,
             session_id,
@@ -2938,7 +2942,10 @@ impl Store {
                     // `ProtocolAppUiBackend::fill_session_list_cwd`) so a
                     // server with per-project session storage scopes the
                     // listing to this project.
-                    Some(AppUiCommand::ListSessions(SessionListParams { cwd: None }))
+                    Some(AppUiCommand::ListSessions(SessionListParams {
+                        profile_id: None,
+                        cwd: None,
+                    }))
                 } else if !self.state.resume_list_loaded {
                     // `/resume <query>` before the list ever loaded: the local
                     // resolve below would ALWAYS fail (`resume_sessions` is only
@@ -2956,7 +2963,10 @@ impl Store {
                     // `ProtocolAppUiBackend::fill_session_list_cwd`) so a
                     // server with per-project session storage scopes the
                     // listing to this project.
-                    Some(AppUiCommand::ListSessions(SessionListParams { cwd: None }))
+                    Some(AppUiCommand::ListSessions(SessionListParams {
+                        profile_id: None,
+                        cwd: None,
+                    }))
                 } else {
                     // `/resume <query>` shortcut: resolve to a session id
                     // (exact / prefix / substring) and switch directly, reusing
@@ -3110,6 +3120,7 @@ impl Store {
         self.state.status = t!("status.switching_profile", profile = id.to_string()).into_owned();
         Some(AppUiCommand::OpenSession(
             octos_core::ui_protocol::SessionOpenParams {
+                client_commands: None,
                 session_id,
                 topic: None,
                 profile_id: Some(id.to_owned()),
@@ -5302,6 +5313,7 @@ impl Store {
             octos_core::SessionKey::with_profile_topic(&profile_id, "local", "tui", topic);
         self.state.status = t!("status.opening_coding_session", profile = profile_id).into_owned();
         Some(AppUiCommand::OpenSession(SessionOpenParams {
+            client_commands: None,
             session_id,
             topic: None,
             profile_id: Some(profile_id),
@@ -6998,6 +7010,7 @@ impl Store {
             self.state.status = t!("status.images_attached", count = media.len()).into_owned();
         }
         Some(AppUiCommand::SubmitPrompt(TurnStartParams {
+            origin: None,
             // Ordinary chat turn: context-scoped tools stay unadvertised.
             tool_context: None,
             session_id,
@@ -10350,6 +10363,7 @@ impl Store {
         .into_owned();
         Some(AppUiCommand::OpenSession(
             octos_core::ui_protocol::SessionOpenParams {
+                client_commands: None,
                 session_id,
                 topic: None,
                 profile_id: Some(profile_id),
@@ -11034,6 +11048,7 @@ impl Store {
             self.state.startup_prompt_dispatched = true;
             let turn_id = TurnId::new();
             let prompt_command = AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 tool_context: None,
                 session_id: session_id.clone(),
                 turn_id,
@@ -13150,6 +13165,9 @@ impl Store {
             // octos-core is ahead of this crate and added `VoiceExit`; handling
             // it here keeps the match exhaustive so the workspace compiles.)
             UiNotification::VoiceExit(_) => None,
+            // The TUI does not negotiate context.state.v1. Accept unsolicited
+            // progress snapshots without treating them as compaction events.
+            UiNotification::ContextStateReported(_) => None,
             // task-consume-turn-steer-dropped: the server hands back `turn/steer`
             // inputs it accepted but never drained. Only a matching retained
             // steer earns a re-stage — whoever consumes it first (this arm or
@@ -13977,6 +13995,7 @@ impl Store {
                 let command = match outcome {
                     TurnTerminalOutcome::Completed => {
                         let (tokens_in, tokens_out) = token_usage
+                            .as_ref()
                             .map(|usage| {
                                 (
                                     u32::try_from(usage.input_tokens).ok(),
@@ -13985,6 +14004,7 @@ impl Store {
                             })
                             .unwrap_or((None, None));
                         self.commit_live_reply(TurnCompletedEvent {
+                            token_usage,
                             session_id: session_id.clone(),
                             topic,
                             turn_id: turn_id.clone(),
@@ -15099,6 +15119,7 @@ impl Store {
             runtime.and_then(|status| status.workspace_root.clone().or_else(|| status.cwd.clone()));
         self.state
             .enqueue_local_session_open_front(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id,
                 topic: None,
                 profile_id,
@@ -17754,6 +17775,7 @@ mod tests {
         // Stale TurnCompleted for a DIFFERENT (older) turn while turn B is live.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: TurnId::new(),
@@ -17777,6 +17799,7 @@ mod tests {
         // The REAL terminal for the live turn DOES stamp it done.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: live_turn,
@@ -19336,6 +19359,7 @@ mod tests {
         let drained = store
             .apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
                 TurnCompletedEvent {
+                    token_usage: None,
                     session_id: session_id.clone(),
                     topic: None,
                     turn_id: first_turn,
@@ -19817,6 +19841,9 @@ mod tests {
 
     fn hydrated_user_row(seq: u64, content: &str, thread_id: &str) -> HydratedMessage {
         HydratedMessage {
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+            tool_name: None,
             seq,
             role: "user".into(),
             content: content.into(),
@@ -20464,6 +20491,7 @@ mod tests {
         // the race `steered:false` covers.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: live_turn,
@@ -21386,6 +21414,8 @@ now analyzing the bus module"
         let mut store = store_with_empty_session();
 
         store.apply_client_event(ClientEvent::SessionList(SessionListResult {
+profile_id: None,
+workspace_root: None,
             sessions: serde_json::json!([
                 { "id": "s:old", "message_count": 1, "updated_at": "2026-06-01T00:00:00Z" },
                 { "id": "s:new", "message_count": 9, "title": "Newest", "updated_at": "2026-07-01T00:00:00Z" },
@@ -21983,6 +22013,7 @@ now analyzing the bus module"
         // A's terminal fires while B is active: nothing may submit into B.
         let command = store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: SessionKey("local:a".into()),
                 topic: None,
                 turn_id,
@@ -22070,6 +22101,7 @@ now analyzing the bus module"
         )));
         let command = store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: a.clone(),
                 topic: None,
                 turn_id,
@@ -22459,6 +22491,7 @@ now analyzing the bus module"
         // new turn's TurnStarted.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: a.clone(),
                 topic: None,
                 turn_id: old_turn.clone(),
@@ -22498,6 +22531,7 @@ now analyzing the bus module"
         // The gate's OWN terminal still releases it (FIFO preserved).
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: a.clone(),
                 topic: None,
                 turn_id: new_turn,
@@ -23476,6 +23510,9 @@ now analyzing the bus module"
                 context: None,
                 context_state: None,
                 messages: Some(vec![HydratedMessage {
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                    tool_name: None,
                     seq: 1,
                     role: "user".into(),
                     content: "first question".into(),
@@ -23539,6 +23576,9 @@ now analyzing the bus module"
                 context: None,
                 context_state: None,
                 messages: Some(vec![HydratedMessage {
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                    tool_name: None,
                     seq: 1,
                     role: "user".into(),
                     content: "first question".into(),
@@ -23610,6 +23650,9 @@ now analyzing the bus module"
                 context: None,
                 context_state: None,
                 messages: Some(vec![HydratedMessage {
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                    tool_name: None,
                     seq: 1,
                     role: "user".into(),
                     content: "first question".into(),
@@ -23660,6 +23703,8 @@ now analyzing the bus module"
 
         // Server returns zero prior sessions.
         store.apply_client_event(ClientEvent::SessionList(SessionListResult {
+            profile_id: None,
+            workspace_root: None,
             sessions: serde_json::json!([]),
         }));
 
@@ -24085,6 +24130,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: a.clone(),
                 topic: None,
                 turn_id: turn,
@@ -24160,6 +24206,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: a,
                 topic: None,
                 turn_id: turn,
@@ -24307,6 +24354,7 @@ now analyzing the bus module"
         )));
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: a,
                 topic: None,
                 turn_id: turn,
@@ -24407,6 +24455,7 @@ now analyzing the bus module"
         // …then the turn settles before the event loop reaches the draw.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id,
@@ -24596,6 +24645,7 @@ now analyzing the bus module"
 
     fn turn_completed_event(session_id: &SessionKey, turn_id: &TurnId) -> AppUiEvent {
         AppUiEvent::Protocol(UiNotification::TurnCompleted(TurnCompletedEvent {
+            token_usage: None,
             session_id: session_id.clone(),
             topic: None,
             turn_id: turn_id.clone(),
@@ -31654,6 +31704,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: turn_id.clone(),
@@ -32414,6 +32465,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_id.clone(),
@@ -32720,6 +32772,7 @@ now analyzing the bus module"
         assert_eq!(store.state.selected_session, 0);
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: background_id.clone(),
                 topic: None,
                 turn_id: turn_id.clone(),
@@ -32793,6 +32846,7 @@ now analyzing the bus module"
         // Original user turn completes first and clears live_reply.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: original_turn,
@@ -32824,6 +32878,7 @@ now analyzing the bus module"
         }
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: continuation,
@@ -32886,6 +32941,7 @@ now analyzing the bus module"
         )));
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_id.clone(),
@@ -32926,6 +32982,7 @@ now analyzing the bus module"
         )));
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_id.clone(),
@@ -33157,6 +33214,7 @@ now analyzing the bus module"
         let mut store = store_with_live_reply(turn_id.clone(), "the answer");
         let session_id = store.state.sessions[0].id.clone();
         let completed = TurnCompletedEvent {
+            token_usage: None,
             session_id: session_id.clone(),
             topic: None,
             turn_id: turn_id.clone(),
@@ -33199,6 +33257,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_id.clone(),
@@ -33247,6 +33306,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: original_turn,
@@ -33271,6 +33331,7 @@ now analyzing the bus module"
         }
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: continuation,
@@ -33314,6 +33375,7 @@ now analyzing the bus module"
         )));
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: continuation,
@@ -33350,6 +33412,7 @@ now analyzing the bus module"
             )));
             store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
                 TurnCompletedEvent {
+                    token_usage: None,
                     session_id: session_id.clone(),
                     topic: None,
                     turn_id: turn.clone(),
@@ -33401,6 +33464,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: turn_id.clone(),
@@ -33452,6 +33516,7 @@ now analyzing the bus module"
         );
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_a.clone(),
@@ -33481,6 +33546,7 @@ now analyzing the bus module"
         );
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: turn_b.clone(),
@@ -33534,6 +33600,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: turn_id.clone(),
@@ -33626,6 +33693,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -33656,6 +33724,7 @@ now analyzing the bus module"
                 ));
             store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
                 TurnCompletedEvent {
+                    token_usage: None,
                     session_id,
                     topic: None,
                     turn_id: turn,
@@ -33707,6 +33776,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -33736,6 +33806,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -33771,6 +33842,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: peer.clone(),
                 topic: None,
                 turn_id,
@@ -33801,6 +33873,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -33832,6 +33905,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -33892,6 +33966,7 @@ now analyzing the bus module"
         )));
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -33929,6 +34004,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -33957,6 +34033,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: TurnId::new(),
@@ -34050,6 +34127,7 @@ now analyzing the bus module"
         // B completes — live_reply is now None.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_b.clone(),
@@ -34075,6 +34153,7 @@ now analyzing the bus module"
         // LATE TurnCompleted{A} arrives after B already committed.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: turn_a.clone(),
@@ -34139,6 +34218,7 @@ now analyzing the bus module"
         // Turn B completes — live_reply is now None.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_b.clone(),
@@ -34170,6 +34250,7 @@ now analyzing the bus module"
         // LATE TurnCompleted{A} arrives after B has completed (live_reply None).
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: turn_a.clone(),
@@ -34224,6 +34305,7 @@ now analyzing the bus module"
         )));
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_a.clone(),
@@ -34262,6 +34344,7 @@ now analyzing the bus module"
         // B completes normally; with the fix nothing latched → back to idle.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: turn_b.clone(),
@@ -34318,6 +34401,7 @@ now analyzing the bus module"
         // B completes — live_reply is now None.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_b.clone(),
@@ -34542,6 +34626,7 @@ now analyzing the bus module"
         let logs_before = store.state.turn_activity_logs.len();
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: turn_a.clone(),
@@ -34640,6 +34725,7 @@ now analyzing the bus module"
         // B completes — live_reply is now None.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_b.clone(),
@@ -34718,6 +34804,7 @@ now analyzing the bus module"
         )));
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: turn_a,
@@ -34791,6 +34878,7 @@ now analyzing the bus module"
             }
             LegacyPayload::TurnCompleted { token_usage } => {
                 UiNotification::TurnCompleted(TurnCompletedEvent {
+                    token_usage: None,
                     session_id,
                     topic: None,
                     turn_id,
@@ -35374,6 +35462,7 @@ now analyzing the bus module"
         let command = store
             .apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
                 TurnCompletedEvent {
+                    token_usage: None,
                     session_id: session_id.clone(),
                     topic: None,
                     turn_id,
@@ -35411,6 +35500,7 @@ now analyzing the bus module"
         let command = store
             .apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
                 TurnCompletedEvent {
+                    token_usage: None,
                     session_id,
                     topic: None,
                     turn_id,
@@ -35497,6 +35587,7 @@ now analyzing the bus module"
         let command = store
             .apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
                 TurnCompletedEvent {
+                    token_usage: None,
                     session_id: session_id.clone(),
                     topic: None,
                     turn_id,
@@ -36065,6 +36156,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -36210,6 +36302,7 @@ now analyzing the bus module"
         );
         event.approval_kind = Some(approval_kinds::DIFF.into());
         event.typed_details = Some(ApprovalTypedDetails {
+            host_tool: None,
             kind: approval_kinds::DIFF.into(),
             command: None,
             sandbox: None,
@@ -36285,6 +36378,7 @@ now analyzing the bus module"
         )));
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -37220,6 +37314,7 @@ now analyzing the bus module"
         // …and then finishes NORMALLY — the interrupt never landed.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_id.clone(),
@@ -37269,6 +37364,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -37830,6 +37926,7 @@ now analyzing the bus module"
         // Some servers settle an interrupted turn with a normal completion.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -39318,6 +39415,7 @@ now analyzing the bus module"
         );
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: TurnId::new(),
@@ -39335,6 +39433,7 @@ now analyzing the bus module"
         // The OWNING turn's terminal clears it.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: owner_turn.clone(),
@@ -39978,6 +40077,7 @@ now analyzing the bus module"
         // …so the turn's terminal archives it with the turn.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_id.clone(),
@@ -40434,6 +40534,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id,
@@ -40503,6 +40604,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: stale_turn,
@@ -43474,6 +43576,9 @@ now analyzing the bus module"
         // a tool turn went 2 live msgs -> 4 on hydrate before this filter).
         let now = chrono::Utc::now();
         let row = |role: &str, content: &str| HydratedMessage {
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+            tool_name: None,
             seq: 1,
             role: role.into(),
             content: content.into(),
@@ -43526,6 +43631,9 @@ now analyzing the bus module"
             context: None,
             context_state: None,
             messages: Some(vec![HydratedMessage {
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+                tool_name: None,
                 seq: 1,
                 role: "user".into(),
                 content: "earlier committed prompt".into(),
@@ -43632,6 +43740,9 @@ now analyzing the bus module"
                     .iter()
                     .enumerate()
                     .map(|(i, (role, content))| HydratedMessage {
+                        tool_call_id: None,
+                        tool_calls: Vec::new(),
+                        tool_name: None,
                         seq: i as u64 + 1,
                         role: (*role).into(),
                         content: (*content).into(),
@@ -45706,6 +45817,9 @@ now analyzing the bus module"
             context: None,
             context_state: None,
             messages: Some(vec![HydratedMessage {
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+                tool_name: None,
                 seq: 1,
                 role: "assistant".into(),
                 content: REPORT.into(),
@@ -45780,6 +45894,9 @@ now analyzing the bus module"
             }),
             messages: Some(vec![
                 HydratedMessage {
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                    tool_name: None,
                     seq: 1,
                     role: "user".into(),
                     content: "build this".into(),
@@ -45793,6 +45910,9 @@ now analyzing the bus module"
                     reasoning_content: None,
                 },
                 HydratedMessage {
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                    tool_name: None,
                     seq: 2,
                     role: "assistant".into(),
                     content: "legacy companion".into(),
@@ -45806,6 +45926,9 @@ now analyzing the bus module"
                     reasoning_content: None,
                 },
                 HydratedMessage {
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                    tool_name: None,
                     seq: 3,
                     role: "assistant".into(),
                     content: "legacy ack".into(),
@@ -45969,6 +46092,9 @@ now analyzing the bus module"
             context_state: None,
             messages: Some(vec![
                 HydratedMessage {
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                    tool_name: None,
                     seq: 0,
                     role: "user".into(),
                     content: "which is larger, 9.11 or 9.9?".into(),
@@ -45982,6 +46108,9 @@ now analyzing the bus module"
                     reasoning_content: None,
                 },
                 HydratedMessage {
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                    tool_name: None,
                     seq: 1,
                     role: "assistant".into(),
                     content: "9.9 is larger.".into(),
@@ -46665,6 +46794,7 @@ now analyzing the bus module"
 
     fn completed_terminal(session_id: &SessionKey, turn_id: &TurnId) -> AppUiEvent {
         AppUiEvent::Protocol(UiNotification::TurnCompleted(TurnCompletedEvent {
+            token_usage: None,
             session_id: session_id.clone(),
             topic: None,
             turn_id: turn_id.clone(),
@@ -47295,6 +47425,9 @@ now analyzing the bus module"
             context: None,
             context_state: None,
             messages: Some(vec![HydratedMessage {
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+                tool_name: None,
                 seq: 1,
                 role: "user".into(),
                 content: "earlier committed prompt".into(),
@@ -48662,6 +48795,7 @@ now analyzing the bus module"
         // `finalized_history_lines_range_dedup_live` call in viewport.rs).
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn.clone(),
@@ -48724,6 +48858,7 @@ now analyzing the bus module"
         // The legacy terminal must still commit — not be deduped away.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn.clone(),
@@ -48791,6 +48926,7 @@ now analyzing the bus module"
         // A is focused; B's turn completes in the background.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: b.clone(),
                 topic: None,
                 turn_id: TurnId::new(),
@@ -48806,6 +48942,7 @@ now analyzing the bus module"
         let a = SessionKey("local:a".into());
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: a.clone(),
                 topic: None,
                 turn_id: TurnId::new(),

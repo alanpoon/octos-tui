@@ -2253,6 +2253,7 @@ fn launch_prompt_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         );
         MenuAction::send_appui(AppUiCommand::OpenSession(
             octos_core::ui_protocol::SessionOpenParams {
+                client_commands: None,
                 session_id,
                 topic: None,
                 profile_id: Some(profile.to_owned()),
