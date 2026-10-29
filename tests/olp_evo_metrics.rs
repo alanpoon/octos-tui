@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Evolution loop phase-2 metrics + shared-lib contract tests (#43c-2,
 //! SDD spec v2: `specs/task-req-olp-evo-p2.spec.md`).
 

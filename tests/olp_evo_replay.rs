@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Evolution loop phase-2 replay + metrics contract tests (#43c, SDD
 //! spec: `specs/task-req-olp-evo-p2.spec.md`).
 

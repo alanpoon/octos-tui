@@ -49,6 +49,12 @@ provider, paste its API key, and open your first coding chat. The
 > replies — no server, connected to nothing. Plain `octoscode` is the real
 > thing.
 
+> **Want it in a browser too?** With a matching backend, the local launch uses
+> an authenticated WebSocket server that the terminal and
+> [octoscode-web](https://github.com/octos-org/octoscode-web) can both use.
+> Older backends fall back to private stdio; start an explicit WebSocket server
+> to connect multiple clients. See [Local and remote transports](#local-and-remote-transports).
+
 ### If something looks wrong
 
 | Symptom | Fix |
@@ -140,6 +146,10 @@ cargo install octoscode
 A copy-pasteable, first-time walkthrough. By the end you have a local profile,
 an LLM provider, and a live coding session — no dashboard, no email OTP.
 
+> "Solo" here means one agent. For the two-agent setup — a cheap model working
+> under review by a strong one, with push authority held by the reviewer — see
+> [Dual loop: OctoLoop](#dual-loop-octoloop).
+
 ### 1. Install the TUI
 
 Install `octoscode` as shown in [Start here](#start-here) — that's all you need.
@@ -188,6 +198,31 @@ Notes:
   ws://host:port/api/ui-protocol/ws` for a remote one. Do **not** pass
   `--profile-id` on a true first run — it selects an existing profile and skips
   onboarding.
+
+### Multiple agents in one folder
+
+With a matching workspace-team backend build, bare `octoscode` launches share
+one local WebSocket server. Each launch creates its own conversation. Closing
+a client leaves the server and other sessions running. Use `/resume` to reopen
+an existing conversation instead of starting a new member.
+The TUI and server both honor inherited `OCTOS_HOME` for the profile registry;
+an explicit `--data-dir` in a launch command takes precedence.
+
+- `/agents` opens the workspace member list and coordinator picker.
+- `/agents leader workspace-2` selects a coordinator after listing the team.
+- `/agents message workspace-2 <text>` sends a peer message.
+- `/agents broadcast <text>` sends to every other member.
+
+The first member is the initial coordinator. A user can select another in the
+picker. Models use the existing peer tools; only the current coordinator gets
+`peer_assign`. File edits still require coordination between agents. Web and
+native clients can join the same server through OUP; this does not synchronize
+folders between machines. An older private stdio server must be stopped before
+the shared server can take ownership of its runtime directory. With an older
+backend (including the currently pinned auto-install release), an implicit
+launch reports that shared sessions are unavailable and keeps using private
+stdio. Upgrade the backend to enable workspace teams. Explicit transport
+commands are preserved.
 
 ### 3. Create your local profile
 
@@ -242,7 +277,7 @@ workspace. How much it may do is a **per-session** setting you change live with
 So for a review, run `/permissions` → **Read-only** and ask the agent to review
 the diff; for hands-on changes, switch to **Workspace-write** (or **Full
 Access**). The TUI only *requests* the mode — the backend applies it, and **Full
-Access is offered only on solo/local backends**, never on a shared `octos serve`.
+Access is offered only on solo/local backends**, never on a multi-user `octos serve`.
 
 For **headless / scripted** code review and for running **many review or edit
 agents in parallel**, use the `octos chat` CLI in the main
@@ -252,12 +287,149 @@ agents in parallel**, use the `octos chat` CLI in the main
 
 ---
 
+## Dual loop: OctoLoop
+
+Everything above runs **one** agent. OctoLoop runs two, with different price
+tags and different authority: a cheap model does the work on the inside, and a
+strong model reviews it from the outside. The protocol underneath is **OLP**
+(Outer-Loop Protocol); **OctoLoop** is the packaged, one-command form of it.
+
+```
+┌─ OUTER loop (strong model: Claude Code / Codex / any CLI agent)
+│    read board → dispatch a numbered entry → independently re-verify → push
+│         ▲                                          │
+│    .octos/OUTER_LOOP_REVIEW.md (the blackboard)     │  herdr prompt / octos steer
+│         │                                          ▼
+└─ INNER loop (octoscode + octos serve, running a cheap model such as kimi)
+     read board → execute → commit (never push) → ACK(done|wontdo|blocked)
+```
+
+The two loops talk only through a file: an append-only blackboard at
+`.octos/OUTER_LOOP_REVIEW.md`. The inner loop takes the lowest-numbered entry
+that has no `ACK(` line, does it, commits, and writes back one of
+`ACK(done|wontdo|blocked): <notes>`. **Push authority belongs to the outer loop
+alone** — so nothing reaches your remote until a second, stronger model has
+re-run the tests itself, in an isolated worktree, from the CI workflow verbatim.
+
+That split is the point: you spend cheap tokens on the work, which you can
+re-run freely, and expensive tokens only on review and adjudication.
+
+### Set it up (one command)
+
+```bash
+cd your-project/
+curl -fsSL https://raw.githubusercontent.com/octos-org/octoscode/main/scripts/olp-init.sh | bash
+```
+
+It is idempotent and never overwrites an existing file. It lays down:
+
+| Artifact | What it is |
+|---|---|
+| `.octos/OUTER_LOOP_REVIEW.md` | the blackboard, gitignored — it is branch-independent, and tracking it causes cross-branch split brain |
+| `.octos/loop.md` | the inner loop's maintenance cycle |
+| `AGENTS.md` | the self-contained onboarding card (see below); `OLP_INIT_LANG=zh` for Chinese |
+| `~/.octos/outer/` | the board sentry and the atomic append helper |
+
+Then start the inner loop:
+
+```bash
+octoscode --stdio-command 'octos serve --stdio --solo --danger-full-access'
+```
+
+`--solo` is the safety gate for a single-person local box; without it serve
+refuses the permissive profile. `--danger-full-access` matters more than it
+looks: the lower permission tiers run the agent inside a filesystem sandbox
+where `~/.cargo` and `~/.rustup` are **invisible**, so every build command comes
+back "command not found" — this is the real cause behind an inner loop
+reporting "there is no cargo on this machine". Granting it is an operator
+decision; see [Agent permissions](#agent-permissions--code-review).
+
+### Hand an agent the card
+
+`AGENTS.md` is the card, and it is deliberately self-contained — any agent
+(Claude Code, Codex, whatever you have a subscription for) can read that one
+file and take a role without opening the rest of the docs. It covers role
+selection, the ACK grammar, dispatch, waking the inner loop, three-layer
+observation, isolated re-verification, and the red lines. It is also the
+protocol's own resident channel: octos injects `AGENTS.md` into every session.
+
+### Drive the inner loop from the outside
+
+The outer loop is not a chat window — it drives the inner one programmatically:
+
+```bash
+herdr agent list                       # find the inner pane
+herdr agent prompt <pane> '<one line>'  # wake it when idle (arrives as a user message)
+
+cd <project>                            # steer resolves the instance by cwd
+octos steer --session '<key>' --text '[external-reviewer] ...'   # mid-turn, no interrupt
+```
+
+[herdr](https://github.com/hagency-org/herdr) is a terminal workspace manager
+and is recommended, not required — without it, fall back to tmux `send-keys`.
+For observation, watch all three layers (screen, `events.jsonl`, and
+`octos goal status` / `ledger tail`): delivery, consumption and execution are
+three different things, and a goal that tripped its breaker is silent in
+exactly the same way as one that is still working.
+
+### OctoLoop docs
+
+| Doc | For |
+|---|---|
+| [`docs/OCTOLOOP_AGENTS.md`](docs/OCTOLOOP_AGENTS.md) | the self-contained card — hand this to an agent ([中文](docs/OCTOLOOP_AGENTS.zh-CN.md)) |
+| [`docs/OLP_QUICKSTART.en.md`](docs/OLP_QUICKSTART.en.md) | zero-to-running for a new project ([中文](docs/OLP_QUICKSTART.md)) |
+| [`docs/OUTER_LOOP_PROTOCOL.md`](docs/OUTER_LOOP_PROTOCOL.md) | the protocol in full: R1–R7, schemas, budgets, field lessons |
+| [`docs/OLP_OUTER_BOOT.md`](docs/OLP_OUTER_BOOT.md) | the outer operator card and tactics handbook |
+| [`docs/OCTOLOOP_GUIDE.md`](docs/OCTOLOOP_GUIDE.md) | full guide, mechanisms, platform matrix |
+| [`docs/OCTOLOOP_FEATURES.md`](docs/OCTOLOOP_FEATURES.md) | one-page capability panorama |
+
+On platforms: Linux is full power. macOS works with two gaps — the outer-duty
+authority lock is Linux-only, and the sandbox tiers do not apply. On Windows,
+use WSL2.
+
+---
+
 ## Other ways to run
+
+### Local and remote transports
+
+The TUI never contains the agent — `octos serve` does. What changes is how the
+two talk, and that decides whether anything else can join.
+
+| | **Shared local (WebSocket)** | **Private (stdio)** | **Explicit server (WebSocket)** |
+| --- | --- | --- | --- |
+| Start it with | `octoscode` with a matching backend | `octoscode --stdio-command "octos serve --stdio --solo"` | Start `octos serve`, then `octoscode --endpoint …` |
+| Who runs the server | the TUI discovers or starts it; it outlives clients | the TUI starts a private child | you do; it outlives clients |
+| How many clients | multiple sessions share one runtime | exactly one | multiple clients can connect |
+| Browser client | yes, with the local endpoint and authentication | no | yes — [octoscode-web](https://github.com/octos-org/octoscode-web) |
+| Setup | automatic discovery | explicit command, or fallback with an older backend | endpoint and authentication |
+
+Bare launches use shared local mode when the backend supports it, and otherwise
+retain private stdio with an upgrade notice. `--stdio` communicates through the
+child's stdin and stdout without an HTTP listener, so browser clients cannot
+attach to that transport.
 
 ### Connect to a running `octos serve` over WebSocket
 
 If a server is already running (locally or remote), connect over its UI Protocol
-WebSocket instead of spawning a child. Start the server from the sibling repo:
+WebSocket instead of spawning a child:
+
+```bash
+# terminal 1 — the server, bound to a port
+# (~/.octos/bin is where octoscode installs it; it is not on your PATH)
+export OCTOS_AUTH_TOKEN=local-dev-token
+~/.octos/bin/octos serve --host 127.0.0.1 --port 50080 --auth-token "$OCTOS_AUTH_TOKEN"
+
+# terminal 2 — the TUI, attaching to it
+octoscode --endpoint ws://127.0.0.1:50080/api/ui-protocol/ws
+```
+
+With `--endpoint` the TUI provisions **nothing**: it does not download a server
+binary and does not spawn a child, because there is no stdio command to run
+([`backend_ensure.rs`](src/backend_ensure.rs) returns early — "WebSocket launch
+— no local backend to provision"). The server you started is the only one.
+
+Or from a source checkout of the sibling repo:
 
 ```bash
 cd ../octos
@@ -283,6 +455,129 @@ Use the **same** token for `--auth-token` on both sides (or set
 `OCTOS_AUTH_TOKEN`). Add `--profile-id <id>` to open an existing profile and
 skip onboarding; add `--readonly` for a view-only session that never sends
 turns.
+
+### Use the terminal and the browser together, step by step
+
+Three terminals, one server. Pick a token — any string you like — and use the
+same one everywhere below.
+
+**Before you start.** Run `octoscode` once on its own (see
+[Start here](#start-here)). That downloads the server to `~/.octos/bin/octos`.
+It is **not** added to your `PATH`, so the commands below spell out the full
+path. You also need [Node.js 22+](https://nodejs.org) and pnpm for the browser
+client; `corepack enable` installs the right pnpm.
+
+**1. Start the server** — terminal 1:
+
+```bash
+export OCTOS_AUTH_TOKEN=my-local-token
+~/.octos/bin/octos serve --host 127.0.0.1 --port 50080 \
+  --auth-token "$OCTOS_AUTH_TOKEN" --solo
+```
+
+`--solo` is what lets the browser set up your profile on first run. Leave it
+out and a fresh server answers "This server cannot onboard from the Web".
+
+**2. Start the browser client** — terminal 2:
+
+```bash
+git clone https://github.com/octos-org/octoscode-web.git
+cd octoscode-web
+pnpm install --frozen-lockfile
+OCTOSCODE_DEV_PROXY_TARGET=http://127.0.0.1:50080 \
+OCTOSCODE_DEV_PROXY_ORIGIN=http://127.0.0.1:50080 \
+pnpm dev
+```
+
+Keep both `OCTOSCODE_DEV_PROXY_*` variables. They make the browser talk only to
+the web client's own address, which forwards to the server. Leave them out and
+the server refuses the browser, because by default it trusts only its own
+address — and the page says "Could not connect", blaming your server and token
+even though both are fine.
+
+**3. Open the browser** at the address step 2 prints — usually
+<http://127.0.0.1:4173>, or the next free port if that one is taken.
+
+- Leave **Server origin** as it is — it already points at this page.
+- Paste your token into **Auth token** and select **Connect**.
+- Under **Add workspace**, type the full path of a project folder and select
+  **Start session**.
+- The first time only, **Create your local coding profile** opens. Set
+  **Profile ID** to `main` (step 4 uses it), choose a **Provider** and
+  **Model**, and paste the provider's API key.
+
+**4. Attach the terminal** — terminal 3, using the **Profile ID** from step 3:
+
+```bash
+OCTOS_AUTH_TOKEN=my-local-token octoscode \
+  --endpoint ws://127.0.0.1:50080/api/ui-protocol/ws --profile-id main
+```
+
+The status line reads "Pass --session to open an interactive session." That is
+expected, not an error: type `/resume` to pick the conversation you started in
+the browser.
+
+**If a step fails**
+
+| You see | Fix |
+| --- | --- |
+| `command not found: octos` | Use the full path, `~/.octos/bin/octos` — see *Before you start* |
+| "This server cannot onboard from the Web" | Restart the server with `--solo` (step 1) |
+| "Could not connect" in the browser, though the server is running and the token is right | Restart step 2 with both `OCTOSCODE_DEV_PROXY_*` variables set |
+| The TUI will not start: "endpoint and stdio-command cannot both be configured" | Your `~/.config/octoscode/config.json` has a `stdio_command`; see [Config file](#config-file) |
+| Nothing happens after `/resume` | The browser session has not finished a turn yet — send one message there first |
+
+**Hosting the browser client somewhere else?** If you serve it without that
+proxy, the server has to be told to trust its address: set
+`OCTOS_APPUI_ALLOWED_ORIGINS=http://<client host>:<port>` on the server, or
+`appui.allowed_origins` in its config. It trusts only its own address otherwise.
+
+> Octos `v2.0.3` can print a one-time pairing link with
+> `octos serve --web-url …`; the browser can open it without copying a token.
+
+Both clients can open the **same session**. Pass `--session <id>` here and pick
+that session in the browser, and you get one conversation with two front ends:
+`session/open` attaches rather than claims, the server replays what each client
+missed from its own cursor, and every later event for that session is pushed to
+every attached connection. A turn started in the terminal streams into the
+browser while it runs, and the reverse.
+
+Two consequences worth knowing before you rely on it:
+
+- **One turn at a time per session.** The server keeps a single active-turn slot
+  per session; while one client's turn runs, the other's `turn/start` is refused
+  rather than queued server-side.
+- **Neither client owns the session.** Either may start a turn whenever the slot
+  is free, and any attached client can interrupt the running turn — the abort
+  path keys on the session and turn, not on the connection that started it. Use
+  `--readonly` on the TUI when you want it to watch without sending.
+
+### Attaching: what differs, and what bites
+
+Attaching is not just a different address. Four things change, and all four have
+produced confusing sessions:
+
+- **No pairing link.** The TUI is token-only. `octos serve --web-url` prints a
+  link for the *browser*; the TUI has no `/pair/claim` support, so give it
+  `--auth-token` or `OCTOS_AUTH_TOKEN`. The token rides an
+  `Authorization: Bearer` header on the WebSocket upgrade, not a query
+  parameter.
+- **No local profile discovery.** Attached launches skip the profiles data dir,
+  because a remote server's profile registry is not visible from here. The
+  profile picker and `/profiles` are unavailable; pass `--profile-id <id>`.
+- **`--session` is optional, and omitting it opens nothing.** You connect and
+  the status line says so — "Pass --session to open an interactive session."
+  Pick one with `/resume`, or pass the id up front.
+- **A bare session id can hit `profile '_main' is not configured`.** Some status
+  reads carry only the session id, and on the WebSocket transport the server
+  resolves the profile from the authenticated identity — an admin token has
+  none — falling back to `_main` regardless of `--profile-id`. Sessions the TUI
+  creates carry their profile in the key and are fine; a hand-passed id that
+  does not is not. Use a profile-prefixed session id, or authenticate as that
+  profile's user rather than with an admin token.
+
+`octoscode doctor` probes a configured endpoint with `config/capabilities/list`
+and is the fastest way to tell a bad address from a bad token.
 
 ### Mock mode (no server)
 
@@ -316,11 +611,11 @@ so plain `octoscode` is the real thing, not the mock.
 --readonly / --no-readonly   open as a view-only session, or force read-write
 --theme <name>           codex | claude | slate | solarized | terminal
 --lang en|zh             UI language; falls back to OCTOS_LANG / LANG. Default: en
---scroll-mode <mode>     native (terminal scrollback, default) | pinned (composer pinned)
+--scroll-mode <mode>     sticky (fixed question and composer, default) | native | pinned
 --vim-mode               enable Vim modal editing in the composer (default off)
 --steer-mid-turn         inject a prompt typed mid-turn into the RUNNING turn
-                         (default off: mid-turn prompts queue FIFO and each runs
-                         as its own turn, in the order typed)
+                         (default on; Tab queues a separate turn, and a saved
+                         false preference keeps Enter queueing FIFO)
 --no-splash              skip the startup logo animation
 ```
 
@@ -330,7 +625,9 @@ settings loaded by `octos serve`, and the TUI config rejects them.
 
 ### Config file
 
-`--config FILE` reads JSON launch defaults (CLI flags win on conflict):
+`~/.config/octoscode/config.json` is read on **every** launch, with no flag —
+`--config FILE` points at a different one. CLI flags win on conflict. Print the
+path with `octoscode config path`.
 
 ```json
 {
@@ -342,9 +639,9 @@ settings loaded by `octos serve`, and the TUI config rejects them.
   "readonly": false,
   "theme": "codex",
   "lang": "en",
-  "scroll-mode": "native",
+  "scroll-mode": "sticky",
   "vim-mode": false,
-  "steer-mid-turn": false
+  "steer-mid-turn": true
 }
 ```
 
@@ -352,6 +649,24 @@ settings loaded by `octos serve`, and the TUI config rejects them.
 back into this file (merging — it never clobbers transport keys like
 `stdio_command`); without `--config` it falls back to
 `~/.config/octoscode/config.json`.
+
+To attach to a running server instead, swap the transport key (the file is
+strict JSON — unknown keys are rejected, and there are no comments):
+
+```json
+{
+  "mode": "protocol",
+  "endpoint": "ws://127.0.0.1:50080/api/ui-protocol/ws",
+  "auth-token": "local-dev-token",
+  "cwd": "/path/to/project"
+}
+```
+
+`endpoint` and `stdio_command` are one choice, here as on the command line. A
+config file carrying `stdio_command` makes `octoscode --endpoint …` **fail to
+start** — "endpoint and stdio-command cannot both be configured" — because the
+flag and the file each supply one half. Remove the key, or point `--config` at
+a file that omits it.
 
 ### Themes
 
@@ -387,7 +702,9 @@ internal error silently falls through to a normal launch.
 ### In-session keys and slash commands
 
 ```text
-Tab        peek a running sub-agent's output; Tab/Shift+Tab cycle main↔agents, Esc returns to chat
+Enter      steer compatible text into the active turn (or start a turn when idle)
+Tab        queue a nonempty draft while working; otherwise peek/cycle sub-agents
+Ctrl+X     interrupt and send pending messages; preserve the unfinished draft (diff view: stage hunk)
 PgUp/PgDn  scroll the transcript (PgUp also opens the pager)
 y / s / n  approve once / approve for session / deny a pending tool approval
 Alt+A      re-show the pending approval prompt
@@ -412,10 +729,10 @@ q          quit
 /theme      switch the TUI palette at runtime (menu, or /theme claude)
 /lang       switch the UI language (menu, or /lang zh) — English / 中文
 /thinking   set reasoning effort for thinking models, per session (menu, or /thinking high)
-/scrollmode switch wheel-scroll behavior (toggle, or /scrollmode native|pinned)
+/scrollmode switch wheel-scroll behavior (toggle, or /scrollmode sticky|native|pinned)
 /vimmode    toggle Vim modal editing in the composer (Normal/Insert)
 /saveconfig persist the active theme / language / scroll-mode / vim-mode / steer-mode to the config file
-/steer      switch what Enter means mid-turn: on injects into the running turn, off (default) queues FIFO
+/steer      switch what Enter means mid-turn: on (default) steers the running turn, off queues FIFO
 /onboard    set onboarding fields inline (name, username, email, key, ...)
 /copy       copy the last assistant reply to the clipboard (works over SSH)
 /status     snapshot-backed session, runtime, and connection status
@@ -486,11 +803,27 @@ counts (`3dd`) are out of scope.
 
 ### Scrolling and the transcript pager
 
-By default (`native` scroll-mode) the wheel scrolls the terminal's own
-scrollback, so native selection/copy stay intact and the composer scrolls away
-with the screen. Press **Ctrl+T** (or **PageUp**) to open a full-screen
-**transcript pager** where history scrolls in the upper pane while the composer
-stays pinned to the bottom; **Esc** (or Ctrl+T again) closes it.
+By default (`sticky` scroll-mode), the latest submitted question stays at the
+screen's top and the composer stays at the bottom. Answers and tool activity
+scroll between them. The question remains after completion and changes on the
+next submission; queued questions show **Queued**. Switching sessions restores
+that session's question and queue. Draft edits do not replace the header.
+
+The header shows up to three wrapped lines. Press **F2** or click it to read the
+complete question; arrows, PageUp/PageDown, Home/End and the wheel scroll that
+reader. **Esc**, F2 or Enter closes it without sending or changing the draft.
+Use **Shift+drag** for terminal text selection in application scroll modes.
+
+`/scrollmode native` (or `--scroll-mode native`) restores terminal scrollback and
+native selection/copy. In native mode, **Ctrl+T** or **PageUp** opens the
+full-screen transcript pager; **Esc** or Ctrl+T closes it. `/scrollmode sticky`
+returns to the fixed question. Bare `/scrollmode` toggles sticky/native.
+`/saveconfig` persists the choice; an explicit existing preference is respected.
+
+中文：默认 `sticky` 模式将最新提交的问题固定在顶部，输入框固定在底部，
+回答和工具活动在中间滚动。任务结束后问题仍保留；下一次提交时更新，排队问题
+显示“已排队”。F2 或点击问题可查看完整内容，Esc/F2/Enter 关闭且不发送草稿。
+`/scrollmode native` 恢复终端原生滚动，`/saveconfig` 保存当前选择。
 
 `--scroll-mode pinned` (or `/scrollmode pinned`) opts into app-side wheel
 handling: the wheel always scrolls the transcript and the composer never moves,
@@ -891,11 +1224,11 @@ one — so a profile can re-enable a skill the global defaults disabled:
 
 ## Testing and harnesses
 
-Run the unit/integration suite (mock-backed, no server needed):
+Run the complete unit/integration suite (mock-backed, no server needed):
 
 ```bash
-cargo test
-# CARGO_TARGET_DIR=/tmp/octoscode-target cargo test   # on shared/locked hosts
+cargo test --all-targets
+# CARGO_TARGET_DIR=/tmp/octoscode-target cargo test --all-targets   # on shared/locked hosts
 ```
 
 Heavier live and visual harnesses live alongside the code:
@@ -930,3 +1263,14 @@ over WebSocket or stdio; it never hard-codes provider/model truth or persists a
 parallel LLM registry. The current v1 bridge stages selected diff context as
 prompt text — structured context attachments are tracked in
 [`docs/M9_31_CONTEXT_ATTACHMENTS_UPCR.md`](docs/M9_31_CONTEXT_ATTACHMENTS_UPCR.md).
+
+---
+
+## Community and governance
+
+- [Contributing guide](CONTRIBUTING.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Security policy](SECURITY.md)
+- [Project governance](GOVERNANCE.md)
+- [Support](SUPPORT.md)
+- [Apache License 2.0](LICENSE)

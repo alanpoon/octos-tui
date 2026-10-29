@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Evolution loop phase-0 contract tests (#41, SDD spec:
 //! `specs/task-req-olp-evo-p0.spec.md`).
 //!

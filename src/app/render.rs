@@ -4,6 +4,10 @@
 use super::*;
 
 pub fn render(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
+    if pinned_question::detail_visible(app) {
+        pinned_question::render_detail(frame, app, palette);
+        return;
+    }
     if app.activity_navigator.active {
         render_activity_navigator_overlay(frame, app, palette);
         return;
@@ -339,6 +343,8 @@ pub(super) fn render_chat_layout(frame: &mut impl FrameLike, app: &AppState, pal
     let active_menu = active_menu_surface(app);
     let areas = chat_layout_areas_for_menu(app, frame.area(), active_menu.as_ref());
 
+    pinned_question::render_header(frame, app, palette, areas.question);
+
     if areas.session_strip.height > 0 {
         frame.render_widget(
             render_session_strip(app, palette, areas.session_strip.width),
@@ -352,7 +358,7 @@ pub(super) fn render_chat_layout(frame: &mut impl FrameLike, app: &AppState, pal
         let transcript = transcript_render_model(app, palette, areas.transcript);
         let metrics = transcript.metrics;
         frame.render_widget(transcript.paragraph, areas.transcript);
-        if app.transcript_pager_active {
+        if app.transcript_pager_active || app.scroll_mode == crate::cli::ScrollMode::Sticky {
             render_pager_scrollbar(frame, metrics, areas.transcript, palette);
             render_scroll_to_bottom_button(frame, app, metrics, areas.transcript, palette);
         }
@@ -383,6 +389,17 @@ pub(super) fn render_chat_layout(frame: &mut impl FrameLike, app: &AppState, pal
         frame.render_widget(
             render_agent_strip(app, palette, areas.agent_strip.height.saturating_sub(1)),
             areas.agent_strip,
+        );
+    }
+    if areas.peer_strip.height > 0 {
+        frame.render_widget(
+            Paragraph::new(peer_strip_lines(
+                app,
+                palette,
+                areas.peer_strip.height.saturating_sub(1),
+            ))
+            .style(Style::default().bg(palette.surface)),
+            areas.peer_strip,
         );
     }
     frame.render_widget(render_status(app, palette), areas.status);
@@ -783,30 +800,38 @@ pub(super) fn render_activity_navigator_toolbar(
     palette: Palette,
 ) -> Paragraph<'static> {
     let search_label = if model.search_active {
-        "search*: "
+        t!("app.activity_navigator.search_active").into_owned()
     } else {
-        "query: "
+        t!("app.activity_navigator.query_label").into_owned()
     };
     let query = if model.query.is_empty() {
-        "(empty)".to_string()
+        t!("app.activity_navigator.empty_query").into_owned()
     } else {
         model.query.clone()
     };
-    let counts = format!(
-        "all {} | changes {} | running {} | blocked {} | failed {} | done {}",
-        model.counts.all,
-        model.counts.changes,
-        model.counts.running,
-        model.counts.blocked,
-        model.counts.failed,
-        model.counts.done
-    );
+    let counts = t!(
+        "app.activity_navigator.counts",
+        all = model.counts.all,
+        changes = model.counts.changes,
+        running = model.counts.running,
+        blocked = model.counts.blocked,
+        failed = model.counts.failed,
+        done = model.counts.done
+    )
+    .into_owned();
     Paragraph::new(Text::from(vec![
         Line::from(vec![
-            Span::styled("Activity", palette.title()),
-            Span::styled(" navigator", palette.text()),
+            Span::styled(t!("app.activity.title").into_owned(), palette.title()),
             Span::styled(
-                format!("  filter: {}", model.filter.label()),
+                t!("app.activity_navigator.navigator_suffix").into_owned(),
+                palette.text(),
+            ),
+            Span::styled(
+                t!(
+                    "app.activity_navigator.filter_label",
+                    filter = activity_navigator_filter_label(model.filter)
+                )
+                .into_owned(),
                 palette.muted(),
             ),
         ]),
@@ -826,12 +851,24 @@ pub(super) fn render_activity_navigator_list(
 ) -> List<'static> {
     let items = if model.rows.is_empty() {
         let detail = if model.query.trim().is_empty() {
-            format!("filter: {}", model.filter.label())
+            t!(
+                "app.activity_navigator.filter_label_compact",
+                filter = activity_navigator_filter_label(model.filter)
+            )
+            .into_owned()
         } else {
-            format!("query: {}  filter: {}", model.query, model.filter.label())
+            t!(
+                "app.activity_navigator.query_filter",
+                query = &model.query,
+                filter = activity_navigator_filter_label(model.filter)
+            )
+            .into_owned()
         };
         vec![ListItem::new(Text::from(vec![
-            Line::from(Span::styled("No activity rows match", palette.muted())),
+            Line::from(Span::styled(
+                t!("app.activity.no_matches").into_owned(),
+                palette.muted(),
+            )),
             Line::from(Span::styled(detail, palette.muted())),
         ]))]
     } else {
@@ -856,14 +893,14 @@ pub(super) fn render_activity_navigator_list(
                     Line::from(vec![
                         Span::styled(format!("{marker} "), style),
                         Span::styled(
-                            format!("[{}] ", row.status.label()),
+                            format!("[{}] ", activity_navigator_status_label(row.status)),
                             status_style(row.status, palette),
                         ),
                         Span::styled(row.title.clone(), style),
                     ]),
                     Line::from(vec![
                         Span::styled("  ", palette.muted()),
-                        Span::styled(row.kind.label(), kind_style),
+                        Span::styled(activity_navigator_kind_label(row.kind), kind_style),
                         Span::styled(" · ", palette.muted()),
                         Span::styled(row.subtitle.clone(), palette.muted()),
                     ]),
@@ -874,7 +911,7 @@ pub(super) fn render_activity_navigator_list(
 
     List::new(items).highlight_style(Style::default()).block(
         titled_block(
-            "Results".to_string(),
+            t!("app.activity_navigator.results").into_owned(),
             palette,
             true,
             Some("j/k".to_string()),
@@ -891,9 +928,12 @@ pub(super) fn render_activity_navigator_detail(
         let mut lines = vec![
             Line::from(Span::styled(row.title.clone(), palette.title())),
             Line::from(vec![
-                Span::styled(row.kind.label(), palette.muted()),
+                Span::styled(activity_navigator_kind_label(row.kind), palette.muted()),
                 Span::styled(" · ", palette.muted()),
-                Span::styled(row.status.label(), status_style(row.status, palette)),
+                Span::styled(
+                    activity_navigator_status_label(row.status),
+                    status_style(row.status, palette),
+                ),
             ]),
             Line::from(Span::raw("")),
         ];
@@ -905,14 +945,20 @@ pub(super) fn render_activity_navigator_detail(
         lines
     } else {
         vec![Line::from(Span::styled(
-            "No activity selected",
+            t!("app.activity_navigator.no_selected").into_owned(),
             palette.muted(),
         ))]
     };
 
     Paragraph::new(Text::from(lines))
         .block(
-            titled_block("Detail".to_string(), palette, false, None).border_style(palette.border()),
+            titled_block(
+                t!("app.activity_navigator.detail").into_owned(),
+                palette,
+                false,
+                None,
+            )
+            .border_style(palette.border()),
         )
         .wrap(Wrap { trim: false })
 }

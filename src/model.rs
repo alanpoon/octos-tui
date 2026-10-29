@@ -1047,6 +1047,7 @@ pub enum AppUiCommand {
     ProfileSkillsRemove(ProfileSkillsRemoveParams),
     // M15-E backend-owned autonomy surface (UPCR-2026-021).
     ListAgents(AgentListParams),
+    WorkspaceTeam(crate::workspace_team::Command),
     ReadAgentStatus(AgentStatusReadParams),
     ReadAgentOutput(AgentOutputReadParams),
     ListAgentArtifacts(AgentArtifactListParams),
@@ -1155,6 +1156,7 @@ impl AppUiCommand {
             Self::ProfileSkillsInstall(_) => APPUI_METHOD_PROFILE_SKILLS_INSTALL,
             Self::ProfileSkillsRemove(_) => APPUI_METHOD_PROFILE_SKILLS_REMOVE,
             Self::ListAgents(_) => APPUI_METHOD_AGENT_LIST,
+            Self::WorkspaceTeam(command) => command.method(),
             Self::ReadAgentStatus(_) => APPUI_METHOD_AGENT_STATUS_READ,
             Self::ReadAgentOutput(_) => APPUI_METHOD_AGENT_OUTPUT_READ,
             Self::ListAgentArtifacts(_) => APPUI_METHOD_AGENT_ARTIFACT_LIST,
@@ -1334,10 +1336,12 @@ pub struct ModelSelectResult {
     pub selected: ModelStatus,
     #[serde(default)]
     pub applied: bool,
-    /// The selection was persisted, but the currently running profile is
-    /// startup-pinned and cannot use it until the backend restarts.
     #[serde(default)]
     pub restart_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_disposition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_policy_stamp: Option<RuntimePolicyStamp>,
 }
@@ -2950,7 +2954,7 @@ impl OnboardingWizardState {
             return Err(OnboardingLocalProfileRecovery {
                 kind: OnboardingLocalProfileErrorKind::InvalidField,
                 focus_field: OnboardingLocalProfileField::RequestedId,
-                message: "Name this profile first. Use /onboard profile-name <id>.".into(),
+                message: t!("onboarding.validation.profile_name_required").into_owned(),
             });
         }
         Ok(())
@@ -3296,14 +3300,14 @@ impl OnboardingWizardState {
             return Err(OnboardingLocalProfileRecovery {
                 kind: OnboardingLocalProfileErrorKind::InvalidField,
                 focus_field: OnboardingLocalProfileField::Name,
-                message: "Display name is required. Use /onboard name <display name>.".into(),
+                message: t!("onboarding.validation.display_name_required").into_owned(),
             });
         }
         if name.chars().count() > 128 {
             return Err(OnboardingLocalProfileRecovery {
                 kind: OnboardingLocalProfileErrorKind::InvalidField,
                 focus_field: OnboardingLocalProfileField::Name,
-                message: "Display name must be 128 characters or fewer.".into(),
+                message: t!("onboarding.validation.display_name_too_long").into_owned(),
             });
         }
 
@@ -3312,14 +3316,14 @@ impl OnboardingWizardState {
             return Err(OnboardingLocalProfileRecovery {
                 kind: OnboardingLocalProfileErrorKind::InvalidField,
                 focus_field: OnboardingLocalProfileField::Username,
-                message: "Username is required. Use /onboard username <handle>.".into(),
+                message: t!("onboarding.validation.username_required").into_owned(),
             });
         }
         if username.len() > 64 {
             return Err(OnboardingLocalProfileRecovery {
                 kind: OnboardingLocalProfileErrorKind::InvalidField,
                 focus_field: OnboardingLocalProfileField::Username,
-                message: "Username must be 64 characters or fewer.".into(),
+                message: t!("onboarding.validation.username_too_long").into_owned(),
             });
         }
         if username
@@ -3329,7 +3333,7 @@ impl OnboardingWizardState {
             return Err(OnboardingLocalProfileRecovery {
                 kind: OnboardingLocalProfileErrorKind::InvalidField,
                 focus_field: OnboardingLocalProfileField::Username,
-                message: "Username must be ASCII without whitespace or control characters.".into(),
+                message: t!("onboarding.validation.username_invalid_chars").into_owned(),
             });
         }
 
@@ -3338,16 +3342,14 @@ impl OnboardingWizardState {
             return Err(OnboardingLocalProfileRecovery {
                 kind: OnboardingLocalProfileErrorKind::InvalidField,
                 focus_field: OnboardingLocalProfileField::Email,
-                message: "Email is required by the backend. Use /onboard email <address>.".into(),
+                message: t!("onboarding.validation.email_required").into_owned(),
             });
         }
         if !looks_like_email(email) {
             return Err(OnboardingLocalProfileRecovery {
                 kind: OnboardingLocalProfileErrorKind::InvalidField,
                 focus_field: OnboardingLocalProfileField::Email,
-                message:
-                    "Email must contain a non-empty local-part and domain (e.g. ada@example.com)."
-                        .into(),
+                message: t!("onboarding.validation.email_invalid").into_owned(),
             });
         }
 
@@ -3381,9 +3383,12 @@ impl OnboardingWizardState {
                 // existing-owner collision (username, email metadata,
                 // or owner id), with the reason in the message. Keep
                 // that reason rather than hard-coding "username taken".
-                message: format!(
-                    "Local profile collision for '{collided_username}': {server_reason}. Edit the fields with /onboard name|username|email and try again."
-                ),
+                message: t!(
+                    "onboarding.validation.profile_collision",
+                    username = collided_username,
+                    reason = server_reason
+                )
+                .into_owned(),
             },
             "profile_local_unsupported" => OnboardingLocalProfileRecovery {
                 kind: OnboardingLocalProfileErrorKind::Unsupported,
@@ -3394,29 +3399,34 @@ impl OnboardingWizardState {
                 // returning `profile_local_unsupported` despite
                 // advertising the method is misconfigured, not a
                 // signal that the user can fall back to OTP locally.
-                message: "This server returned profile_local_unsupported for profile/local/create. The backend is misconfigured — restart the server with local solo onboarding enabled, or connect to a backend that fully supports it."
-                    .into(),
+                message: t!("onboarding.validation.local_profile_unsupported").into_owned(),
             },
             "profile_local_invalid_name" => OnboardingLocalProfileRecovery {
                 kind: OnboardingLocalProfileErrorKind::InvalidParams,
                 focus_field: OnboardingLocalProfileField::Name,
-                message: format!(
-                    "Server rejected the display name: {server_reason}. Edit it with /onboard name <display name>."
-                ),
+                message: t!(
+                    "onboarding.validation.server_rejected_name",
+                    reason = server_reason
+                )
+                .into_owned(),
             },
             "profile_local_invalid_username" => OnboardingLocalProfileRecovery {
                 kind: OnboardingLocalProfileErrorKind::InvalidParams,
                 focus_field: OnboardingLocalProfileField::Username,
-                message: format!(
-                    "Server rejected the username: {server_reason}. Edit it with /onboard username <handle>."
-                ),
+                message: t!(
+                    "onboarding.validation.server_rejected_username",
+                    reason = server_reason
+                )
+                .into_owned(),
             },
             "profile_local_invalid_email" => OnboardingLocalProfileRecovery {
                 kind: OnboardingLocalProfileErrorKind::InvalidParams,
                 focus_field: OnboardingLocalProfileField::Email,
-                message: format!(
-                    "Server rejected the email: {server_reason}. Edit it with /onboard email <address>."
-                ),
+                message: t!(
+                    "onboarding.validation.server_rejected_email",
+                    reason = server_reason
+                )
+                .into_owned(),
             },
             "invalid_params" => OnboardingLocalProfileRecovery {
                 kind: OnboardingLocalProfileErrorKind::InvalidParams,
@@ -3424,14 +3434,20 @@ impl OnboardingWizardState {
                 // which field is at fault; default to username because
                 // collision is the highest-prior real-world cause.
                 focus_field: OnboardingLocalProfileField::Username,
-                message: format!(
-                    "Server rejected the profile fields as invalid: {server_reason}. Edit them with /onboard name|username|email."
-                ),
+                message: t!(
+                    "onboarding.validation.server_rejected_fields",
+                    reason = server_reason
+                )
+                .into_owned(),
             },
             _ => OnboardingLocalProfileRecovery {
                 kind: OnboardingLocalProfileErrorKind::InvalidParams,
                 focus_field: OnboardingLocalProfileField::Username,
-                message: format!("profile/local/create failed: {server_reason}"),
+                message: t!(
+                    "onboarding.validation.local_profile_create_failed",
+                    reason = server_reason
+                )
+                .into_owned(),
             },
         };
         self.local_profile_create_pending = false;
@@ -4807,6 +4823,8 @@ impl ScrollToBottomHit {
 
 #[derive(Debug, Clone)]
 pub struct AppState {
+    pub workspace_teams: std::collections::HashMap<SessionKey, crate::workspace_team::Snapshot>,
+    pub workspace_launch_topic: String,
     /// Active TUI palette, chosen at launch (`--theme`/config) and switchable
     /// at runtime via `/theme`. The event loop derives the per-frame `Palette`
     /// from this field, so a `/theme` change repaints on the next frame; it
@@ -4989,25 +5007,17 @@ pub struct AppState {
     /// key is read, so it is stale by at most one frame — the same discipline as
     /// [`AppState::agent_view_scroll_max`]).
     pub goal_objective_folded_effective: std::cell::Cell<bool>,
-    /// `--scroll-mode pinned`: capture the mouse in the chat flow so wheel-up
-    /// auto-enters the pager (composer stays pinned) and wheel-down at the
-    /// pager bottom drops back to the inline tail. False = `native` (default):
-    /// the wheel belongs to the terminal and native selection/copy stay intact.
-    pub pinned_scroll: bool,
+    /// Chat presentation, seeded from launch settings by the event loop.
+    pub scroll_mode: crate::cli::ScrollMode,
+    /// Read-only expansion of the fixed question; separate from chat scrolling.
+    pub question_detail: QuestionDetailState,
     /// Vim modal editing for the composer (opt-in via `--vim-mode`/config
     /// `vim-mode`/`/vimmode`). When false the composer behaves exactly as a
     /// plain text field (equivalent to always-Insert); `composer_mode` is only
     /// consulted when this is true.
     pub vim_mode: bool,
-    /// octos#1807 steering as an OPT-IN: when true, a prompt typed while a
-    /// turn is running is injected into the LIVE turn via `turn/steer`. The
-    /// default is false — mid-turn prompts stage FIFO in `pending_messages`
-    /// and each drains as its OWN turn at turn-end, so every prompt is
-    /// processed to completion in the order it was typed. Steering makes the
-    /// model treat the newest instruction as superseding the work in
-    /// progress (the steer lands as a bare `role: user` message mid-loop),
-    /// which reads as "interrupt and pivot" — the right tool for a course
-    /// correction, the wrong default for "also do this next".
+    /// Enter steers an active turn by default. Tab queues a separate turn;
+    /// `/steer off` restores FIFO submission for every prompt.
     pub steer_mid_turn: bool,
     /// Current composer editing mode under Vim. Defaults to `Insert` so typing
     /// works immediately when Vim is enabled; `Esc` switches to `Normal`.
@@ -6149,6 +6159,15 @@ impl UserQuestionPickerState {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuestionDetailState {
+    pub active: bool,
+    pub title: String,
+    pub content: String,
+    pub scroll: usize,
+    pub max_scroll: std::cell::Cell<usize>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskOutputDetailState {
     pub active: bool,
     pub session_id: Option<SessionKey>,
@@ -7284,9 +7303,12 @@ impl AppState {
             peer_dock_collapsed: false,
             goal_objective_fold: GoalObjectiveFold::default(),
             goal_objective_folded_effective: std::cell::Cell::new(false),
-            pinned_scroll: false,
+            // Keep the transport/model constructor presentation-neutral. The
+            // event loop applies the resolved CLI/config mode before drawing.
+            scroll_mode: crate::cli::ScrollMode::Native,
+            question_detail: QuestionDetailState::default(),
             vim_mode: false,
-            steer_mid_turn: false,
+            steer_mid_turn: true,
             composer_mode: ComposerMode::Insert,
             composer_vim_pending: None,
             ctrl_c_quit_armed: false,
@@ -7375,6 +7397,8 @@ impl AppState {
             active_menu: None,
             capabilities: None,
             onboarding: OnboardingWizardState::default(),
+            workspace_teams: std::collections::HashMap::new(),
+            workspace_launch_topic: format!("coding-{}", crate::workspace_team::occurrence()),
             permission_profiles: Vec::new(),
             session_runtime_statuses: Vec::new(),
             profile_llm_catalog: None,
@@ -9421,6 +9445,7 @@ impl AppState {
         self.stash_pending_messages_for_selected_session();
         self.composer_history.reset_navigation(); // end history browse on switch
         self.selected_session = index;
+        self.question_detail = QuestionDetailState::default();
         self.selected_task = 0;
         // The new session has its own (or no) sub-agents; a carried-over agent
         // selection would point at the wrong session's agent.
@@ -12251,6 +12276,7 @@ mod tests {
         use octos_core::ui_protocol::SessionOpenParams;
         let open = |id: &str| {
             AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: SessionKey(id.into()),
                 topic: None,
                 profile_id: None,
@@ -12262,6 +12288,7 @@ mod tests {
         let mut state = AppState::new(Vec::new(), 0, "ready".into(), None, false);
         for _ in 0..16 {
             state.enqueue_autonomy_hydration(AppUiCommand::ListSessions(SessionListParams {
+                profile_id: None,
                 cwd: None,
             }));
         }
@@ -12302,12 +12329,14 @@ mod tests {
         let mut state = AppState::new(Vec::new(), 0, "ready".into(), None, false);
         for _ in 0..15 {
             state.enqueue_autonomy_hydration(AppUiCommand::ListSessions(SessionListParams {
+                profile_id: None,
                 cwd: None,
             }));
         }
         state
             .pending_autonomy_hydration
             .push_front(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: session_id.clone(),
                 topic: None,
                 profile_id: None,
@@ -12322,6 +12351,7 @@ mod tests {
         );
 
         state.enqueue_autonomy_hydration(AppUiCommand::SubmitPrompt(TurnStartParams {
+            origin: None,
             tool_context: None,
             session_id: session_id.clone(),
             turn_id: TurnId::new(),
@@ -12366,6 +12396,7 @@ mod tests {
         let mut state = AppState::new(Vec::new(), 0, "ready".into(), None, false);
         for index in 0..16 {
             state.enqueue_autonomy_hydration(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: SessionKey(format!("local:{index}")),
                 topic: None,
                 profile_id: None,
@@ -12415,6 +12446,7 @@ mod tests {
             }));
         }
         state.enqueue_local_session_open_front(AppUiCommand::OpenSession(SessionOpenParams {
+            client_commands: None,
             session_id: SessionKey("local:active".into()),
             topic: None,
             profile_id: None,
@@ -13368,7 +13400,10 @@ mod tests {
         // historical empty object `{}`, byte-identical to what old clients
         // sent, so an OLD server (no per-project session storage) still
         // deserializes it unchanged (`cwd: None` -> legacy global listing).
-        let params = SessionListParams { cwd: None };
+        let params = SessionListParams {
+            profile_id: None,
+            cwd: None,
+        };
         let wire = serde_json::to_value(&params).expect("SessionListParams serializes");
         assert_eq!(wire, serde_json::json!({}));
     }
@@ -13380,6 +13415,7 @@ mod tests {
         // `session.workspace_cwd.v1` feature) honors to scope the listing to
         // the project rooted at that path.
         let params = SessionListParams {
+            profile_id: None,
             cwd: Some("/tmp/project".into()),
         };
         let wire = serde_json::to_value(&params).expect("SessionListParams serializes");

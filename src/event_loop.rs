@@ -252,10 +252,10 @@ pub fn run(cli: Cli) -> Result<()> {
     // `/theme` menu mutates this field, so the palette below is recomputed each
     // frame from `store.state.theme` rather than captured once at startup.
     store.state.theme = cli.theme;
-    // `--scroll-mode pinned` opts into app-side wheel handling (composer stays
-    // pinned); the default `native` keeps the wheel on the terminal so native
-    // selection/copy survive. Seeded once at launch, read-only afterwards.
-    store.state.pinned_scroll = cli.scroll_mode == crate::cli::ScrollMode::Pinned;
+    // Sticky fixes the latest question and composer; explicit native/pinned
+    // preferences keep their existing behavior. /scrollmode can change this
+    // presentation setting at runtime.
+    store.state.scroll_mode = cli.scroll_mode;
     // Retain the launch config path so `/saveconfig` can persist runtime UI
     // settings (theme/lang/scroll-mode/vim-mode) back into it.
     store.state.config_path = cli.config.clone();
@@ -514,8 +514,10 @@ where
 {
     let palette = Palette::for_theme(store.state.theme);
 
-    if app::wants_fullscreen_overlay(&store.state) {
-        // Transient overlay → alternate screen, full legacy render.
+    if app::wants_fullscreen_overlay(&store.state)
+        || store.state.scroll_mode == crate::cli::ScrollMode::Sticky
+    {
+        // Sticky chat and transient overlays use the alternate screen.
         guard.enter_alt_screen(terminal)?;
         guard.sync_mouse_capture(terminal, app::wants_mouse_capture(&store.state))?;
         let size = terminal.size()?;
@@ -1206,7 +1208,9 @@ fn handle_mouse(store: &mut Store, mouse: MouseEvent) -> KeyAction {
     // scrolling, and multiplying each by 4 makes the transcript jump instead
     // of glide. Other surfaces (modals, workspace/git panes) keep the coarser
     // step that suits clicky wheel mice.
-    let lines = if store.state.transcript_pager_active {
+    let lines = if store.state.transcript_pager_active
+        || store.state.scroll_mode == crate::cli::ScrollMode::Sticky
+    {
         1
     } else {
         MOUSE_SCROLL_LINES
@@ -1215,7 +1219,11 @@ fn handle_mouse(store: &mut Store, mouse: MouseEvent) -> KeyAction {
         MouseEventKind::ScrollUp => scroll_current_surface_up(store, lines),
         MouseEventKind::ScrollDown => scroll_current_surface_down(store, lines),
         MouseEventKind::Down(MouseButton::Left)
-            if store.state.transcript_pager_active
+            if !modal_owns_keyboard(store)
+                && !store.state.menu_stack.is_active()
+                && !app::agent_view_active(&store.state)
+                && (store.state.transcript_pager_active
+                    || store.state.scroll_mode == crate::cli::ScrollMode::Sticky)
                 && store
                     .state
                     .scroll_to_bottom_button
@@ -1226,6 +1234,20 @@ fn handle_mouse(store: &mut Store, mouse: MouseEvent) -> KeyAction {
             // live tail. The pager gate prevents a stale hit rect from eating
             // clicks after close while pinned mode keeps capture enabled.
             store.state.scroll_transcript_to_latest();
+        }
+        MouseEventKind::Down(MouseButton::Left) if question_header_available(store) => {
+            let area = ratatui::layout::Rect::new(
+                0,
+                0,
+                store.state.last_terminal_width,
+                store.state.last_terminal_height,
+            );
+            if app::chat_layout_areas(&store.state, area)
+                .question
+                .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+            {
+                app::pinned_question::open(&mut store.state);
+            }
         }
         _ => {}
     }
@@ -1270,6 +1292,18 @@ fn modal_owns_keyboard(store: &Store) -> bool {
         || store.state.thread_graph_detail.active
         || store.state.turn_state_detail.active
         || store.state.diff_preview.overlay_active()
+        || store.state.question_detail.active
+}
+
+fn question_header_available(store: &Store) -> bool {
+    store.state.scroll_mode == crate::cli::ScrollMode::Sticky
+        && !modal_owns_keyboard(store)
+        && !store.state.menu_stack.is_active()
+        && matches!(
+            store.state.focus,
+            FocusPane::Composer | FocusPane::Transcript
+        )
+        && !app::agent_view_active(&store.state)
 }
 
 pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
@@ -1318,6 +1352,34 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     // Any other key press means the user moved on — the next idle Ctrl+C
     // hints again instead of quitting out from under them.
     store.state.ctrl_c_quit_armed = false;
+
+    // A read-only question viewer must not leak edits or sends into the draft.
+    // Incoming approval/question dialogs take priority over this reader.
+    if app::pinned_question::detail_visible(&store.state) {
+        let detail = &mut store.state.question_detail;
+        match key.code {
+            KeyCode::Esc | KeyCode::F(2) | KeyCode::Enter => *detail = Default::default(),
+            KeyCode::Up | KeyCode::Char('k') => detail.scroll = detail.scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                detail.scroll = detail.scroll.saturating_add(1).min(detail.max_scroll.get())
+            }
+            KeyCode::PageUp => detail.scroll = detail.scroll.saturating_sub(10),
+            KeyCode::PageDown => {
+                detail.scroll = detail
+                    .scroll
+                    .saturating_add(10)
+                    .min(detail.max_scroll.get())
+            }
+            KeyCode::Home => detail.scroll = 0,
+            KeyCode::End => detail.scroll = detail.max_scroll.get(),
+            _ => {}
+        }
+        return KeyAction::Continue;
+    }
+    if key.code == KeyCode::F(2) && question_header_available(store) {
+        app::pinned_question::open(&mut store.state);
+        return KeyAction::Continue;
+    }
 
     // A live sub-agent peek OWNS the keyboard, exactly like a modal: routed here
     // — after the always-on quit/interrupt keys but BEFORE every composer /
@@ -1492,6 +1554,15 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             store.state.diff_preview.expanded = false;
         }
         return KeyAction::Continue;
+    }
+
+    if is_ctrl_char(&key, 'x')
+        && store.state.focus == FocusPane::Composer
+        && !store.state.transcript_pager_active
+    {
+        return store
+            .send_pending_now_command()
+            .map_or(KeyAction::Continue, KeyAction::send);
     }
 
     // ONE key, cycling. `select_next_hunk` wraps ((current + 1) % len), so a
@@ -1673,7 +1744,7 @@ fn handle_paste(store: &mut Store, text: &str) -> KeyAction {
     // free-text box active, detail viewers, activity navigator): dropping the
     // paste with a visible status beats silently editing the hidden composer.
     if modal_owns_keyboard(store) {
-        store.state.status = "Paste ignored while a dialog is open".to_string();
+        store.state.status = t!("status.paste_ignored_dialog_open").into_owned();
         return KeyAction::Continue;
     }
 
@@ -1946,6 +2017,18 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return action;
     }
 
+    if key.code == KeyCode::Tab
+        && key.modifiers.is_empty()
+        && store.state.focus == FocusPane::Composer
+        && !store.state.transcript_pager_active
+        && store.state.active_turn().is_some()
+        && !store.state.composer.trim().is_empty()
+    {
+        return store
+            .queue_composer_command()
+            .map_or(KeyAction::Continue, KeyAction::send);
+    }
+
     match key.code {
         // Tab / Shift+Tab ENTER the sub-agent peek from the inline chat: they
         // cycle the main pane across `[main, …running sub-agents]` and select as
@@ -2127,7 +2210,9 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             // press opens the pager (at the bottom) instead; inside the pager
             // it pages through the full transcript.
             _ => {
-                if transcript_pager_available(&store.state) {
+                if store.state.scroll_mode != crate::cli::ScrollMode::Sticky
+                    && transcript_pager_available(&store.state)
+                {
                     store.state.enter_transcript_pager();
                 } else {
                     store.state.scroll_transcript_up(8);
@@ -3317,6 +3402,14 @@ fn toggle_transcript_pager(store: &mut Store) {
 }
 
 fn scroll_current_surface_down(store: &mut Store, lines: usize) {
+    if app::pinned_question::detail_visible(&store.state) {
+        let detail = &mut store.state.question_detail;
+        detail.scroll = detail
+            .scroll
+            .saturating_add(lines)
+            .min(detail.max_scroll.get());
+        return;
+    }
     // See `scroll_current_surface_up` for the surface precedence.
     if app::agent_view_active(&store.state) {
         store.state.scroll_agent_view_down(lines);
@@ -3358,7 +3451,7 @@ fn scroll_current_surface_down(store: &mut Store, lines: usize) {
         // always pinned, the wheel just moves the content" illusion. A pager
         // opened manually in native mode keeps its position instead.
         _ => {
-            if store.state.pinned_scroll
+            if store.state.scroll_mode == crate::cli::ScrollMode::Pinned
                 && store.state.transcript_pager_active
                 && store.state.transcript_scroll == 0
             {
@@ -3371,6 +3464,11 @@ fn scroll_current_surface_down(store: &mut Store, lines: usize) {
 }
 
 fn scroll_current_surface_up(store: &mut Store, lines: usize) {
+    if app::pinned_question::detail_visible(&store.state) {
+        store.state.question_detail.scroll =
+            store.state.question_detail.scroll.saturating_sub(lines);
+        return;
+    }
     // A live peek is a full-screen overlay above everything, so it takes the
     // wheel first. When a real modal is up the peek yields (agent_view_active is
     // false) and the surface precedence below applies: detail modals (rendered on
@@ -3416,7 +3514,9 @@ fn scroll_current_surface_up(store: &mut Store, lines: usize) {
         // wheel then scrolls inside it. Native mode keeps the wheel on the
         // terminal, so this arm only sees synthetic/test events there.
         _ => {
-            if store.state.pinned_scroll && transcript_pager_available(&store.state) {
+            if store.state.scroll_mode == crate::cli::ScrollMode::Pinned
+                && transcript_pager_available(&store.state)
+            {
                 store.state.enter_transcript_pager();
             } else {
                 store.state.scroll_transcript_up(lines);
@@ -3482,6 +3582,34 @@ struct TerminalGuard {
 }
 
 impl TerminalGuard {
+    /// Restore the screen buffer and erase any inline viewport owned by this
+    /// process. An alternate-screen exit must clear the SAVED inline viewport:
+    /// `enter_alt_screen` deliberately sets `live_inline_viewport` to `None`,
+    /// but leaving the alternate screen reveals the normal-buffer composer that
+    /// was painted before the overlay opened.
+    fn restore_render_surface_on_exit<W: io::Write>(&self, stdout: &mut W) {
+        if self.mouse_captured {
+            let _ = execute!(stdout, DisableMouseCapture);
+        }
+        if self.mode == RenderMode::AltScreen {
+            let _ = execute!(stdout, LeaveAlternateScreen);
+        }
+        let viewport = match self.mode {
+            RenderMode::Inline => self.live_inline_viewport,
+            RenderMode::AltScreen => self.saved_inline_viewport,
+        };
+        // An empty saved viewport means the overlay was the first frame, so the
+        // normal buffer contains no TUI-owned rows and must be left untouched
+        // (for example, to preserve first-install output above the shell).
+        if let Some(viewport) = viewport.filter(|viewport| !viewport.is_empty()) {
+            let _ = execute!(
+                stdout,
+                crossterm::cursor::MoveTo(0, viewport.top()),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
+            );
+        }
+    }
+
     /// Bring the terminal's mouse-capture state in line with the policy
     /// (`app::wants_mouse_capture`). Idempotent: only writes the escape
     /// sequence on an actual transition.
@@ -3573,26 +3701,7 @@ impl Drop for TerminalGuard {
         #[cfg(not(test))]
         {
             let mut stdout = io::stdout();
-            if self.mouse_captured {
-                let _ = execute!(stdout, DisableMouseCapture);
-            }
-            if self.mode == RenderMode::AltScreen {
-                let _ = execute!(stdout, LeaveAlternateScreen);
-            }
-            // Clear the inline viewport the TUI painted this session. Without
-            // this, the inline model leaves its last frames — status bar,
-            // composer hint, slash menu — fossilized in the user's scrollback
-            // on exit (and they resurface again whenever an alt-screen
-            // overlay drops back to the main screen). Finalized transcript
-            // lives ABOVE the viewport via `insert_history`, so clearing from
-            // the viewport top down only touches TUI-owned rows.
-            if let Some(viewport) = self.live_inline_viewport {
-                let _ = execute!(
-                    stdout,
-                    crossterm::cursor::MoveTo(0, viewport.top()),
-                    crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
-                );
-            }
+            self.restore_render_surface_on_exit(&mut stdout);
             let _ = disable_raw_mode();
             let _ = execute!(stdout, DisableBracketedPaste, DisableFocusChange, Show);
         }
@@ -5382,6 +5491,7 @@ done
             &mut backend,
             &mut store,
             AppUiCommand::OpenSession(octos_core::ui_protocol::SessionOpenParams {
+                client_commands: None,
                 session_id: session_id.clone(),
                 topic: None,
                 profile_id: Some("coding".into()),
@@ -6005,6 +6115,87 @@ done
         let written = String::from_utf8_lossy(&terminal.backend().buf);
         assert!(written.contains("\u{1b}[?1049h"));
         assert!(written.contains("\u{1b}[?1049l"));
+    }
+
+    #[test]
+    fn onboarding_alt_screen_exit_clears_the_saved_inline_viewport() {
+        // First-launch Model A paints a short inline frame while launch/resolve
+        // is in flight, then opens onboarding on the alternate screen. Exiting
+        // directly from that overlay must erase the hidden composer after the
+        // normal screen is restored, or the shell prompt lands inside it.
+        let guard = TerminalGuard {
+            mode: RenderMode::AltScreen,
+            saved_inline_viewport: Some(Rect::new(0, 19, 80, 5)),
+            saved_visible_history_extent: Some((0, 19)),
+            saved_inline_screen_size: Some(Size::new(80, 24)),
+            mouse_captured: false,
+            live_inline_viewport: None,
+        };
+        let mut written = Vec::new();
+
+        guard.restore_render_surface_on_exit(&mut written);
+
+        let written = String::from_utf8(written).expect("ANSI output");
+        let leave_alt = written
+            .find("\u{1b}[?1049l")
+            .expect("exit leaves the onboarding alternate screen");
+        let move_to_saved_top = written
+            .find("\u{1b}[20;1H")
+            .expect("cursor moves to the saved inline viewport top");
+        let clear_down = written
+            .find("\u{1b}[J")
+            .expect("saved inline viewport is cleared");
+        assert!(
+            leave_alt < move_to_saved_top && move_to_saved_top < clear_down,
+            "normal screen must be restored before its stale inline viewport is cleared: {written:?}"
+        );
+    }
+
+    #[test]
+    fn inline_exit_still_clears_the_live_inline_viewport() {
+        // Keep the original #547 behavior pinned while sharing the teardown
+        // helper with the alternate-screen exit path.
+        let guard = TerminalGuard {
+            mode: RenderMode::Inline,
+            saved_inline_viewport: None,
+            saved_visible_history_extent: None,
+            saved_inline_screen_size: None,
+            mouse_captured: false,
+            live_inline_viewport: Some(Rect::new(0, 20, 80, 4)),
+        };
+        let mut written = Vec::new();
+
+        guard.restore_render_surface_on_exit(&mut written);
+
+        let written = String::from_utf8(written).expect("ANSI output");
+        assert!(!written.contains("\u{1b}[?1049l"));
+        assert!(written.contains("\u{1b}[21;1H"));
+        assert!(written.contains("\u{1b}[J"));
+    }
+
+    #[test]
+    fn onboarding_alt_screen_exit_preserves_normal_screen_without_an_inline_frame() {
+        // When onboarding is the very first frame, the saved viewport is empty:
+        // there is no hidden TUI surface to erase, and clearing from its cursor
+        // anchor could instead delete first-install output owned by the shell.
+        let guard = TerminalGuard {
+            mode: RenderMode::AltScreen,
+            saved_inline_viewport: Some(Rect::new(0, 6, 0, 0)),
+            saved_visible_history_extent: Some((0, 0)),
+            saved_inline_screen_size: Some(Size::new(80, 24)),
+            mouse_captured: false,
+            live_inline_viewport: None,
+        };
+        let mut written = Vec::new();
+
+        guard.restore_render_surface_on_exit(&mut written);
+
+        let written = String::from_utf8(written).expect("ANSI output");
+        assert!(written.contains("\u{1b}[?1049l"));
+        assert!(
+            !written.contains("\u{1b}[J"),
+            "an empty saved viewport owns no normal-screen rows: {written:?}"
+        );
     }
 
     #[test]
@@ -7677,6 +7868,62 @@ done
         };
         assert_eq!(params.turn_id, turn_id);
         assert_eq!(store.state.status, "Interrupt requested for active turn");
+    }
+
+    #[test]
+    fn ctrl_x_sends_pending_once_and_preserves_composer_draft() {
+        let mut store = store_with_sessions(1);
+        let turn_id = TurnId::new();
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: turn_id.clone(),
+            text: "working".into(),
+        });
+        store.state.pending_messages.push("next task".into());
+        store.state.set_composer_text("unfinished draft");
+        let action = handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        );
+        assert!(
+            matches!(sent_command(action), AppUiCommand::InterruptTurn(p) if p.turn_id == turn_id)
+        );
+        assert_eq!(store.state.composer, "unfinished draft");
+        assert!(store.state.pending_interrupt_restores.is_empty());
+        assert_eq!(store.state.pending_messages, vec!["next task"]);
+        assert!(matches!(
+            handle_key(
+                &mut store,
+                modified_key(KeyCode::Char('x'), KeyModifiers::CONTROL)
+            ),
+            KeyAction::Continue
+        ));
+    }
+
+    #[test]
+    fn tab_queues_draft_even_when_enter_steers_by_default() {
+        let mut store = store_with_sessions(1);
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: TurnId::new(),
+            text: "working".into(),
+        });
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_TURN_STEER,
+        ]));
+        assert!(store.state.steer_mid_turn);
+        store.state.set_composer_text("do this later");
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Tab)),
+            KeyAction::Continue
+        ));
+        assert_eq!(store.state.pending_messages, vec!["do this later"]);
+        assert!(store.state.composer.is_empty());
+        assert!(store.state.pending_turn_steers.is_empty());
+        store.state.pending_messages.clear();
+        store.state.set_composer_text("correct the current work");
+        assert!(matches!(
+            sent_command(handle_key(&mut store, key(KeyCode::Enter))),
+            AppUiCommand::TurnSteer(_)
+        ));
     }
 
     #[test]

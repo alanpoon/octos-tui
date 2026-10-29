@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Evolution loop phase-3 index contract tests (#44b).
 
 use std::path::{Path, PathBuf};

@@ -21,12 +21,13 @@ use octos_core::ui_protocol::{
 };
 use octos_core::ui_protocol::{
     JSON_RPC_VERSION, MAX_TEXT_FRAME_BYTES, RpcRequest, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
-    UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
-    UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
-    UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
-    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
-    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
-    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+    UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1, UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1, UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
+    UI_PROTOCOL_FEATURE_PLAN_TODOS_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
+    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
 };
 use octos_core::{Message, SessionKey, TaskId};
 use serde_json::Value;
@@ -53,12 +54,12 @@ use crate::{
         ClientEvent, ContextLifecycleClientEvent, LocalShellResultEvent, McpConfigListClientEvent,
         McpConfigMutationClientEvent, McpStatusClientEvent, ModelListClientEvent,
         ModelSelectClientEvent, PermissionProfileClientEvent, ProfileLlmCatalogClientEvent,
-        ProfileLlmListClientEvent, ProfileLlmMutationClientEvent, ProfileLocalCreateClientEvent,
-        ProfileSkillsListClientEvent, ProfileSkillsMutationClientEvent,
-        ProfileSkillsRegistrySearchClientEvent, SessionBtwClientEvent,
-        SessionHydrateContextClientEvent, SessionStatusClientEvent, SubProvidersListClientEvent,
-        SubProvidersMutationClientEvent, ToolConfigListClientEvent, ToolConfigMutationClientEvent,
-        ToolStatusClientEvent,
+        ProfileLlmListClientEvent, ProfileLlmMutationClientEvent, ProfileLlmMutationKind,
+        ProfileLocalCreateClientEvent, ProfileSkillsListClientEvent,
+        ProfileSkillsMutationClientEvent, ProfileSkillsRegistrySearchClientEvent,
+        SessionBtwClientEvent, SessionHydrateContextClientEvent, SessionStatusClientEvent,
+        SubProvidersListClientEvent, SubProvidersMutationClientEvent, ToolConfigListClientEvent,
+        ToolConfigMutationClientEvent, ToolStatusClientEvent,
     },
     model::{
         AppUiAuthToken, AppUiCommand, AuthLogoutResult, AuthMeResult, AuthSendCodeResult,
@@ -206,6 +207,11 @@ pub struct AppUiLaunch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppUiEndpoint {
+    SharedLocal {
+        command: String,
+        cwd: std::path::PathBuf,
+        profile_id: Option<String>,
+    },
     WebSocket {
         url: String,
         auth_token: Option<String>,
@@ -246,7 +252,7 @@ impl AppUiEndpoint {
     pub fn label(&self) -> &str {
         match self {
             Self::WebSocket { url, .. } => url,
-            Self::Stdio { command } => command,
+            Self::Stdio { command } | Self::SharedLocal { command, .. } => command,
         }
     }
 }
@@ -295,6 +301,17 @@ fn launch_from_cli(cli: &Cli) -> AppUiLaunch {
 
 fn endpoint_from_cli(cli: &Cli, auth_token: Option<String>) -> Option<AppUiEndpoint> {
     if let Some(command) = &cli.stdio_command {
+        if shlex::split(command).is_some_and(|words| words.iter().any(|w| w == "--shared")) {
+            return Some(AppUiEndpoint::SharedLocal {
+                command: command.clone(),
+                cwd: cli
+                    .cwd
+                    .clone()
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_default(),
+                profile_id: cli.profile_id.clone(),
+            });
+        }
         return Some(AppUiEndpoint::stdio(command.clone()));
     }
 
@@ -635,6 +652,7 @@ enum TransportEvent {
 }
 
 struct WebSocketTransportDriver {
+    shared: Option<crate::shared_instance::Launch>,
     endpoint: String,
     auth_token: Option<String>,
     profile_id: Option<String>,
@@ -787,6 +805,19 @@ impl ProtocolExchange {
 impl ProtocolTransportDriver {
     fn from_endpoint(endpoint: &AppUiEndpoint) -> Result<Self> {
         match endpoint {
+            AppUiEndpoint::SharedLocal {
+                command,
+                cwd,
+                profile_id,
+            } => {
+                let mut driver =
+                    WebSocketTransportDriver::new(command.clone(), None, profile_id.clone());
+                driver.shared = Some(crate::shared_instance::Launch {
+                    command: command.clone(),
+                    cwd: cwd.clone(),
+                });
+                Ok(Self::WebSocket(driver))
+            }
             AppUiEndpoint::WebSocket {
                 url,
                 auth_token,
@@ -858,6 +889,7 @@ impl ProtocolTransportDriver {
 impl WebSocketTransportDriver {
     fn new(endpoint: String, auth_token: Option<String>, profile_id: Option<String>) -> Self {
         Self {
+            shared: None,
             endpoint,
             auth_token,
             profile_id,
@@ -883,6 +915,11 @@ impl WebSocketTransportDriver {
 
         self.disconnect();
 
+        if let Some(shared) = &self.shared {
+            let instance = runtime.block_on(crate::shared_instance::discover(shared))?;
+            self.endpoint = instance.endpoint;
+            self.auth_token = Some(instance.auth_token);
+        }
         let request = websocket_request(
             &self.endpoint,
             self.auth_token.as_deref(),
@@ -1996,6 +2033,7 @@ impl ProtocolAppUiBackend {
                 .cloned()
                 .or_else(|| self.launch.cwd.clone());
             AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id,
                 topic: None,
                 profile_id: self.launch.profile_id.clone(),
@@ -2065,6 +2103,7 @@ impl ProtocolAppUiBackend {
             return None;
         }
         Some(AppUiCommand::OpenSession(SessionOpenParams {
+            client_commands: None,
             session_id: params.session_id.clone(),
             topic: None,
             profile_id: self.launch.profile_id.clone(),
@@ -2517,6 +2556,7 @@ impl ProtocolAppUiBackend {
                 // hydration depends on these, and `--readonly` users
                 // still want to see backend agent/goal/loop state.
                 | AppUiCommand::ListAgents(_)
+                | AppUiCommand::WorkspaceTeam(crate::workspace_team::Command::List { .. })
                 | AppUiCommand::ReadAgentStatus(_)
                 | AppUiCommand::ReadAgentOutput(_)
                 | AppUiCommand::ListAgentArtifacts(_)
@@ -2737,6 +2777,7 @@ impl ProtocolAppUiBackend {
             // "unexpectedly blocked read-style" readonly_policy bug.
             | AppUiCommand::SessionRollback(_)
             | AppUiCommand::StartReview(_)
+            | AppUiCommand::WorkspaceTeam(_)
             | AppUiCommand::SelectModel(_)
             | AppUiCommand::CancelTask(_)
             | AppUiCommand::RestartTaskFromNode(_)
@@ -2807,6 +2848,7 @@ impl AppUiBackend for ProtocolAppUiBackend {
         if let Some(session_id) = self.launch.session_id.clone() {
             self.send(AppUiCommand::OpenSession(
                 octos_core::ui_protocol::SessionOpenParams {
+                    client_commands: None,
                     session_id,
                     topic: None,
                     profile_id: self.launch.profile_id.clone(),
@@ -3101,24 +3143,26 @@ pub(crate) fn install_local_shell_parent_signal_shield() -> std::io::Result<()> 
     static INSTALL_ERROR: OnceLock<Option<String>> = OnceLock::new();
     let error = INSTALL_ERROR.get_or_init(|| {
         let intercepted = Arc::new(AtomicBool::new(false));
-        signal_hook::flag::register(
+        let sigint_error = signal_hook::flag::register(
             signal_hook::consts::signal::SIGINT,
             Arc::clone(&intercepted),
         )
         .err()
-        .map(|err| format!("failed to shield parent from SIGINT: {err}"))
-        .or_else(|| {
-            #[cfg(not(windows))]
-            {
-                signal_hook::flag::register(signal_hook::consts::signal::SIGQUIT, intercepted)
-                    .err()
-                    .map(|err| format!("failed to shield parent from SIGQUIT: {err}"))
-            }
-            #[cfg(windows)]
-            {
-                None
-            }
-        })
+        .map(|err| format!("failed to shield parent from SIGINT: {err}"));
+        if sigint_error.is_some() {
+            return sigint_error;
+        }
+
+        #[cfg(not(windows))]
+        {
+            signal_hook::flag::register(signal_hook::consts::signal::SIGQUIT, intercepted)
+                .err()
+                .map(|err| format!("failed to shield parent from SIGQUIT: {err}"))
+        }
+        #[cfg(windows)]
+        {
+            None
+        }
     });
 
     match error {
@@ -3260,6 +3304,7 @@ fn appui_feature_header_for(old_server: bool) -> String {
 fn appui_feature_tokens_for(old_server: bool) -> Vec<String> {
     let baseline = [
         UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+        UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
         UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
         UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
         UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
@@ -3270,6 +3315,9 @@ fn appui_feature_tokens_for(old_server: bool) -> Vec<String> {
     }
     [
         UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+        // session/list (and therefore /resume) is gated by this feature on
+        // both transports, including servers using the compatibility baseline.
+        UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
         UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
         UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
         UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
@@ -3499,6 +3547,7 @@ fn rpc_request_from_command(
         AppUiCommand::ProfileSkillsInstall(params) => serde_json::to_value(params),
         AppUiCommand::ProfileSkillsRemove(params) => serde_json::to_value(params),
         AppUiCommand::ListAgents(params) => serde_json::to_value(params),
+        AppUiCommand::WorkspaceTeam(params) => serde_json::to_value(params),
         AppUiCommand::ReadAgentStatus(params) => serde_json::to_value(params),
         AppUiCommand::ReadAgentOutput(params) => serde_json::to_value(params),
         AppUiCommand::ListAgentArtifacts(params) => serde_json::to_value(params),
@@ -3616,6 +3665,16 @@ fn rpc_value_to_app_event(
         };
 
         let params = frame.get("params").cloned().unwrap_or(Value::Null);
+        if method == "peer/team/updated" {
+            return Ok(Some(match serde_json::from_value(params) {
+                Ok(team) => ClientEvent::WorkspaceTeamUpdated(team),
+                Err(error) => app_error(
+                    "invalid_params",
+                    format!("invalid workspace team update: {error}"),
+                )
+                .into(),
+            }));
+        }
         if method == "server/heartbeat" {
             return Ok(None);
         }
@@ -3973,11 +4032,11 @@ fn success_response_to_app_event(
                 )),
             }
         }
-        crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT
+        method @ (crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT
         | crate::model::APPUI_METHOD_PROFILE_LLM_DELETE
-        | crate::model::APPUI_METHOD_PROFILE_LLM_TEST => {
+        | crate::model::APPUI_METHOD_PROFILE_LLM_TEST) => {
             match serde_json::from_value::<ProfileLlmMutationResult>(result) {
-                Ok(result) => Ok(Some(profile_llm_mutation_event(result))),
+                Ok(result) => Ok(Some(profile_llm_mutation_event(method, result))),
                 Err(err) => Ok(Some(
                     app_error(
                         "invalid_result",
@@ -4375,6 +4434,26 @@ fn success_response_to_app_event(
         // M15-E autonomy results. We decode and forward as
         // ClientEvent::Autonomy so the store can update the per-session
         // mirror.
+        crate::workspace_team::LIST | crate::workspace_team::LEADER => {
+            match serde_json::from_value::<crate::workspace_team::Snapshot>(result) {
+                Ok(team) => Ok(Some(ClientEvent::WorkspaceTeam(team))),
+                Err(error) => Ok(Some(
+                    app_error("invalid_result", format!("invalid workspace team: {error}")).into(),
+                )),
+            }
+        }
+        crate::workspace_team::MESSAGE => {
+            match serde_json::from_value::<crate::workspace_team::MessageResult>(result) {
+                Ok(receipt) => Ok(Some(ClientEvent::WorkspaceMessage(receipt))),
+                Err(error) => Ok(Some(
+                    app_error(
+                        "invalid_result",
+                        format!("invalid peer message receipt: {error}"),
+                    )
+                    .into(),
+                )),
+            }
+        }
         crate::model::APPUI_METHOD_AGENT_LIST => {
             match serde_json::from_value::<crate::model::AgentListResult>(result) {
                 Ok(result) => Ok(Some(autonomy_event(AutonomyResult::AgentList(result)))),
@@ -4618,12 +4697,18 @@ fn model_select_event(
     result: ModelSelectResult,
     initiating_session: Option<SessionKey>,
 ) -> ClientEvent {
-    let prefix = if result.restart_required && result.applied {
+    let prefix = if result.restart_required {
         "Model saved; restart required"
-    } else if result.applied {
-        "Model selected"
     } else {
-        "Model unchanged"
+        match result.runtime_disposition.as_deref() {
+            Some("reloaded") => "Model saved. Your next message uses",
+            Some("restart_required") => "Model saved; restart required",
+            Some("deferred") => "Model saved; runtime activation pending",
+            Some("persisted_but_not_live") => "Model saved, but not live",
+            Some("unchanged") => "Model unchanged",
+            _ if result.applied => "Model saved; runtime activation unconfirmed",
+            _ => "Model unchanged",
+        }
     };
     ClientEvent::ModelSelect(ModelSelectClientEvent {
         message: format!(
@@ -4655,7 +4740,13 @@ fn profile_llm_list_event(result: ProfileLlmListResult) -> ClientEvent {
     })
 }
 
-fn profile_llm_mutation_event(result: ProfileLlmMutationResult) -> ClientEvent {
+fn profile_llm_mutation_event(method: &str, result: ProfileLlmMutationResult) -> ClientEvent {
+    let kind = match method {
+        crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT => ProfileLlmMutationKind::Upsert,
+        crate::model::APPUI_METHOD_PROFILE_LLM_DELETE => ProfileLlmMutationKind::Delete,
+        crate::model::APPUI_METHOD_PROFILE_LLM_TEST => ProfileLlmMutationKind::Test,
+        _ => unreachable!("not a profile/llm mutation method: {method}"),
+    };
     let count = result.models().len();
     let message = match (
         result.applied,
@@ -4667,7 +4758,11 @@ fn profile_llm_mutation_event(result: ProfileLlmMutationResult) -> ClientEvent {
         (false, None, Some(error)) => format!("Provider operation failed: {error}"),
         _ => format!("Provider profile updated: {count} configured provider(s)"),
     };
-    ClientEvent::ProfileLlmMutation(ProfileLlmMutationClientEvent { message, result })
+    ClientEvent::ProfileLlmMutation(ProfileLlmMutationClientEvent {
+        kind,
+        message,
+        result,
+    })
 }
 
 fn snapshot_list_event(result: crate::model::SnapshotListResult) -> ClientEvent {
@@ -5493,6 +5588,8 @@ impl MockAppUiBackend {
             text: "M9 scaffold over mock transport.".into(),
         }));
         self.enqueue_protocol(UiNotification::TaskUpdated(TaskUpdatedEvent {
+            started_at: None,
+            relaunched_from: None,
             session_id: session_id.clone(),
             topic: None,
             task_id: build_task_id.clone(),
@@ -5530,6 +5627,8 @@ impl MockAppUiBackend {
             duration_ms: Some(420),
         }));
         self.enqueue_protocol(UiNotification::TaskUpdated(TaskUpdatedEvent {
+            started_at: None,
+            relaunched_from: None,
             session_id: session_id.clone(),
             topic: None,
             task_id: build_task_id,
@@ -5553,6 +5652,7 @@ impl MockAppUiBackend {
                     .into(),
         }));
         self.enqueue_protocol(UiNotification::TurnCompleted(TurnCompletedEvent {
+            token_usage: None,
             session_id: session_id.clone(),
             topic: None,
             turn_id,
@@ -5738,6 +5838,8 @@ impl AppUiBackend for MockAppUiBackend {
                         selected,
                         applied: true,
                         restart_required: false,
+                        runtime_disposition: Some("reloaded".into()),
+                        runtime_error: None,
                         runtime_policy_stamp: None,
                     },
                     Some(params.session_id),
@@ -5771,17 +5873,30 @@ impl AppUiBackend for MockAppUiBackend {
                         selected,
                         applied: true,
                         restart_required: false,
+                        runtime_disposition: Some("reloaded".into()),
+                        runtime_error: None,
                         runtime_policy_stamp: None,
                     },
                     Some(initiating),
                 ));
                 Ok(())
             }
-            AppUiCommand::ProfileLlmUpsert(_)
+            command @ (AppUiCommand::ProfileLlmUpsert(_)
             | AppUiCommand::ProfileLlmDelete(_)
-            | AppUiCommand::ProfileLlmTest(_) => {
-                self.queue
-                    .push_back(profile_llm_mutation_event(ProfileLlmMutationResult {
+            | AppUiCommand::ProfileLlmTest(_)) => {
+                let method = match command {
+                    AppUiCommand::ProfileLlmUpsert(_) => {
+                        crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT
+                    }
+                    AppUiCommand::ProfileLlmDelete(_) => {
+                        crate::model::APPUI_METHOD_PROFILE_LLM_DELETE
+                    }
+                    AppUiCommand::ProfileLlmTest(_) => crate::model::APPUI_METHOD_PROFILE_LLM_TEST,
+                    _ => unreachable!(),
+                };
+                self.queue.push_back(profile_llm_mutation_event(
+                    method,
+                    ProfileLlmMutationResult {
                         profile_id: Some(self.profile_id()),
                         primary: mock_profile_llm_list().primary,
                         fallbacks: mock_profile_llm_list().fallbacks,
@@ -5790,7 +5905,8 @@ impl AppUiBackend for MockAppUiBackend {
                         runtime_policy_stamp: None,
                         message: None,
                         error: None,
-                    }));
+                    },
+                ));
                 Ok(())
             }
             AppUiCommand::AuthStatus(_) => {
@@ -6125,6 +6241,8 @@ impl AppUiBackend for MockAppUiBackend {
             AppUiCommand::ListSessions(_) => {
                 self.queue
                     .push_back(ClientEvent::SessionList(SessionListResult {
+                        profile_id: None,
+                        workspace_root: None,
                         sessions: serde_json::json!([
                             {
                                 "id": "local:mock#alpha",
@@ -6156,6 +6274,8 @@ impl AppUiBackend for MockAppUiBackend {
                     .push_back(ClientEvent::SessionRollback(SessionRollbackResult {
                         dropped_turns: 1,
                         thread: SessionHydrateResult {
+                            replayed_projection_envelopes: None,
+                            projection_thread_sequences: None,
                             session_id: session_id.clone(),
                             cursor: UiCursor {
                                 stream: session_id.0.clone(),
@@ -6165,6 +6285,9 @@ impl AppUiBackend for MockAppUiBackend {
                             context_state: None,
                             replayed_tool_envelopes: None,
                             messages: Some(vec![HydratedMessage {
+                                tool_call_id: None,
+                                tool_calls: Vec::new(),
+                                tool_name: None,
                                 seq: 1,
                                 role: "user".into(),
                                 content: "first mock prompt".into(),
@@ -6572,6 +6695,14 @@ fn mock_approval_tool_name(kind: &str) -> &'static str {
     }
 }
 
+/// Workspace root shown in mock approval details: the current directory,
+/// so no fixed machine path is compiled into the binary.
+fn mock_workspace_root() -> String {
+    std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| ".".into())
+}
+
 fn mock_approval_title(kind: &str) -> &'static str {
     match kind {
         approval_kinds::DIFF => "Mock diff approval boundary",
@@ -6605,6 +6736,7 @@ fn mock_approval_risk(kind: &str) -> &'static str {
 fn mock_approval_details(kind: &str) -> ApprovalTypedDetails {
     match kind {
         approval_kinds::DIFF => ApprovalTypedDetails {
+            host_tool: None,
             kind: approval_kinds::DIFF.into(),
             command: None,
             sandbox: None,
@@ -6621,6 +6753,7 @@ fn mock_approval_details(kind: &str) -> ApprovalTypedDetails {
             sandbox_escalation: None,
         },
         approval_kinds::FILESYSTEM => ApprovalTypedDetails {
+            host_tool: None,
             kind: approval_kinds::FILESYSTEM.into(),
             command: None,
             sandbox: None,
@@ -6629,12 +6762,13 @@ fn mock_approval_details(kind: &str) -> ApprovalTypedDetails {
                 operation: "write".into(),
                 paths: vec!["/tmp/octos-mock-approval.txt".into()],
                 outside_workspace: true,
-                writable_roots: vec!["/Users/yuechen/home/octos".into()],
+                writable_roots: vec![mock_workspace_root()],
             }),
             network: None,
             sandbox_escalation: None,
         },
         approval_kinds::NETWORK => ApprovalTypedDetails {
+            host_tool: None,
             kind: approval_kinds::NETWORK.into(),
             command: None,
             sandbox: None,
@@ -6649,6 +6783,7 @@ fn mock_approval_details(kind: &str) -> ApprovalTypedDetails {
             sandbox_escalation: None,
         },
         approval_kinds::SANDBOX_ESCALATION => ApprovalTypedDetails {
+            host_tool: None,
             kind: approval_kinds::SANDBOX_ESCALATION.into(),
             command: None,
             sandbox: None,
@@ -6688,7 +6823,7 @@ fn mock_approval_details(kind: &str) -> ApprovalTypedDetails {
                 mode: Some("workspace-write".into()),
                 filesystem_access: Some("workspace-write".into()),
                 network_access: Some(false),
-                writable_roots: vec!["/Users/yuechen/home/octos".into()],
+                writable_roots: vec![mock_workspace_root()],
             }),
         ),
     }
@@ -6732,6 +6867,69 @@ fn mock_diff_preview(session_id: SessionKey, preview_id: PreviewId) -> DiffPrevi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workspace_default_launch_is_shared_and_explicit_transports_are_preserved() {
+        let local = Cli::try_parse_from(["octoscode"]).unwrap();
+        assert!(matches!(
+            endpoint_from_cli(&local, None),
+            Some(AppUiEndpoint::SharedLocal { .. })
+        ));
+        let stdio =
+            Cli::try_parse_from(["octoscode", "--stdio-command", "octos serve --stdio --solo"])
+                .unwrap();
+        assert!(matches!(
+            endpoint_from_cli(&stdio, None),
+            Some(AppUiEndpoint::Stdio { .. })
+        ));
+        let remote = Cli::try_parse_from([
+            "octoscode",
+            "--endpoint",
+            "ws://example.test/api/ui-protocol/ws",
+        ])
+        .unwrap();
+        assert!(matches!(
+            endpoint_from_cli(&remote, None),
+            Some(AppUiEndpoint::WebSocket { .. })
+        ));
+    }
+
+    #[test]
+    fn model_select_messages_report_runtime_disposition() {
+        for (disposition, expected) in [
+            ("reloaded", "next message"),
+            ("restart_required", "restart required"),
+            ("deferred", "pending"),
+            ("persisted_but_not_live", "not live"),
+            ("legacy", "unconfirmed"),
+            ("unchanged", "unchanged"),
+        ] {
+            let mut raw = serde_json::json!({
+                "session_id":"local:a", "selected":{"model":"new", "provider":"openai", "selected":true}, "applied":true
+            });
+            if disposition != "legacy" {
+                raw["runtime_disposition"] = disposition.into();
+            }
+            let ClientEvent::ModelSelect(event) =
+                model_select_event(serde_json::from_value(raw).unwrap(), None)
+            else {
+                panic!("model event")
+            };
+            assert!(
+                event.message.contains(expected),
+                "{disposition}: {}",
+                event.message
+            );
+        }
+        let result = serde_json::from_value(serde_json::json!({
+            "session_id":"local:a", "selected":{"model":"new", "provider":"openai", "selected":true},
+            "applied":true, "restart_required":true
+        })).unwrap();
+        let ClientEvent::ModelSelect(event) = model_select_event(result, None) else {
+            panic!("model event")
+        };
+        assert!(event.message.contains("restart required"));
+    }
+
     use super::*;
     use crate::model::{
         AgentArtifactReadParams, ConfigCapabilitiesListParams, McpConfigDeleteParams,
@@ -6791,6 +6989,53 @@ mod tests {
     fn websocket_target_label_is_unchanged() {
         let ws = "ws://127.0.0.1:50179/api/ui-protocol/ws";
         assert_eq!(protocol_target_label(ws), ws);
+    }
+
+    #[test]
+    fn negotiated_stdio_and_websocket_features_enable_resume_and_rewind() {
+        use crate::menu::{
+            AvailabilityContext, CapabilitySet, CommandRegistry, ConnectionState, RuntimeMode,
+            TaskActivity,
+        };
+
+        let registry = CommandRegistry::with_core_commands();
+        for old_server in [false, true] {
+            let mut exchange = ProtocolExchange::default();
+            let hello = exchange.build_client_hello_request(appui_feature_tokens_for(old_server));
+            let stdio_features: Vec<String> =
+                serde_json::from_value(hello.params["supported_features"].clone())
+                    .expect("stdio feature tokens");
+            let websocket_features: Vec<String> = appui_feature_header_for(old_server)
+                .split(',')
+                .map(|token| token.trim().to_owned())
+                .collect();
+
+            for (transport, features) in
+                [("stdio", stdio_features), ("websocket", websocket_features)]
+            {
+                // Exercise the server's real capability negotiation, rather than
+                // supplying synthetic methods that bypass the feature gates.
+                let negotiated = UiProtocolCapabilities::for_negotiated_features(features);
+                let capabilities = CapabilitySet::from(&negotiated);
+                let context = AvailabilityContext {
+                    task: TaskActivity::Idle,
+                    approval_modal_visible: false,
+                    readonly: false,
+                    runtime: RuntimeMode::Protocol,
+                    connection: ConnectionState::Connected,
+                    capabilities: Some(&capabilities),
+                    feature_flags: &[],
+                    session_open: true,
+                };
+                let commands = registry.available_commands(&context);
+                for name in ["resume", "rewind"] {
+                    assert!(
+                        commands.iter().any(|command| command.name == name),
+                        "/{name} must be available after {transport} negotiation (old_server={old_server})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -7390,6 +7635,7 @@ mod tests {
         let request = rpc_request_from_command(
             "tui-7".into(),
             AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 // Ordinary chat turn: context-scoped tools stay unadvertised.
                 tool_context: None,
                 session_id: SessionKey("local:test".into()),
@@ -7420,6 +7666,7 @@ mod tests {
         let request = rpc_request_from_command(
             "tui-9".into(),
             AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 // Ordinary chat turn: context-scoped tools stay unadvertised.
                 tool_context: None,
                 session_id: SessionKey("local:test".into()),
@@ -8244,10 +8491,7 @@ mod tests {
     /// honors it stops sending `message/delta` + `turn/completed` entirely —
     /// the reply text and the turn terminal ride inside `projection/envelope`
     /// instead. This is the exact frame a live server emits for a reasoning
-    /// delta; it has to reach the v2 notification, because the v1 arm is
-    /// dropped on the floor (`store.rs` `UiNotification::Envelope(_) => None`)
-    /// and a dropped terminal leaves the UI spinning on "Working" forever with
-    /// the answer only visible after a restart re-hydrates the session.
+    /// delta; it must reach the v2 notification to settle the live turn.
     /// task-consume-turn-steer-dropped: the modern negotiation header asks the
     /// server for the dropped-before-terminal steer guarantee; the old-server
     /// baseline does not.
@@ -8429,18 +8673,12 @@ mod tests {
         );
     }
 
-    /// A `projection/envelope` frame WITHOUT `turn_id` decodes to the v1
-    /// `UiNotification::Envelope` arm. That arm used to return `None`, so a v1
-    /// server's reply text and turn terminal vanished silently: the composer
-    /// spun on "Working" forever and the answer only surfaced after a restart
-    /// re-hydrated the session. v1 carries the same payloads as v2 (minus the
-    /// segment id, and spelling the terminal `turn_completed`), so it must be
-    /// applied, not discarded.
+    /// A server using the legacy delta lane still needs to settle the turn
+    /// when its terminal notification arrives.
     #[test]
-    fn envelope_v1_turn_lands_and_settles_like_v2() {
-        const THREAD: &str = "b6a0e44e-8336-4cc0-a9db-93439010b313";
-        let session = "v1-envelope-session";
-
+    fn legacy_delta_turn_lands_and_settles() {
+        let turn_id = TurnId::new();
+        let session = "legacy-delta-session";
         let mut store = crate::store::Store::from_snapshot(AppUiSnapshot {
             sessions: vec![AppUiSession {
                 id: SessionKey(session.into()),
@@ -8459,23 +8697,12 @@ mod tests {
         store.compose_command().expect("submit starts a turn");
 
         let mut pending = HashMap::new();
-        // No `turn_id` anywhere: this is the v1 wire shape.
         let frames = [
-            json!({"jsonrpc":"2.0","method":"projection/envelope","params":{
-                "session_id": session, "thread_id": THREAD, "seq": 1,
-                "payload": {"type":"assistant_delta","data":{"text":"Hello! "}}}}),
-            json!({"jsonrpc":"2.0","method":"projection/envelope","params":{
-                "session_id": session, "thread_id": THREAD, "seq": 2,
-                "payload": {"type":"assistant_persisted","data":{
-                    "text":"Hello! How can I help you today?",
-                    "meta": {"message_id":"v1:1:1786348294194329000",
-                             "persisted_at":"2026-08-10T07:51:34.194329Z"}}}}}),
-            json!({"jsonrpc":"2.0","method":"projection/envelope","params":{
-                "session_id": session, "thread_id": THREAD, "seq": 3,
-                "payload": {"type":"turn_completed","data":{
-                    "token_usage":{"input_tokens":87,"output_tokens":43}}}}}),
+            json!({"jsonrpc":"2.0","method":methods::MESSAGE_DELTA,"params":{
+                "session_id": session, "turn_id": turn_id, "text": "Hello! How can I help you today?"}}),
+            json!({"jsonrpc":"2.0","method":methods::TURN_COMPLETED,"params":{
+                "session_id": session, "turn_id": turn_id}}),
         ];
-
         for frame in frames {
             let event = rpc_text_to_app_event_with_pending(&frame.to_string(), &mut pending)
                 .expect("frame decodes")
@@ -8492,18 +8719,11 @@ mod tests {
             .map(|message| message.content.clone())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(
-            transcript.contains("How can I help you today?"),
-            "v1 assistant answer never reached the transcript: {transcript:?}"
-        );
-        assert!(
-            store.state.sessions[0].live_reply.is_none(),
-            "v1 terminal left the turn live, so the spinner never clears"
-        );
+        assert!(transcript.contains("How can I help you today?"));
+        assert!(store.state.sessions[0].live_reply.is_none());
         assert_ne!(
             store.state.run_state,
-            crate::model::SessionRunState::InProgress,
-            "run state stuck InProgress after the v1 turn terminal"
+            crate::model::SessionRunState::InProgress
         );
     }
 
@@ -9427,6 +9647,7 @@ mod tests {
         let read_style_commands = [
             AppUiCommand::ListConfigCapabilities(ConfigCapabilitiesListParams {}),
             AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: session_id.clone(),
                 topic: None,
                 sandbox: None,
@@ -9463,7 +9684,10 @@ mod tests {
                 after: None,
                 include: Vec::new(),
             }),
-            AppUiCommand::ListSessions(octos_core::ui_protocol::SessionListParams { cwd: None }),
+            AppUiCommand::ListSessions(octos_core::ui_protocol::SessionListParams {
+                profile_id: None,
+                cwd: None,
+            }),
             AppUiCommand::GetThreadGraph(ThreadGraphGetParams {
                 session_id: session_id.clone(),
                 at: None,
@@ -9504,6 +9728,7 @@ mod tests {
 
         let mutating_commands = [
             AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 // Ordinary chat turn: context-scoped tools stay unadvertised.
                 tool_context: None,
                 session_id: session_id.clone(),
@@ -10602,6 +10827,7 @@ mod tests {
     #[test]
     fn launch_from_cli_uses_stdio_endpoint_when_requested() {
         let cli = Cli {
+            implicit_local_transport: false,
             config: None,
             mode: crate::cli::Mode::Protocol,
             base_url: None,
@@ -10629,6 +10855,40 @@ mod tests {
                 .map(|endpoint| endpoint.label().to_string()),
             Some("octos serve --stdio".into())
         );
+    }
+
+    #[test]
+    fn protocol_preserves_profile_llm_delete_kind() {
+        let mut exchange = ProtocolExchange::default();
+        let request = exchange
+            .build_tracked_request(AppUiCommand::ProfileLlmDelete(
+                crate::model::ProfileLlmDeleteParams {
+                    profile_id: Some("coding".into()),
+                    family_id: "moonshot-coding".into(),
+                    model_id: "k3".into(),
+                    route_id: "official".into(),
+                },
+            ))
+            .expect("request builds");
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": request.id,
+            "result": {
+                "profile_id": "coding",
+                "primary": null,
+                "fallbacks": [],
+                "applied": true
+            }
+        });
+
+        let event = exchange
+            .decode_rpc_text(&response.to_string())
+            .expect("response decodes")
+            .expect("delete result yields an event");
+        let ClientEvent::ProfileLlmMutation(event) = event else {
+            panic!("expected profile LLM mutation event");
+        };
+        assert_eq!(event.kind, ProfileLlmMutationKind::Delete);
     }
 
     /// `profile/llm/fetch_models` responses must produce an event: this arm
@@ -10931,6 +11191,7 @@ mod tests {
             .expect("session opened event");
         let request = exchange
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: session_id.clone(),
                 topic: None,
                 sandbox: None,
@@ -11415,6 +11676,7 @@ mod tests {
         // This seam tests a hydrate writer failure in an ALREADY opened
         // scope; unknown-scope hydration has a separate session/open gate.
         backend.remember_confirmed_session_scope(SessionOpenParams {
+            client_commands: None,
             session_id: SessionKey("local:hydrate-send".into()),
             topic: None,
             profile_id: None,
@@ -11605,9 +11867,16 @@ mod tests {
         // Drain until the reconnect happens: the dead writer makes the next
         // send/poll fail, the disconnect is reported, and the backend
         // reconnects (server accepts connection 2 and captures 3 requests).
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Both outcomes are required before leaving the loop: the reconnect's
+        // capabilities frame reaching the test server does NOT imply the
+        // disconnect status was already popped from the backend's event queue
+        // — which side wins is scheduler-dependent, and the Windows CI runner
+        // under full-suite load routinely delivers the frame first. Generous
+        // deadline for the same reason; isolated runs finish in <1s.
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut saw_disconnect = false;
-        while Instant::now() < deadline {
+        let mut saw_reconnect = false;
+        while Instant::now() < deadline && !(saw_disconnect && saw_reconnect) {
             match backend.next_event() {
                 Ok(Some(ClientEvent::App(event))) => {
                     if let AppUiEvent::Status(status) = *event {
@@ -11624,16 +11893,29 @@ mod tests {
                     session_id: SessionKey("local:test".into()),
                 },
             ));
-            if let Ok(frame) = server.received.recv_timeout(Duration::from_millis(50)) {
-                // First reconnect request must be the capabilities refresh.
-                assert_eq!(
-                    frame["method"],
-                    crate::model::APPUI_METHOD_CONFIG_CAPABILITIES_LIST
-                );
-                break;
+            // Only the FIRST reconnect frame is consumed here; the replayed
+            // launch/resolve and the session reopen stay queued for the
+            // recv_json assertions below.
+            if !saw_reconnect {
+                if let Ok(frame) = server.received.recv_timeout(Duration::from_millis(50)) {
+                    // First reconnect request must be the capabilities refresh.
+                    assert_eq!(
+                        frame["method"],
+                        crate::model::APPUI_METHOD_CONFIG_CAPABILITIES_LIST
+                    );
+                    saw_reconnect = true;
+                }
+            } else {
+                // Keep iterations paced while waiting for the disconnect
+                // status; recv_timeout no longer provides the 50ms pause.
+                thread::sleep(Duration::from_millis(50));
             }
         }
-        assert!(saw_disconnect, "the dead connection was reported");
+        assert!(
+            saw_disconnect && saw_reconnect,
+            "the dead connection was reported and the reconnect happened \
+             (saw_disconnect={saw_disconnect}, saw_reconnect={saw_reconnect})"
+        );
 
         // The REPLAYED launch/resolve lands BEFORE the session reopen.
         let replayed = server.recv_json();
@@ -11727,6 +12009,7 @@ mod tests {
 
         let request = backend
             .build_tracked_request(AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 // Ordinary chat turn: context-scoped tools stay unadvertised.
                 tool_context: None,
                 session_id: SessionKey("local:test".into()),
@@ -11834,6 +12117,7 @@ mod tests {
         let session_id = SessionKey("local:test".into());
         let request = backend
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: session_id.clone(),
                 topic: None,
                 sandbox: None,
@@ -12457,6 +12741,7 @@ mod tests {
         });
         let request = backend
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: SessionKey("local:test".into()),
                 topic: None,
                 sandbox: None,
@@ -12495,6 +12780,7 @@ mod tests {
     #[test]
     fn launch_from_cli_defaults_cwd_to_process_current_dir() {
         let cli = Cli {
+            implicit_local_transport: false,
             config: None,
             mode: crate::cli::Mode::Protocol,
             base_url: Some("wss://example.test/ui-protocol".into()),
@@ -12538,6 +12824,7 @@ mod tests {
         });
         let request = backend
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: SessionKey("local:test".into()),
                 topic: None,
                 sandbox: None,
@@ -12567,7 +12854,10 @@ mod tests {
         });
         let request = backend
             .build_tracked_request(AppUiCommand::ListSessions(
-                octos_core::ui_protocol::SessionListParams { cwd: None },
+                octos_core::ui_protocol::SessionListParams {
+                    profile_id: None,
+                    cwd: None,
+                },
             ))
             .expect("request builds");
 
@@ -12590,7 +12880,10 @@ mod tests {
         });
         let request = backend
             .build_tracked_request(AppUiCommand::ListSessions(
-                octos_core::ui_protocol::SessionListParams { cwd: None },
+                octos_core::ui_protocol::SessionListParams {
+                    profile_id: None,
+                    cwd: None,
+                },
             ))
             .expect("request builds");
 
@@ -12620,6 +12913,7 @@ mod tests {
         );
         let open = |session_id: &str, cwd: Option<&str>| {
             AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: SessionKey(session_id.into()),
                 topic: None,
                 profile_id: Some("dev".into()),
@@ -12723,6 +13017,7 @@ mod tests {
 
         let request = backend
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: session_id.clone(),
                 topic: None,
                 sandbox: None,
@@ -12948,6 +13243,7 @@ mod tests {
 
         // 2. An explicit open carries its OWN cwd, not the launch one.
         backend.record_reopen_target(&AppUiCommand::OpenSession(SessionOpenParams {
+            client_commands: None,
             session_id: SessionKey("local:other".into()),
             topic: None,
             profile_id: Some("research".into()),
@@ -13050,6 +13346,7 @@ done
         backend.refresh_capabilities_on_reconnect = true;
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 tool_context: None,
                 session_id: session_id.clone(),
                 turn_id: TurnId::new(),
@@ -13222,6 +13519,7 @@ wait
         ] {
             backend
                 .send(AppUiCommand::OpenSession(SessionOpenParams {
+                    client_commands: None,
                     session_id: SessionKey(session.into()),
                     topic: None,
                     profile_id: Some(
@@ -13275,6 +13573,7 @@ wait
         for session in ["local:master", "local:peer"] {
             backend
                 .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                    origin: None,
                     tool_context: None,
                     session_id: SessionKey(session.into()),
                     turn_id: TurnId::new(),
@@ -13486,6 +13785,7 @@ wait
         backend.disconnected_status_reported = true;
         let prompt = |session: &str| {
             AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 tool_context: None,
                 session_id: SessionKey(session.into()),
                 turn_id: TurnId::new(),
@@ -13526,6 +13826,7 @@ wait
         );
         backend
             .send(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: SessionKey("local:peer".into()),
                 topic: None,
                 profile_id: Some("dev".into()),
@@ -13564,6 +13865,7 @@ wait
         let session_id = SessionKey("local:barrier".into());
         let request = backend
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: session_id.clone(),
                 topic: None,
                 profile_id: Some("dev".into()),
@@ -13582,7 +13884,10 @@ wait
         });
         backend
             .deferred_until_reconnect_open
-            .push_back(AppUiCommand::ListSessions(SessionListParams { cwd: None }));
+            .push_back(AppUiCommand::ListSessions(SessionListParams {
+                profile_id: None,
+                cwd: None,
+            }));
         (backend, request_id)
     }
 
@@ -13592,6 +13897,7 @@ wait
     fn arm_session_open_barrier(backend: &mut ProtocolAppUiBackend, session_id: &str) -> String {
         let session_id = SessionKey(session_id.into());
         let command = AppUiCommand::OpenSession(SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: Some("dev".into()),
@@ -13809,6 +14115,7 @@ done
         backend.refresh_capabilities_on_reconnect = true;
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 tool_context: None,
                 session_id: session_id.clone(),
                 turn_id: TurnId::new(),
@@ -13927,6 +14234,7 @@ done
         backend.refresh_capabilities_on_reconnect = true;
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 tool_context: None,
                 session_id: session_id.clone(),
                 turn_id: TurnId::new(),
@@ -14064,7 +14372,10 @@ done
         backend.disconnected_status_reported = true;
         backend.refresh_capabilities_on_reconnect = true;
         backend
-            .send(AppUiCommand::ListSessions(SessionListParams { cwd: None }))
+            .send(AppUiCommand::ListSessions(SessionListParams {
+                profile_id: None,
+                cwd: None,
+            }))
             .expect("child launch + deferred list");
 
         let mut seen = Vec::new();
@@ -14083,6 +14394,7 @@ done
 
         let prompt = || {
             AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 tool_context: None,
                 session_id: SessionKey("local:rejected".into()),
                 turn_id: TurnId::new(),
@@ -14100,6 +14412,7 @@ done
         // with a follow-up command queued behind the barrier.
         backend
             .send(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: SessionKey("local:rejected".into()),
                 topic: None,
                 profile_id: Some("dev".into()),
@@ -14113,7 +14426,10 @@ done
             "every open arms the scoped barrier"
         );
         backend
-            .send(AppUiCommand::ListSessions(SessionListParams { cwd: None }))
+            .send(AppUiCommand::ListSessions(SessionListParams {
+                profile_id: None,
+                cwd: None,
+            }))
             .expect("list defers behind the barrier");
         backend.send(prompt()).expect("submit defers");
         assert_eq!(backend.deferred_until_reconnect_open.len(), 2);
@@ -14207,6 +14523,7 @@ done
         );
         backend
             .send(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: launch_session.clone(),
                 topic: None,
                 profile_id: Some("dev".into()),
@@ -14293,6 +14610,7 @@ done
         let mut exchange = ProtocolExchange::default();
         let open = exchange
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id: SessionKey("local:context".into()),
                 topic: None,
                 profile_id: None,
@@ -14411,6 +14729,7 @@ done
         // An explicitly recorded reopen target (e.g. after /resume) also gets
         // its cwd corrected to the confirmed root.
         backend.record_reopen_target(&AppUiCommand::OpenSession(SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: Some("coding".into()),
@@ -14482,6 +14801,7 @@ done
         // records the reopen target via `record_reopen_target` before any
         // network I/O; drive that helper directly so the test never dials out.
         backend.record_reopen_target(&AppUiCommand::OpenSession(SessionOpenParams {
+            client_commands: None,
             session_id: resumed_session.clone(),
             topic: None,
             profile_id: Some("research".into()),
@@ -14643,6 +14963,7 @@ done
 
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 // Ordinary chat turn: context-scoped tools stay unadvertised.
                 tool_context: None,
                 session_id: session_id.clone(),
@@ -14707,6 +15028,7 @@ done
 
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 // Ordinary chat turn: context-scoped tools stay unadvertised.
                 tool_context: None,
                 session_id: session,
@@ -14742,6 +15064,7 @@ done
         let turn_id = TurnId::new();
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 // Ordinary chat turn: context-scoped tools stay unadvertised.
                 tool_context: None,
                 session_id: session_id.clone(),
@@ -14896,6 +15219,7 @@ done
 
         backend
             .send(AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 // Ordinary chat turn: context-scoped tools stay unadvertised.
                 tool_context: None,
                 session_id,

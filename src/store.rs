@@ -3,15 +3,15 @@ use std::collections::BTreeSet;
 use octos_core::app_ui::{AppUiError, AppUiEvent, AppUiSnapshot};
 use octos_core::ui_protocol::{
     ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalId,
-    ApprovalRespondParams, AttachmentOwnerV2, DiffPreviewGetParams, Envelope, EnvelopeNotification,
-    EnvelopeToolEndStatus, EnvelopeV2, EnvelopeV2Notification, HydratedMessage, InputItem,
-    MessageDeltaEvent, Payload, PayloadV2, ReplayLossyEvent, SessionHydrateParams,
-    SessionHydrateResult, SessionListParams, SessionListResult, SessionOpenParams,
-    SessionRollbackParams, SessionRollbackResult, TaskArtifactReadParams, TaskOutputDeltaEvent,
-    TaskOutputReadParams, TaskRuntimeState, TaskUpdatedEvent, ThreadGraphGetParams,
-    TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams, TurnLifecycleState,
-    TurnStartParams, TurnStateGetParams, TurnTerminalOutcome, UiContextState, UiNotification,
-    UiProgressEvent, UserQuestionRequestedEvent,
+    ApprovalRespondParams, DiffPreviewGetParams, EnvelopeToolEndStatus, EnvelopeV2,
+    EnvelopeV2Notification, HydratedMessage, InputItem, MessageDeltaEvent, PayloadV2,
+    ReplayLossyEvent, SessionHydrateParams, SessionHydrateResult, SessionListParams,
+    SessionListResult, SessionOpenParams, SessionRollbackParams, SessionRollbackResult,
+    TaskArtifactReadParams, TaskOutputDeltaEvent, TaskOutputReadParams, TaskRuntimeState,
+    TaskUpdatedEvent, ThreadGraphGetParams, TurnCompletedEvent, TurnErrorEvent, TurnId,
+    TurnInterruptParams, TurnLifecycleState, TurnStartParams, TurnStateGetParams,
+    TurnTerminalOutcome, UiContextState, UiNotification, UiProgressEvent,
+    UserQuestionRequestedEvent,
 };
 use octos_core::{Message, MessageRole, SessionKey, TaskId, ThreadId};
 use serde_json::Value;
@@ -21,10 +21,11 @@ use crate::{
         CapabilitiesClientEvent, ClientEvent, McpConfigListClientEvent,
         McpConfigMutationClientEvent, McpStatusClientEvent, ModelListClientEvent,
         ModelSelectClientEvent, PermissionProfileClientEvent, ProfileLlmCatalogClientEvent,
-        ProfileLlmListClientEvent, ProfileLlmMutationClientEvent, ProfileSkillsListClientEvent,
-        ProfileSkillsMutationClientEvent, ProfileSkillsRegistrySearchClientEvent,
-        SessionStatusClientEvent, SubProvidersListClientEvent, SubProvidersMutationClientEvent,
-        ToolConfigListClientEvent, ToolConfigMutationClientEvent, ToolStatusClientEvent,
+        ProfileLlmListClientEvent, ProfileLlmMutationClientEvent, ProfileLlmMutationKind,
+        ProfileSkillsListClientEvent, ProfileSkillsMutationClientEvent,
+        ProfileSkillsRegistrySearchClientEvent, SessionStatusClientEvent,
+        SubProvidersListClientEvent, SubProvidersMutationClientEvent, ToolConfigListClientEvent,
+        ToolConfigMutationClientEvent, ToolStatusClientEvent,
     },
     menu::{
         CommandEntry, CommandRegistry, CommandResolution, LocalAction, MenuAction, MenuAppSnapshot,
@@ -67,6 +68,27 @@ const AGENT_TERMINAL_LINGER: std::time::Duration = std::time::Duration::from_sec
 /// surface froze on "Testing connection…" with every edit and re-dispatch
 /// blocked. Generous: a real `profile/llm/test` does one provider roundtrip.
 const PROVIDER_PENDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// The server's RUNTIME profile identity when no profile is scoped
+/// (`MAIN_PROFILE_ID` on the server side). It is a valid thing to run under and
+/// to report in `profile/llm/list`, but NOT a persistable profile: the server's
+/// own slug validator accepts only `[a-z0-9-]`, so the leading underscore makes
+/// every write naming it fail with an opaque `-32603`. Treat it as "no profile
+/// to save into" at any persistence boundary.
+const MAIN_RUNTIME_PROFILE_ID: &str = "_main";
+
+/// True when `profile_id` is one the server's profile store can actually
+/// persist. Mirrors its slug rule — lowercase ASCII, digits and hyphens only —
+/// which is what rejects [`MAIN_RUNTIME_PROFILE_ID`] and any other
+/// underscore-prefixed runtime identity. An id failing this can be run under
+/// but never saved into, so a write naming it is refused client-side with an
+/// actionable message instead of an opaque `-32603` from the server.
+fn is_persistable_profile_id(profile_id: &str) -> bool {
+    !profile_id.is_empty()
+        && profile_id != MAIN_RUNTIME_PROFILE_ID
+        && profile_id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
 /// How long a staged-submit FIFO gate stays authoritative without its
 /// turn/started or terminal arriving. Past this, `submit_next_pending_if_idle`
 /// treats the marker as stale (the in-flight turn/start died in some way the
@@ -442,6 +464,14 @@ impl Store {
     }
 
     pub fn compose_command(&mut self) -> Option<AppUiCommand> {
+        self.compose_with_delivery(false)
+    }
+
+    pub fn queue_composer_command(&mut self) -> Option<AppUiCommand> {
+        self.compose_with_delivery(true)
+    }
+
+    fn compose_with_delivery(&mut self, queue_only: bool) -> Option<AppUiCommand> {
         let prompt = self.state.composer.trim().to_string();
         // `looks_like_slash_command`, not `starts_with('/')`: a prompt that
         // merely BEGINS with a path (`/Users/me/Downloads/notes.md is broken,
@@ -495,9 +525,7 @@ impl Store {
         // switches back to the master to send it. Slash/bang were handled above,
         // so client-local commands (`/resume`, `!ls`, …) still work on a peer.
         if self.state.focused_session_is_peer() {
-            self.state.status =
-                "Peer sessions are read-only — steer peers from the master with peer_send_input."
-                    .into();
+            self.state.status = t!("status.peer_session_read_only").into_owned();
             return None;
         }
 
@@ -512,6 +540,11 @@ impl Store {
             // A settled `/btw` aside is ephemeral — the next prompt dismisses
             // it (an answering one stays; its result may still land).
             self.state.clear_settled_btw_aside(&session_id);
+        }
+        if queue_only && self.turn_in_progress() {
+            self.state.pending_messages.push(prompt);
+            self.state.status = t!("status.message_staged").into_owned();
+            return None;
         }
         self.queue_or_start_prompt_turn(prompt, t!("status.queued_turn_start").into_owned())
     }
@@ -723,15 +756,9 @@ impl Store {
     /// prompt is stashed FIFO in `pending_turn_steers` so an attributed
     /// steer failure can re-stage it (the text must never be lost).
     fn try_steer_live_turn(&mut self, prompt: &str) -> Option<AppUiCommand> {
-        // Steering is OPT-IN (`steer_mid_turn` config / --steer-mid-turn).
-        // The default answers "what does Enter mean while the agent works?"
-        // with FIFO: stage the prompt and run it as its OWN turn after the
-        // current one finishes, in the order typed. A steer is delivered as
-        // a bare user message into the RUNNING loop, and the model treats
-        // the newest instruction as superseding the work in progress — an
-        // effective interrupt-and-pivot. Right tool for a course
-        // correction; wrong default for "also do this next".
-        if !self.state.steer_mid_turn {
+        // Enter steers by default; Tab explicitly queues. Unsupported servers
+        // retain FIFO behavior, and a saved /steer off preference is respected.
+        if !self.state.steer_mid_turn || !Self::image_media_from_prompt(prompt).is_empty() {
             return None;
         }
         if self.state.readonly {
@@ -1360,6 +1387,7 @@ impl Store {
                     },
                 );
                 let open = AppUiCommand::OpenSession(octos_core::ui_protocol::SessionOpenParams {
+                    client_commands: None,
                     session_id,
                     topic: None,
                     profile_id: Some(entry.profile_id.clone()),
@@ -1406,6 +1434,7 @@ impl Store {
         .into_owned();
         Some(AppUiCommand::OpenSession(
             octos_core::ui_protocol::SessionOpenParams {
+                client_commands: None,
                 session_id,
                 topic: None,
                 profile_id: Some(result.profile_id),
@@ -1470,6 +1499,7 @@ impl Store {
         self.state.status = t!("status.peer_staged_by_agent", slug = display_name).into_owned();
         Some(AppUiCommand::OpenSession(
             octos_core::ui_protocol::SessionOpenParams {
+                client_commands: None,
                 session_id,
                 topic: None,
                 profile_id: Some(event.profile_id),
@@ -1694,6 +1724,7 @@ impl Store {
         let slug = self.peer_slug_for_key(&session_id);
         self.state.status = t!("status.peer_started", slug = slug).into_owned();
         Some(AppUiCommand::SubmitPrompt(TurnStartParams {
+            origin: None,
             // Ordinary chat turn: context-scoped tools stay unadvertised.
             tool_context: None,
             session_id,
@@ -2132,7 +2163,61 @@ impl Store {
         use crate::autonomy::AgentsCommand;
         let session_id = self.active_autonomy_session_id()?;
         match cmd {
+            AgentsCommand::Leader(agent_id) => {
+                if !self.require_mutating_appui_method(crate::workspace_team::LEADER) {
+                    return None;
+                }
+                let Some(team) = self.state.workspace_teams.get(&session_id) else {
+                    self.state.status = t!("workspace_team.list_first").into_owned();
+                    return None;
+                };
+                Some(AppUiCommand::WorkspaceTeam(
+                    crate::workspace_team::Command::Leader {
+                        session_id,
+                        agent_id,
+                        expected_revision: team.revision,
+                    },
+                ))
+            }
+            AgentsCommand::Message { agent_id, text } => {
+                if !self.require_mutating_appui_method(crate::workspace_team::MESSAGE) {
+                    return None;
+                }
+                Some(AppUiCommand::WorkspaceTeam(
+                    crate::workspace_team::Command::Message {
+                        session_id,
+                        agent_id: Some(agent_id),
+                        message: text,
+                        broadcast: false,
+                        occurrence_id: crate::workspace_team::occurrence(),
+                    },
+                ))
+            }
+            AgentsCommand::Broadcast(text) => {
+                if !self.require_mutating_appui_method(crate::workspace_team::MESSAGE) {
+                    return None;
+                }
+                Some(AppUiCommand::WorkspaceTeam(
+                    crate::workspace_team::Command::Message {
+                        session_id,
+                        agent_id: None,
+                        message: text,
+                        broadcast: true,
+                        occurrence_id: crate::workspace_team::occurrence(),
+                    },
+                ))
+            }
             AgentsCommand::List => {
+                if self
+                    .state
+                    .capabilities
+                    .as_ref()
+                    .is_some_and(|caps| caps.supports_method(crate::workspace_team::LIST))
+                {
+                    return Some(AppUiCommand::WorkspaceTeam(
+                        crate::workspace_team::Command::List { session_id },
+                    ));
+                }
                 if !self.require_appui_method(crate::model::APPUI_METHOD_AGENT_LIST) {
                     return None;
                 }
@@ -2575,6 +2660,19 @@ impl Store {
             .and_then(|session| session.profile_id.clone())
     }
 
+    /// Profile to stamp on a freshly created [`SessionView`] for `session_id`
+    /// when no server-supplied `active_profile_id` is available (the resume /
+    /// hydrate paths). A profiled key (`{profile}:{channel}:{chat}`) carries
+    /// its own immutable profile dimension — that IS the session's profile,
+    /// regardless of which session is currently active; only profile-less
+    /// keys fall back to the active session's profile.
+    fn profile_stamp_for_session_key(&self, session_id: &SessionKey) -> Option<String> {
+        session_id
+            .profile_id()
+            .map(str::to_owned)
+            .or_else(|| self.active_session_profile_id())
+    }
+
     /// Returns the cached goal record IFF the goal is in a state the
     /// TUI is allowed to transition. Per UPCR-2026-021 the model owns
     /// the `complete` transition — the TUI must not reactivate a
@@ -2787,11 +2885,11 @@ impl Store {
             // reorder handling exists — so mirror SaveKeymap's explicit
             // not-wired wording instead of claiming "layout selected".
             LocalAction::SaveStatusLine(_) => {
-                self.state.status = "Status line layout save is not wired yet".into();
+                self.state.status = t!("status.statusline_save_not_wired").into_owned();
                 None
             }
             LocalAction::SaveTerminalTitle(_) => {
-                self.state.status = "Terminal title layout save is not wired yet".into();
+                self.state.status = t!("status.terminal_title_save_not_wired").into_owned();
                 None
             }
             LocalAction::SaveKeymap => {
@@ -2954,7 +3052,10 @@ impl Store {
                     // `ProtocolAppUiBackend::fill_session_list_cwd`) so a
                     // server with per-project session storage scopes the
                     // listing to this project.
-                    Some(AppUiCommand::ListSessions(SessionListParams { cwd: None }))
+                    Some(AppUiCommand::ListSessions(SessionListParams {
+                        profile_id: None,
+                        cwd: None,
+                    }))
                 } else if !self.state.resume_list_loaded {
                     // `/resume <query>` before the list ever loaded: the local
                     // resolve below would ALWAYS fail (`resume_sessions` is only
@@ -2972,7 +3073,10 @@ impl Store {
                     // `ProtocolAppUiBackend::fill_session_list_cwd`) so a
                     // server with per-project session storage scopes the
                     // listing to this project.
-                    Some(AppUiCommand::ListSessions(SessionListParams { cwd: None }))
+                    Some(AppUiCommand::ListSessions(SessionListParams {
+                        profile_id: None,
+                        cwd: None,
+                    }))
                 } else {
                     // `/resume <query>` shortcut: resolve to a session id
                     // (exact / prefix / substring) and switch directly, reusing
@@ -2980,17 +3084,18 @@ impl Store {
                     match self.resolve_resume_session(arg) {
                         ResumeResolution::Resolved(id) => self.resume_session_command(id),
                         ResumeResolution::Ambiguous(ids) => {
-                            self.state.status = format!(
-                                "\"{arg}\" matches {} sessions ({}); type more of the id to pick one.",
-                                ids.len(),
-                                ids.join(", ")
-                            );
+                            self.state.status = t!(
+                                "status.resume_ambiguous",
+                                query = arg,
+                                count = ids.len(),
+                                ids = ids.join(", ")
+                            )
+                            .into_owned();
                             None
                         }
                         ResumeResolution::NoMatch => {
-                            self.state.status = format!(
-                                "No prior session matches \"{arg}\"; run /resume with no argument to browse."
-                            );
+                            self.state.status =
+                                t!("status.resume_no_match", query = arg).into_owned();
                             None
                         }
                     }
@@ -3004,8 +3109,7 @@ impl Store {
                 // status line and open no menu — covers both the picker and the
                 // `/rewind <n>` inline shortcut.
                 if self.state.active_turn().is_some() {
-                    self.state.status =
-                        "Finish or stop the active turn before rewinding the conversation.".into();
+                    self.state.status = t!("status.rewind_active_turn").into_owned();
                     None
                 } else if arg.is_empty() {
                     // No fetch needed: the user turns are already in the local
@@ -3117,10 +3221,16 @@ impl Store {
         // kind/message, not the request's profile id.
         self.state.onboarding.profile_id = Some(id.to_owned());
         let cwd = self.current_switch_cwd();
-        let session_id = octos_core::SessionKey::with_profile_topic(id, "local", "tui", "coding");
+        let session_id = octos_core::SessionKey::with_profile_topic(
+            id,
+            "local",
+            "tui",
+            self.workspace_launch_topic(),
+        );
         self.state.status = t!("status.switching_profile", profile = id.to_string()).into_owned();
         Some(AppUiCommand::OpenSession(
             octos_core::ui_protocol::SessionOpenParams {
+                client_commands: None,
                 session_id,
                 topic: None,
                 profile_id: Some(id.to_owned()),
@@ -3317,7 +3427,7 @@ impl Store {
         {
             self.state.switch_selected_session(index);
         } else {
-            let profile_id = self.active_session_profile_id();
+            let profile_id = self.profile_stamp_for_session_key(&session_id);
             self.state.sessions.push(SessionView {
                 id: session_id.clone(),
                 title: session_id.0.clone(),
@@ -3333,7 +3443,8 @@ impl Store {
         // were left queued when a terminal fired while another session was
         // active) — drain them now that it is active again.
         self.enqueue_staged_drain_after_switch();
-        self.state.status = format!("Resuming {}…", session_id.0);
+        self.state.status =
+            t!("status.resuming_session", session = session_id.0.clone()).into_owned();
         // OUTER_LOOP_REVIEW #12: an in-flight hydrate (e.g. the `session/opened`
         // dispatch) already fetches this same transcript — skip the duplicate.
         if !self.state.hydrate_in_flight.insert(session_id.clone()) {
@@ -3414,8 +3525,7 @@ impl Store {
         prefill: String,
     ) -> Option<AppUiCommand> {
         if self.state.active_turn().is_some() {
-            self.state.status =
-                "Finish or stop the active turn before rewinding the conversation.".into();
+            self.state.status = t!("status.rewind_active_turn").into_owned();
             return None;
         }
         let Some(session_id) = self
@@ -3423,11 +3533,11 @@ impl Store {
             .active_session()
             .map(|session| session.id.clone())
         else {
-            self.state.status = "No active session to rewind.".into();
+            self.state.status = t!("status.rewind_no_active_session").into_owned();
             return None;
         };
         if session_id.0 != picked_session_id {
-            self.state.status = "Rewind pick belongs to another session — reopen /rewind.".into();
+            self.state.status = t!("status.rewind_wrong_session").into_owned();
             return None;
         }
         let fresh_rows = self.collect_rewind_turns();
@@ -3435,11 +3545,11 @@ impl Store {
             .get((num_turns as usize).saturating_sub(1))
             .is_some_and(|row| row.prefill == prefill);
         if !pick_is_current {
-            self.state.status = "Transcript changed — reopen /rewind.".into();
+            self.state.status = t!("status.rewind_transcript_changed").into_owned();
             return None;
         }
         self.state.pending_rewind_prefill = Some((session_id.clone(), prefill));
-        self.state.status = format!("Rewinding {num_turns} turn(s)…");
+        self.state.status = t!("status.rewinding", count = num_turns).into_owned();
         Some(AppUiCommand::SessionRollback(SessionRollbackParams {
             session_id,
             num_turns,
@@ -3455,21 +3565,23 @@ impl Store {
     /// (the exact same path as a picker pick, so its guards apply too).
     fn rewind_inline_command(&mut self, arg: &str) -> Option<AppUiCommand> {
         let Ok(n) = arg.parse::<u32>() else {
-            self.state.status =
-                format!("/rewind expects a checkpoint number like /rewind 2 (got \"{arg}\").");
+            self.state.status = t!("status.rewind_invalid_checkpoint", value = arg).into_owned();
             return None;
         };
         if n == 0 {
-            self.state.status = "/rewind needs a checkpoint of 1 or more.".into();
+            self.state.status = t!("status.rewind_checkpoint_min").into_owned();
             return None;
         }
         // Validate against the CURRENT transcript, not a stale snapshot.
         let rows = self.collect_rewind_turns();
         let turn_count = rows.len();
         let Some(row) = rows.get((n as usize) - 1) else {
-            self.state.status = format!(
-                "/rewind {n} is out of range — this session has {turn_count} checkpoint(s)."
-            );
+            self.state.status = t!(
+                "status.rewind_checkpoint_out_of_range",
+                checkpoint = n,
+                count = turn_count
+            )
+            .into_owned();
             return None;
         };
         let num_turns = row.num_turns;
@@ -3479,7 +3591,7 @@ impl Store {
             .active_session()
             .map(|session| session.id.0.clone())
         else {
-            self.state.status = "No active session to rewind.".into();
+            self.state.status = t!("status.rewind_no_active_session").into_owned();
             return None;
         };
         self.rewind_to_turn_command(session_id, num_turns, prefill)
@@ -3550,11 +3662,7 @@ impl Store {
             self.state.status = t!("saveconfig.no_path").into_owned();
             return;
         };
-        let scroll_mode = if self.state.pinned_scroll {
-            crate::cli::ScrollMode::Pinned
-        } else {
-            crate::cli::ScrollMode::Native
-        };
+        let scroll_mode = self.state.scroll_mode;
         let lang =
             crate::cli::Lang::from_env_value(&rust_i18n::locale()).unwrap_or(crate::cli::Lang::En);
         match crate::cli::save_ui_settings(
@@ -3629,25 +3737,30 @@ impl Store {
     }
 
     /// `/scrollmode` — runtime switch of the wheel-scroll model. Bare command
-    /// toggles; `native`/`pinned` set explicitly. Mouse capture follows on the
-    /// next frame (the draw loop re-syncs capture from `wants_mouse_capture`).
+    /// toggles sticky/native; all three modes can be set explicitly. Mouse
+    /// capture follows on the next frame (re-synced by `wants_mouse_capture`).
     fn dispatch_set_scrollmode(&mut self, inline_args: &str) {
         let arg = inline_args.trim().to_ascii_lowercase();
-        let pinned = match arg.as_str() {
-            "" => !self.state.pinned_scroll,
-            "pinned" | "pin" => true,
-            "native" | "default" => false,
+        use crate::cli::ScrollMode;
+        let mode = match arg.as_str() {
+            "" if self.state.scroll_mode == ScrollMode::Native => ScrollMode::Sticky,
+            "" | "native" => ScrollMode::Native,
+            "pinned" | "pin" => ScrollMode::Pinned,
+            "sticky" => ScrollMode::Sticky,
+            "default" => ScrollMode::default(),
             other => {
                 self.state.status =
                     t!("scrollmode.unknown", value = other.to_string()).into_owned();
                 return;
             }
         };
-        self.state.pinned_scroll = pinned;
-        self.state.status = if pinned {
-            t!("scrollmode.set_pinned").into_owned()
-        } else {
-            t!("scrollmode.set_native").into_owned()
+        self.state.scroll_mode = mode;
+        self.state.exit_transcript_pager();
+        self.state.question_detail = Default::default();
+        self.state.status = match mode {
+            ScrollMode::Pinned => t!("scrollmode.set_pinned").into_owned(),
+            ScrollMode::Native => t!("scrollmode.set_native").into_owned(),
+            ScrollMode::Sticky => t!("scrollmode.set_sticky").into_owned(),
         };
     }
 
@@ -4988,6 +5101,38 @@ impl Store {
         Some(AppUiCommand::ProfileLlmFetchModels(params))
     }
 
+    /// Gate every provider SAVE on a resolved profile id.
+    ///
+    /// `profile_id` is `skip_serializing_if = "Option::is_none"`, so an
+    /// unresolved profile drops the field off the wire entirely. The server
+    /// then defaults it to `MAIN_PROFILE_ID` (`_main`) — an id its own profile
+    /// store cannot persist, because the slug validator accepts only
+    /// `[a-z0-9-]` and the leading underscore fails it. The save comes back as
+    /// `-32603 … profile ID must contain only lowercase letters, digits, and
+    /// hyphens`, which names nothing the operator can act on, and onboarding is
+    /// stuck: "Continue to Workspace" is gated on a saved provider.
+    ///
+    /// Test/fetch_models deliberately are NOT gated: they never reach the
+    /// profile store, so they work unscoped and are useful before a profile
+    /// exists.
+    ///
+    /// Presence is NOT sufficient. `profile/llm/list` reports the server's
+    /// RUNTIME identity, so a response naming `_main` seeds the onboarding
+    /// cache and `current_profile_for_onboarding` starts returning
+    /// `Some("_main")`. That is a real thing to run under but not a persistable
+    /// profile, and a write naming it fails the same slug validator as the
+    /// omitted-field case. Gate on persistability at the write boundary.
+    fn onboarding_profile_id_is_resolved(&mut self, profile_id: Option<&str>) -> bool {
+        if profile_id.is_some_and(is_persistable_profile_id) {
+            return true;
+        }
+        let message = t!("status.onboarding_profile_unresolved").into_owned();
+        self.state.onboarding.last_message = Some(message.clone());
+        self.state.status = message;
+        self.refresh_active_menu_if_open();
+        false
+    }
+
     fn onboarding_save_provider_command(&mut self) -> Option<AppUiCommand> {
         // Route on the PERSISTENT lane intent: bare `/research add` sets
         // `research_lane_intent`, which survives staged-input edits (unlike the
@@ -5013,6 +5158,9 @@ impl Store {
             self.state.status = t!("status.onboarding_provider_selection_incomplete").into_owned();
             return None;
         };
+        if !self.onboarding_profile_id_is_resolved(params.profile_id.as_deref()) {
+            return None;
+        }
         if let OnboardingKeyGate::Blocked(command) =
             self.onboarding_require_api_key("status.onboarding_api_key_empty_onboard")
         {
@@ -5092,6 +5240,12 @@ impl Store {
             self.state.status = t!("status.onboarding_provider_selection_incomplete").into_owned();
             return None;
         };
+        // `profile/sub_providers/upsert` resolves its profile through the same
+        // server-side `_main` default and ends in the same `save_with_merge`,
+        // so an unresolved profile fails identically here.
+        if !self.onboarding_profile_id_is_resolved(params.profile_id.as_deref()) {
+            return None;
+        }
         // Pop the picker so the wizard beneath shows the pending save spinner.
         self.close_menu();
         self.state.onboarding.last_message = Some(t!("status.saving_provider").into_owned());
@@ -5122,6 +5276,9 @@ impl Store {
             self.state.status = t!("status.onboarding_fallback_selection_incomplete").into_owned();
             return None;
         };
+        if !self.onboarding_profile_id_is_resolved(params.profile_id.as_deref()) {
+            return None;
+        }
         if let OnboardingKeyGate::Blocked(command) =
             self.onboarding_require_api_key("status.onboarding_api_key_empty_provider")
         {
@@ -5261,10 +5418,12 @@ impl Store {
         {
             self.state.workspace.root = canonical.clone();
         }
+        let topic = self.workspace_launch_topic();
         let session_id =
-            octos_core::SessionKey::with_profile_topic(&profile_id, "local", "tui", "coding");
+            octos_core::SessionKey::with_profile_topic(&profile_id, "local", "tui", topic);
         self.state.status = t!("status.opening_coding_session", profile = profile_id).into_owned();
         Some(AppUiCommand::OpenSession(SessionOpenParams {
+            client_commands: None,
             session_id,
             topic: None,
             profile_id: Some(profile_id),
@@ -5370,14 +5529,13 @@ impl Store {
             self.refresh_active_menu_if_open();
             return;
         }
-        let canonical = std::fs::canonicalize(&path)
-            .map(|canonical| canonical.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| target.clone());
-        // Reject obvious root-escape attempts: a workspace MUST NOT
-        // be `/`, the user's home root, or contain `..` after
-        // canonicalisation. The backend will re-validate but the
-        // TUI should reject the worst cases up front.
-        if canonical == "/" || canonical.is_empty() {
+        let canonical_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let canonical = canonical_path.to_string_lossy().into_owned();
+        // Reject filesystem roots structurally instead of comparing with `/`:
+        // Windows canonicalizes a drive root to a path such as `\\?\C:\`.
+        // The backend will re-validate, but the TUI should reject this broad
+        // scope up front on every supported platform.
+        if canonical_path.as_os_str().is_empty() || canonical_path.parent().is_none() {
             self.state.onboarding.workspace_validation =
                 crate::model::OnboardingWorkspaceValidation::Invalid {
                     reason: t!("status.workspace_cannot_be_root").into_owned(),
@@ -5713,7 +5871,7 @@ impl Store {
             }
         }
         if let Some(frame) = self.state.menu_stack.active() {
-            self.state.status = format!("Menu: {}", frame.id);
+            self.state.status = t!("status.menu_label", id = frame.id.to_string()).into_owned();
         }
     }
 
@@ -6096,10 +6254,24 @@ impl Store {
 
     fn run_onboarding_doctor(&mut self) {
         let report = self.onboarding_doctor_report();
+        let outcome_label = |outcome: &crate::model::OnboardingDoctorOutcome| match outcome {
+            crate::model::OnboardingDoctorOutcome::Pass { .. } => {
+                t!("status.doctor_outcome.pass").into_owned()
+            }
+            crate::model::OnboardingDoctorOutcome::Warn { .. } => {
+                t!("status.doctor_outcome.warn").into_owned()
+            }
+            crate::model::OnboardingDoctorOutcome::Fail { .. } => {
+                t!("status.doctor_outcome.fail").into_owned()
+            }
+            crate::model::OnboardingDoctorOutcome::Skipped { .. } => {
+                t!("status.doctor_outcome.skip").into_owned()
+            }
+        };
         let summary_line = report
             .checks
             .iter()
-            .map(|check| format!("{}: {}", check.id, check.outcome.label()))
+            .map(|check| format!("{}: {}", check.id, outcome_label(&check.outcome)))
             .collect::<Vec<_>>()
             .join(" · ");
         self.state.status =
@@ -6122,7 +6294,8 @@ impl Store {
                 crate::model::OnboardingDoctorOutcome::Fail { .. } => ActivityKind::Error,
             };
             self.state.push_activity(
-                ActivityItem::new(kind, check.id, check.outcome.label()).with_detail(detail),
+                ActivityItem::new(kind, check.id, outcome_label(&check.outcome))
+                    .with_detail(detail),
             );
         }
         self.refresh_active_menu_if_open();
@@ -6340,10 +6513,22 @@ impl Store {
             theme_name: Some(self.state.theme.as_str()),
             selected_path: &path,
         };
-        let result = filter_menu_result_for_search(
-            core_menu_registry().build(&frame.id, &ctx),
-            &frame.search_query,
-        );
+        let build = if frame.id.as_str() == crate::workspace_team::MENU {
+            self.state
+                .active_session()
+                .and_then(|session| self.state.workspace_teams.get(&session.id))
+                .map(|team| crate::workspace_team::menu(team, self.state.readonly))
+                .unwrap_or_else(|| {
+                    MenuBuildResult::Unavailable(crate::menu::MenuStatusSpec::new(
+                        crate::workspace_team::MENU,
+                        "Workspace agents",
+                        "Run /agents to refresh this session's team.",
+                    ))
+                })
+        } else {
+            core_menu_registry().build(&frame.id, &ctx)
+        };
+        let result = filter_menu_result_for_search(build, &frame.search_query);
         let len = active_menu_item_len(Some(&result));
         if len > 0
             && let Some(frame) = self.state.menu_stack.active_mut()
@@ -6473,6 +6658,7 @@ impl Store {
             mcp_config_catalog: self.state.mcp_config_catalog.as_ref(),
             tool_config_catalog: self.state.tool_config_catalog.as_ref(),
             onboarding: Some(&self.state.onboarding),
+            workspace_launch_topic: Some(self.workspace_launch_topic()),
             selected_session_id: selected_session.map(|session| &session.id),
             selected_session_title: selected_session.map(|session| session.title.as_str()),
             selected_task_title: selected_task.map(|task| task.title.as_str()),
@@ -6488,7 +6674,7 @@ impl Store {
                     )
                 })
                 .count(),
-            pinned_scroll: self.state.pinned_scroll,
+            scroll_mode: self.state.scroll_mode,
             resume_sessions: &self.state.resume_sessions,
             resume_list_loaded: self.state.resume_list_loaded,
             rewind_turns: &self.state.rewind_turns,
@@ -6934,6 +7120,7 @@ impl Store {
             self.state.status = t!("status.images_attached", count = media.len()).into_owned();
         }
         Some(AppUiCommand::SubmitPrompt(TurnStartParams {
+            origin: None,
             // Ordinary chat turn: context-scoped tools stay unadvertised.
             tool_context: None,
             session_id,
@@ -6991,7 +7178,27 @@ impl Store {
             return None;
         }
 
-        let command = self.interrupt_command();
+        self.send_pending_now_command()
+    }
+
+    pub fn send_pending_now_command(&mut self) -> Option<AppUiCommand> {
+        let (session_id, turn_id) = self.state.active_turn()?;
+        if self.state.turn_locally_interrupted(session_id, turn_id)
+            || self
+                .state
+                .pending_turn_steers
+                .iter()
+                .any(|s| &s.session_id == session_id)
+            || !(self.state.has_pending_messages()
+                || self
+                    .state
+                    .retained_steers
+                    .iter()
+                    .any(|s| &s.session_id == session_id && &s.turn_id == turn_id))
+        {
+            return None;
+        }
+        let command = self.interrupt_with_restore(false);
         if command.is_some() {
             self.state.status = t!("status.interrupt_staged_submit").into_owned();
         }
@@ -6999,6 +7206,10 @@ impl Store {
     }
 
     pub fn interrupt_command(&mut self) -> Option<AppUiCommand> {
+        self.interrupt_with_restore(true)
+    }
+
+    fn interrupt_with_restore(&mut self, restore_prompt: bool) -> Option<AppUiCommand> {
         let Some((session_id, turn_id)) = self
             .state
             .active_turn()
@@ -7015,6 +7226,12 @@ impl Store {
             return None;
         };
 
+        if !restore_prompt {
+            self.state
+                .pending_interrupt_restores
+                .retain(|pending| pending.session_id != session_id || pending.turn_id != turn_id);
+        }
+
         // A user Esc/Ctrl+C is a "stop and let me edit/resend" gesture, so the
         // interrupted turn's prompt comes back to the composer — but only once
         // the turn actually SETTLES (its terminal arrives), not here at
@@ -7029,7 +7246,8 @@ impl Store {
         // typed (the apply site re-checks). This is the single user-initiated
         // interrupt chokepoint (both Esc and Ctrl+C route here), so the stash
         // is always user-driven; genuine turn errors never arm it.
-        if self.state.composer.is_empty()
+        if restore_prompt
+            && self.state.composer.is_empty()
             && let Some(prompt) = self.state.submitted_prompt_for_turn(&session_id, &turn_id)
             && !prompt.trim().is_empty()
         {
@@ -7403,6 +7621,14 @@ impl Store {
         }
     }
 
+    /// A decision taking keyboard focus must also enter the visible pane.
+    fn reveal_pending_decision(&mut self) {
+        self.state.diff_preview.expanded = false;
+        if self.state.scroll_mode == crate::cli::ScrollMode::Sticky {
+            self.state.scroll_transcript_to_latest();
+        }
+    }
+
     pub fn show_pending_approval(&mut self) -> bool {
         let title = {
             let Some(approval) = self.state.approval.as_mut() else {
@@ -7418,7 +7644,7 @@ impl Store {
         // overlays, yet takes key priority over all of them — an expanded
         // diff overlay left up would cover the very dialog now receiving
         // approve/deny keys. Collapse it (keep the preview open inline).
-        self.state.diff_preview.expanded = false;
+        self.reveal_pending_decision();
         self.state.approval_auto_open = true;
         self.state.focus = FocusPane::Composer;
         self.state.status = t!("status.approval_shown", title = title).into_owned();
@@ -7608,7 +7834,7 @@ impl Store {
         // Same as `show_pending_approval`: the picker takes key priority over
         // the expanded diff overlay but renders beneath it — collapse the
         // overlay so the user answers a dialog they can actually see.
-        self.state.diff_preview.expanded = false;
+        self.reveal_pending_decision();
         self.state.user_question_auto_open = true;
         self.state.focus = FocusPane::Composer;
         self.state.status = t!("status.question_shown", title = title).into_owned();
@@ -8693,6 +8919,45 @@ impl Store {
                 self.refresh_active_menu_if_open();
                 self.tool_config_list_command()
             }
+            ClientEvent::WorkspaceTeamUpdated(team) => {
+                self.state
+                    .workspace_teams
+                    .insert(team.session_id.clone(), team);
+                self.refresh_active_menu_if_open();
+                None
+            }
+            ClientEvent::WorkspaceTeam(team) => {
+                let active = self
+                    .state
+                    .active_session()
+                    .is_some_and(|s| s.id == team.session_id);
+                self.state
+                    .workspace_teams
+                    .insert(team.session_id.clone(), team);
+                if active {
+                    self.open_menu(MenuId::from(crate::workspace_team::MENU));
+                }
+                None
+            }
+            ClientEvent::WorkspaceMessage(result) => {
+                self.state.status = result
+                    .receipts
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "{}: {}{}",
+                            r.agent_id,
+                            r.status,
+                            r.error
+                                .as_ref()
+                                .map(|e| format!(" ({e})"))
+                                .unwrap_or_default()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                None
+            }
             ClientEvent::Autonomy(event) => self.apply_autonomy_result(event),
             ClientEvent::LocalShellResult(event) => {
                 self.apply_local_shell_result(event);
@@ -9419,7 +9684,7 @@ impl Store {
                 // scroll mode (otherwise a launch `--scroll-mode`/`/scrollmode`
                 // reverts to native).
                 let config_path = self.state.config_path.clone();
-                let pinned_scroll = self.state.pinned_scroll;
+                let scroll_mode = self.state.scroll_mode;
                 // Local-only Vim editing settings the server never echoes: the
                 // launch/runtime vim toggle and the current Normal/Insert mode
                 // (otherwise a reconnect drops you out of Vim mid-edit).
@@ -9541,7 +9806,7 @@ impl Store {
                 state.session_reasoning_display = session_reasoning_display;
                 state.theme = theme;
                 state.config_path = config_path;
-                state.pinned_scroll = pinned_scroll;
+                state.scroll_mode = scroll_mode;
                 state.vim_mode = vim_mode;
                 state.composer_mode = composer_mode;
                 state.resume_sessions = resume_sessions;
@@ -10309,11 +10574,27 @@ impl Store {
         }
     }
 
+    /// Every fresh launch route shares the same per-client conversation identity.
+    /// Explicit history/resume targets bypass this choice.
+    fn workspace_launch_topic(&self) -> &str {
+        if self
+            .state
+            .capabilities
+            .as_ref()
+            .is_some_and(|caps| caps.supports_method(crate::workspace_team::LIST))
+        {
+            self.state.workspace_launch_topic.as_str()
+        } else {
+            "coding"
+        }
+    }
+
     /// Build the `session/open` command for a launch-resolved profile, attaching
     /// the workspace cwd so the session lands in this folder's per-project store.
     fn open_resolved_launch_session(&mut self, profile_id: String) -> Option<AppUiCommand> {
+        let topic = self.workspace_launch_topic();
         let session_id =
-            octos_core::SessionKey::with_profile_topic(&profile_id, "local", "tui", "coding");
+            octos_core::SessionKey::with_profile_topic(&profile_id, "local", "tui", topic);
         // Preserve the target across a rejected `session/open`; AppUiError does
         // not carry request params, and profile-unconfigured recovery needs the
         // id to open model setup for the correct profile.
@@ -10325,6 +10606,7 @@ impl Store {
         .into_owned();
         Some(AppUiCommand::OpenSession(
             octos_core::ui_protocol::SessionOpenParams {
+                client_commands: None,
                 session_id,
                 topic: None,
                 profile_id: Some(profile_id),
@@ -10366,11 +10648,10 @@ impl Store {
             .iter_mut()
             .find(|status| status.session_id == session_id)
         {
-            // A startup-pinned profile accepted the persisted selection but
-            // did not rebuild its live provider chain. Keep the footer on the
-            // effective model until reconnect instead of claiming the saved
-            // model is already serving this session.
-            if !result.restart_required {
+            // Persistence alone does not mean the runtime changed. Older
+            // servers may save the default but keep serving the boot model.
+            if !result.restart_required && result.runtime_disposition.as_deref() == Some("reloaded")
+            {
                 status.model = Some(result.selected.clone());
                 if let Some(stamp) = result.runtime_policy_stamp.clone() {
                     status.runtime_policy_stamp = Some(stamp);
@@ -10378,6 +10659,7 @@ impl Store {
             }
         }
         if !result.restart_required
+            && result.runtime_disposition.as_deref() != Some("restart_required")
             && let Some(catalog) = self
                 .state
                 .session_model_catalogs
@@ -10386,10 +10668,13 @@ impl Store {
         {
             for model in &mut catalog.models {
                 model.selected = model.model == result.selected.model
-                    && model.provider == result.selected.provider;
+                    && model.provider == result.selected.provider
+                    && model.route == result.selected.route;
             }
             if !catalog.models.iter().any(|model| {
-                model.model == result.selected.model && model.provider == result.selected.provider
+                model.model == result.selected.model
+                    && model.provider == result.selected.provider
+                    && model.route == result.selected.route
             }) {
                 catalog.models.push(result.selected);
             }
@@ -10468,10 +10753,11 @@ impl Store {
                 rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
                 let count = rows.len();
                 self.state.resume_sessions = rows;
-                self.state.status = format!("Loaded {count} prior session(s) for /resume.");
+                self.state.status = t!("status.resume_loaded", count = count).into_owned();
             }
             Err(err) => {
-                self.state.status = format!("Could not parse the session list: {err}");
+                self.state.status =
+                    t!("status.resume_parse_failed", error = err.to_string()).into_owned();
             }
         }
     }
@@ -10543,7 +10829,7 @@ impl Store {
                     });
             }
         }
-        self.state.status = format!("Rewound {dropped} turn(s) — edit and resend");
+        self.state.status = t!("status.rewind_complete", count = dropped).into_owned();
     }
 
     /// Finalize a hydrated turn the server reports TERMINAL that is still latched
@@ -10643,15 +10929,29 @@ impl Store {
         session: &SessionKey,
         turn: TurnId,
     ) -> Option<AppUiCommand> {
+        // The stale reply answers the in-flight hydrate (dispatch is deduped
+        // per session, so at most one is outstanding), but this branch
+        // early-returns before `apply_session_hydrate_result` clears its
+        // marker — release it here. While it stays armed, the refresh below
+        // (and every later hydrate on this connection) is dedup-rejected and
+        // the session strands until an unrelated path clears the set.
+        self.state.hydrate_in_flight.remove(session);
         let command = self.hydrate_session_state_command(session)?;
         let epoch = self.state.connection_epoch;
         self.state
             .stale_hydrate_refreshes
             .retain(|(_, _, recorded_epoch)| *recorded_epoch == epoch);
-        self.state
+        if !self
+            .state
             .stale_hydrate_refreshes
             .insert((session.clone(), turn, epoch))
-            .then_some(command)
+        {
+            // The once-guard already fired for this turn: drop the duplicate
+            // refresh and the marker it just armed.
+            self.state.hydrate_in_flight.remove(session);
+            return None;
+        }
+        Some(command)
     }
 
     fn apply_session_hydrate_result(
@@ -10751,7 +11051,7 @@ impl Store {
                     self.state.sessions.push(SessionView {
                         id: session_id.clone(),
                         title: session_id.0.clone(),
-                        profile_id: self.active_session_profile_id(),
+                        profile_id: self.profile_stamp_for_session_key(&session_id),
                         messages,
                         tasks: Vec::new(),
                         live_reply: None,
@@ -10909,6 +11209,7 @@ impl Store {
                         completed_at: active_turn.completed_at,
                         thread_id: active_turn.thread_id.clone(),
                         committed_seqs: Vec::new(),
+                        running: None,
                     });
             }
         }
@@ -10990,6 +11291,7 @@ impl Store {
             self.state.startup_prompt_dispatched = true;
             let turn_id = TurnId::new();
             let prompt_command = AppUiCommand::SubmitPrompt(TurnStartParams {
+                origin: None,
                 tool_context: None,
                 session_id: session_id.clone(),
                 turn_id,
@@ -11236,7 +11538,7 @@ impl Store {
             // A visible approval takes key priority over the expanded diff
             // overlay but renders beneath it — collapse the overlay so the
             // dialog receiving approve/deny keys is on screen.
-            self.state.diff_preview.expanded = false;
+            self.reveal_pending_decision();
         }
         self.state.approval = Some(approval);
         self.state.focus = FocusPane::Composer;
@@ -11297,7 +11599,7 @@ impl Store {
             // A visible question owns the keyboard before the expanded diff
             // overlay, but renders below it. Collapse the overlay so hydrate
             // cannot leave the user answering an invisible dialog.
-            self.state.diff_preview.expanded = false;
+            self.reveal_pending_decision();
         }
         self.state.user_question = Some(picker);
         self.state.focus = FocusPane::Composer;
@@ -11500,52 +11802,85 @@ impl Store {
     }
 
     fn apply_profile_llm_mutation_event(&mut self, event: ProfileLlmMutationClientEvent) {
-        let pending = self.state.onboarding.provider_pending.take();
-        let save_target = self.state.onboarding.provider_save_target.take();
+        let is_model_removal = event.kind == ProfileLlmMutationKind::Delete;
+        // Delete is an independent operation: do not consume a staged Test/Save
+        // if responses ever cross. Its explicit transport-level kind also means
+        // cancellation leftovers cannot make a later upsert look like a delete.
+        let pending = (!is_model_removal)
+            .then(|| self.state.onboarding.provider_pending.take())
+            .flatten();
+        let save_target = (!is_model_removal)
+            .then(|| self.state.onboarding.provider_save_target.take())
+            .flatten();
+        if is_model_removal {
+            self.state.onboarding.pending_model_removal = None;
+        }
         let staged_provider_label = self.state.onboarding.provider_label();
         let mut reset_staged_provider = false;
         if event.result.applied {
-            if profile_llm_list_has_provider_state(&event.result.to_list_result()) {
-                self.state.profile_llm_state = Some(event.result.to_list_result());
+            let list_result = event.result.to_list_result();
+            let primary_remains = list_result.primary_provider().is_some();
+            // Test responses may omit the provider list, so the ordinary path
+            // preserves the prior cache when the echo is empty. Delete results
+            // are authoritative even when the last model was removed and the
+            // returned list is empty.
+            if is_model_removal || profile_llm_list_has_provider_state(&list_result) {
+                self.state.profile_llm_state = Some(list_result);
             }
-            match pending {
-                Some(OnboardingProviderPending::Test) => {
-                    self.state.onboarding.provider_tested = true;
-                    // M22-E: a successful test clears any prior
-                    // failure reason so the menu does not surface
-                    // a stale "test failed" recovery line.
-                    self.state.onboarding.provider_test_failure_reason = None;
+            if is_model_removal {
+                // Server truth now owns whether a primary still exists. Drop
+                // local "last saved" hints when the primary was removed so
+                // re-adding its family/model/route is treated as a fresh draft.
+                // When a primary remains (for example after deleting a
+                // fallback), its server record remains authoritative.
+                self.state.onboarding.provider_saved = primary_remains;
+                self.state.onboarding.provider_tested = false;
+                if !primary_remains {
+                    self.state.onboarding.saved_primary_provider_label = None;
+                    self.state.onboarding.last_saved_provider_label = None;
+                    self.state.onboarding.last_saved_provider_target = None;
                 }
-                Some(OnboardingProviderPending::Save) => {
-                    match save_target.unwrap_or(OnboardingProviderSaveTarget::Primary) {
-                        OnboardingProviderSaveTarget::Primary => {
-                            self.state.onboarding.provider_saved = true;
-                            self.state.onboarding.provider_tested = true;
-                            self.state.onboarding.saved_primary_provider_label =
-                                Some(staged_provider_label.clone());
-                        }
-                        OnboardingProviderSaveTarget::Fallback
-                        | OnboardingProviderSaveTarget::ResearchLane => {
-                            self.state.onboarding.provider_tested = false;
-                            reset_staged_provider = true;
-                        }
+                self.state.onboarding.provider_test_failure_reason = None;
+            } else {
+                match pending {
+                    Some(OnboardingProviderPending::Test) => {
+                        self.state.onboarding.provider_tested = true;
+                        // M22-E: a successful test clears any prior
+                        // failure reason so the menu does not surface
+                        // a stale "test failed" recovery line.
+                        self.state.onboarding.provider_test_failure_reason = None;
                     }
-                    self.state.onboarding.last_saved_provider_label =
-                        Some(staged_provider_label.clone());
-                    self.state.onboarding.last_saved_provider_target =
-                        Some(save_target.unwrap_or(OnboardingProviderSaveTarget::Primary));
-                    self.state.onboarding.provider_test_failure_reason = None;
-                }
-                None => {
-                    self.state.onboarding.provider_saved = true;
-                    self.state.onboarding.provider_tested = true;
-                    self.state.onboarding.saved_primary_provider_label =
-                        Some(staged_provider_label.clone());
-                    self.state.onboarding.last_saved_provider_label =
-                        Some(staged_provider_label.clone());
-                    self.state.onboarding.last_saved_provider_target =
-                        Some(OnboardingProviderSaveTarget::Primary);
-                    self.state.onboarding.provider_test_failure_reason = None;
+                    Some(OnboardingProviderPending::Save) => {
+                        match save_target.unwrap_or(OnboardingProviderSaveTarget::Primary) {
+                            OnboardingProviderSaveTarget::Primary => {
+                                self.state.onboarding.provider_saved = true;
+                                self.state.onboarding.provider_tested = true;
+                                self.state.onboarding.saved_primary_provider_label =
+                                    Some(staged_provider_label.clone());
+                            }
+                            OnboardingProviderSaveTarget::Fallback
+                            | OnboardingProviderSaveTarget::ResearchLane => {
+                                self.state.onboarding.provider_tested = false;
+                                reset_staged_provider = true;
+                            }
+                        }
+                        self.state.onboarding.last_saved_provider_label =
+                            Some(staged_provider_label.clone());
+                        self.state.onboarding.last_saved_provider_target =
+                            Some(save_target.unwrap_or(OnboardingProviderSaveTarget::Primary));
+                        self.state.onboarding.provider_test_failure_reason = None;
+                    }
+                    None => {
+                        self.state.onboarding.provider_saved = true;
+                        self.state.onboarding.provider_tested = true;
+                        self.state.onboarding.saved_primary_provider_label =
+                            Some(staged_provider_label.clone());
+                        self.state.onboarding.last_saved_provider_label =
+                            Some(staged_provider_label.clone());
+                        self.state.onboarding.last_saved_provider_target =
+                            Some(OnboardingProviderSaveTarget::Primary);
+                        self.state.onboarding.provider_test_failure_reason = None;
+                    }
                 }
             }
             if reset_staged_provider {
@@ -12292,7 +12627,8 @@ impl Store {
                             text: String::new(),
                         });
                     }
-                    self.state.status = format!("Turn started in {}", session.title);
+                    self.state.status =
+                        t!("status.turn_started_in", session = session.title.clone()).into_owned();
                     // The connected child just vouched for this turn: stamp
                     // the latch with the current connection epoch so a later
                     // relaunch reconcile can tell it from a dead child's.
@@ -12430,10 +12766,12 @@ impl Store {
                         );
                         self.state.status = recovery;
                     } else {
-                        self.state.status = format!("Tool failed: {}", event.tool_name);
+                        self.state.status =
+                            t!("status.tool_failed", tool = event.tool_name.clone()).into_owned();
                     }
                 } else {
-                    self.state.status = format!("Tool completed: {}", event.tool_name);
+                    self.state.status =
+                        t!("status.tool_completed", tool = event.tool_name.clone()).into_owned();
                 }
                 None
             }
@@ -12485,7 +12823,7 @@ impl Store {
                     // A visible approval takes key priority over the expanded
                     // diff overlay but renders beneath it — collapse the
                     // overlay so approve/deny keys act on a visible dialog.
-                    self.state.diff_preview.expanded = false;
+                    self.reveal_pending_decision();
                 }
                 let diff_preview_id = approval.diff_preview_id();
                 let diff_preview_turn_id = approval.turn_id.clone();
@@ -12535,7 +12873,12 @@ impl Store {
                     .with_detail("protocol warning")
                     .with_session(event.session_id.clone()),
                 );
-                self.state.status = format!("Warning [{}]: {}", event.code, event.message);
+                self.state.status = t!(
+                    "status.warning_code_message",
+                    code = event.code,
+                    message = event.message
+                )
+                .into_owned();
                 None
             }
             UiNotification::ReasoningDelta(event) => {
@@ -12559,15 +12902,6 @@ impl Store {
             UiNotification::ReplayLossy(event) => self.apply_replay_lossy(event),
             UiNotification::TurnSpawnComplete(event) => self.apply_turn_spawn_complete(event),
             UiNotification::FileAttached(event) => self.apply_file_attached(event),
-            // A v1 server projects the SAME turn content as v2 — reply deltas
-            // and the turn terminal included — so discarding this arm silently
-            // stranded a whole turn: nothing rendered, the spinner never
-            // cleared, and the answer only appeared once a restart re-hydrated
-            // the session from the server. Lift it into the v2 shape and run
-            // the one handler instead of maintaining a second projection.
-            UiNotification::Envelope(event) => {
-                self.apply_envelope_v2(envelope_v1_as_v2(event), AssistantProjectionLane::V1)
-            }
             // Added by octos-core v2.0.3-rc.1; no client surface yet, so
             // drop it rather than guess at a rendering. (PeerClosed, added in
             // the same core rev, IS handled above by the peer console.)
@@ -12577,10 +12911,13 @@ impl Store {
             }
             UiNotification::SessionEventBridged(event) => self.apply_session_event_bridged(event),
             UiNotification::RouterStatus(event) => {
-                self.state.status = format!(
-                    "Router {} using {} ({})",
-                    event.mode, event.provider_name, event.session_id.0
-                );
+                self.state.status = t!(
+                    "status.router_status",
+                    mode = event.mode,
+                    provider = event.provider_name,
+                    session = event.session_id.0
+                )
+                .into_owned();
                 None
             }
             UiNotification::RouterFailover(event) => {
@@ -12592,14 +12929,15 @@ impl Store {
                         ))
                         .with_session(event.session_id.clone()),
                 );
-                self.state.status = format!("Router failover to {}", event.to_provider);
+                self.state.status =
+                    t!("status.router_failover", provider = event.to_provider).into_owned();
                 None
             }
             UiNotification::QueueState(event) => {
                 self.state.status = if event.pending_count == 0 {
-                    "Queue empty".into()
+                    t!("status.queue_empty").into_owned()
                 } else {
-                    format!("Queue pending: {}", event.pending_count)
+                    t!("status.queue_pending", count = event.pending_count).into_owned()
                 };
                 None
             }
@@ -12709,7 +13047,8 @@ impl Store {
                     Some(event.plan.clone()),
                     event.turn_id.clone(),
                 );
-                self.state.status = format!("Plan updated: {done}/{count} done");
+                self.state.status =
+                    t!("status.plan_updated", done = done, count = count).into_owned();
                 None
             }
             UiNotification::SessionGoalUpdated(event) => {
@@ -12832,18 +13171,6 @@ impl Store {
                 self.state
                     .pending_loop_attribution
                     .insert(event.session_id.clone());
-                self.state.push_activity(
-                    ActivityItem::new(ActivityKind::Progress, event.loop_id, status)
-                        .with_session(event.session_id.clone()),
-                );
-                None
-            }
-            UiNotification::LoopCompleted(event) => {
-                let status = event.status.clone().unwrap_or_else(|| "completed".into());
-                if let Some(loop_state) = event.loop_state.clone() {
-                    self.state
-                        .upsert_session_loop(&event.session_id, loop_state);
-                }
                 self.state.push_activity(
                     ActivityItem::new(ActivityKind::Progress, event.loop_id, status)
                         .with_session(event.session_id.clone()),
@@ -13092,6 +13419,9 @@ impl Store {
             // octos-core is ahead of this crate and added `VoiceExit`; handling
             // it here keeps the match exhaustive so the workspace compiles.)
             UiNotification::VoiceExit(_) => None,
+            // The TUI does not negotiate context.state.v1. Accept unsolicited
+            // progress snapshots without treating them as compaction events.
+            UiNotification::ContextStateReported(_) => None,
             // task-consume-turn-steer-dropped: the server hands back `turn/steer`
             // inputs it accepted but never drained. Only a matching retained
             // steer earns a re-stage — whoever consumes it first (this arm or
@@ -13956,7 +14286,12 @@ impl Store {
                     success,
                     duration_ms,
                 );
-                self.state.status = format!("Tool {label}: {tool_call_id}");
+                self.state.status = t!(
+                    "status.tool_lifecycle",
+                    state = label,
+                    id = tool_call_id.clone()
+                )
+                .into_owned();
                 None
             }
             PayloadV2::FileAttached {
@@ -13978,7 +14313,7 @@ impl Store {
                     item = item.with_tool_call(tool_call_id);
                 }
                 self.state.push_activity(item);
-                self.state.status = format!("File attached: {path}");
+                self.state.status = t!("status.file_attached", path = path).into_owned();
                 None
             }
             PayloadV2::TurnTerminal {
@@ -13990,6 +14325,7 @@ impl Store {
                 let command = match outcome {
                     TurnTerminalOutcome::Completed => {
                         let (tokens_in, tokens_out) = token_usage
+                            .as_ref()
                             .map(|usage| {
                                 (
                                     u32::try_from(usage.input_tokens).ok(),
@@ -13998,6 +14334,7 @@ impl Store {
                             })
                             .unwrap_or((None, None));
                         self.commit_live_reply(TurnCompletedEvent {
+                            token_usage,
                             session_id: session_id.clone(),
                             topic,
                             turn_id: turn_id.clone(),
@@ -14048,7 +14385,9 @@ impl Store {
                             // keeps interrupted turns terse. V2 still carries a
                             // canonical error payload, so retain its text in the
                             // status surface after the common cleanup finishes.
-                            self.state.status = format!("Turn interrupted: {message}");
+                            self.state.status =
+                                t!("status.turn_interrupted_reason", message = message)
+                                    .into_owned();
                         }
                         command
                     }
@@ -14086,7 +14425,8 @@ impl Store {
                     item = item.with_tool_call(tool_call_id);
                 }
                 self.state.push_activity(item);
-                self.state.status = format!("Background completion persisted: {message_id}");
+                self.state.status =
+                    t!("status.background_completion_persisted", id = message_id).into_owned();
                 None
             }
         }
@@ -14111,7 +14451,11 @@ impl Store {
                 .with_detail(event.source)
                 .with_session(session_id),
         );
-        self.state.status = format!("Background completion persisted: {}", event.message_id);
+        self.state.status = t!(
+            "status.background_completion_persisted",
+            id = event.message_id
+        )
+        .into_owned();
         None
     }
 
@@ -14147,7 +14491,7 @@ impl Store {
                 .with_turn(event.turn_id)
                 .with_detail(event.mime.unwrap_or_else(|| "artifact".into())),
         );
-        self.state.status = format!("File attached: {}", event.path);
+        self.state.status = t!("status.file_attached", path = event.path).into_owned();
         None
     }
 
@@ -14160,7 +14504,7 @@ impl Store {
                 .with_detail("legacy session event")
                 .with_session(event.session_id.clone()),
         );
-        self.state.status = format!("Session event: {}", event.kind);
+        self.state.status = t!("status.session_event", kind = event.kind).into_owned();
         None
     }
 
@@ -14205,7 +14549,7 @@ impl Store {
         if let Some(session_id) = cleared.as_ref() {
             self.resume_run_state_after_decision(session_id);
         }
-        self.state.status = format!("Approval auto-resolved ({decision}) by scope policy");
+        self.state.status = t!("status.approval_auto_resolved", decision = decision).into_owned();
         None
     }
 
@@ -14225,7 +14569,12 @@ impl Store {
         if let Some(session_id) = cleared.as_ref() {
             self.resume_run_state_after_decision(session_id);
         }
-        self.state.status = format!("Approval decided: {decision} ({detail})");
+        self.state.status = t!(
+            "status.approval_decided",
+            decision = decision,
+            detail = detail
+        )
+        .into_owned();
         None
     }
 
@@ -14239,7 +14588,7 @@ impl Store {
         if let Some(session_id) = cleared.as_ref() {
             self.resume_run_state_after_decision(session_id);
         }
-        self.state.status = format!("Approval cancelled: {reason}");
+        self.state.status = t!("status.approval_cancelled", reason = reason).into_owned();
         None
     }
 
@@ -14299,7 +14648,7 @@ impl Store {
         // The picker takes key priority over the expanded diff overlay but
         // renders beneath it — collapse the overlay so the question is
         // answered on a visible dialog.
-        self.state.diff_preview.expanded = false;
+        self.reveal_pending_decision();
         self.state.user_question_auto_open = true;
         self.state.user_question = Some(picker);
         // Salience (spec task-approval-ux-salience): a live decision arrival
@@ -14452,7 +14801,7 @@ impl Store {
         if self.state.task_output.is_for(&session_id, &task_id) {
             self.state.task_output.append_output(&text, cursor);
         }
-        self.state.status = format!("Task output @{}", cursor.offset);
+        self.state.status = t!("status.task_output_cursor", offset = cursor.offset).into_owned();
     }
 
     fn commit_live_reply(&mut self, event: TurnCompletedEvent) -> Option<AppUiCommand> {
@@ -15100,6 +15449,7 @@ impl Store {
             runtime.and_then(|status| status.workspace_root.clone().or_else(|| status.cwd.clone()));
         self.state
             .enqueue_local_session_open_front(AppUiCommand::OpenSession(SessionOpenParams {
+                client_commands: None,
                 session_id,
                 topic: None,
                 profile_id,
@@ -16904,116 +17254,6 @@ fn hydrated_row_to_message(row: HydratedMessage) -> Message {
     }
 }
 
-/// Lift a v1 projection envelope into the v2 shape so both wire versions run
-/// through [`Store::apply_envelope_v2`].
-///
-/// The payloads are the same union; v1 only lacks the two things v2 added:
-///
-/// * **No `turn_id`.** The thread IS the turn on the v1 wire (a thread is never
-///   reused — a new turn must use a new `thread_id`), and a live v2 server
-///   projects `turn_id == thread_id` anyway, so the thread id is the faithful
-///   substitute rather than a placeholder.
-/// * **No `assistant_segment_id`.** v1 predates multi-segment assistant
-///   iterations, so every fragment in a thread belongs to one segment; deltas
-///   and the persisted message must agree on the id or the persisted text
-///   opens a second bubble instead of finalizing the streamed one.
-///
-/// `turn_completed` becomes the canonical `TurnTerminal`. v1 has no failure
-/// terminal — an errored turn ends via `turn/failed`, not an envelope — so
-/// `Completed` is the only outcome this can carry.
-fn envelope_v1_as_v2(event: EnvelopeNotification) -> EnvelopeV2Notification {
-    let EnvelopeNotification {
-        session_id,
-        topic,
-        envelope,
-    } = event;
-    let Envelope {
-        thread_id,
-        seq,
-        client_message_id,
-        payload,
-    } = envelope;
-    let segment_id = format!("{thread_id}:assistant:1");
-
-    let payload_v2 = match payload {
-        Payload::UserMessage { text, files } => PayloadV2::UserMessage { text, files },
-        Payload::AssistantDelta { text } => PayloadV2::AssistantDelta {
-            text,
-            assistant_segment_id: segment_id,
-        },
-        Payload::ReasoningDelta { text } => PayloadV2::ReasoningDelta { text },
-        Payload::AssistantPersisted { text, meta } => PayloadV2::AssistantPersisted {
-            text,
-            assistant_segment_id: segment_id,
-            meta,
-        },
-        Payload::ToolStart {
-            tool_call_id,
-            name,
-            arguments_preview,
-        } => PayloadV2::ToolStart {
-            tool_call_id,
-            name,
-            arguments_preview,
-        },
-        Payload::ToolProgress {
-            tool_call_id,
-            message,
-        } => PayloadV2::ToolProgress {
-            tool_call_id,
-            message,
-        },
-        Payload::ToolEnd {
-            tool_call_id,
-            status,
-            error,
-            reason,
-            output_preview,
-            duration_ms,
-        } => PayloadV2::ToolEnd {
-            tool_call_id,
-            status,
-            error,
-            reason,
-            output_preview,
-            duration_ms,
-        },
-        Payload::FileAttached {
-            path,
-            mime,
-            size_bytes,
-        } => PayloadV2::FileAttached {
-            path,
-            mime,
-            size_bytes,
-            // v1 carries no owner; anchor to the thread's sole assistant
-            // segment so the file lands on the bubble it was streamed beside.
-            attachment_owner: AttachmentOwnerV2 {
-                assistant_segment_id: Some(segment_id),
-                tool_call_id: None,
-            },
-        },
-        Payload::TurnCompleted { token_usage } => PayloadV2::TurnTerminal {
-            outcome: TurnTerminalOutcome::Completed,
-            error: None,
-            token_usage: Some(token_usage),
-        },
-    };
-
-    EnvelopeV2Notification {
-        session_id,
-        topic,
-        envelope: EnvelopeV2 {
-            thread_id: thread_id.clone(),
-            seq,
-            cursor: None,
-            turn_id: thread_id,
-            client_message_id,
-            payload: payload_v2,
-        },
-    }
-}
-
 fn background_child_completed_to_message(envelope: EnvelopeV2) -> Message {
     let EnvelopeV2 {
         thread_id, payload, ..
@@ -17865,6 +18105,7 @@ mod tests {
         // Stale TurnCompleted for a DIFFERENT (older) turn while turn B is live.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: TurnId::new(),
@@ -17888,6 +18129,7 @@ mod tests {
         // The REAL terminal for the live turn DOES stamp it done.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: live_turn,
@@ -19403,23 +19645,15 @@ mod tests {
         params.turn_id
     }
 
-    /// The DEFAULT for a prompt typed while the agent is working: stage FIFO
-    /// and run it as its OWN turn after the current one finishes — even when
-    /// the server advertises `turn/steer`. A steer is delivered as a bare
-    /// user message into the RUNNING loop, where the model treats the newest
-    /// instruction as superseding the work in progress — an effective
-    /// interrupt-and-pivot. That redirection is opt-in (`steer_mid_turn`);
-    /// plain Enter means "next, in order", and every prompt gets processed.
+    /// A saved /steer off preference still uses FIFO even on a capable server.
     #[test]
-    fn mid_turn_prompts_stage_fifo_by_default_even_when_steer_capable() {
+    fn mid_turn_prompts_stage_fifo_when_steering_disabled() {
         let mut store = store_with_empty_session();
+        assert!(store.state.steer_mid_turn);
+        store.state.steer_mid_turn = false;
         store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
             crate::model::APPUI_METHOD_TURN_STEER,
         ]));
-        assert!(
-            !store.state.steer_mid_turn,
-            "precondition: steering is opt-in, off by default"
-        );
         let session_id = store.state.sessions[0].id.clone();
         let first_turn = start_live_turn(&mut store, "review the design");
 
@@ -19439,7 +19673,7 @@ mod tests {
         );
         assert!(
             store.state.pending_turn_steers.is_empty(),
-            "nothing may enter the steer stash by default"
+            "nothing may enter the steer stash when disabled"
         );
         assert_eq!(
             store.state.pending_messages,
@@ -19455,6 +19689,7 @@ mod tests {
         let drained = store
             .apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
                 TurnCompletedEvent {
+                    token_usage: None,
                     session_id: session_id.clone(),
                     topic: None,
                     turn_id: first_turn,
@@ -19936,6 +20171,9 @@ mod tests {
 
     fn hydrated_user_row(seq: u64, content: &str, thread_id: &str) -> HydratedMessage {
         HydratedMessage {
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+            tool_name: None,
             seq,
             role: "user".into(),
             content: content.into(),
@@ -20642,6 +20880,7 @@ mod tests {
         // the race `steered:false` covers.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: live_turn,
@@ -21564,6 +21803,8 @@ now analyzing the bus module"
         let mut store = store_with_empty_session();
 
         store.apply_client_event(ClientEvent::SessionList(SessionListResult {
+profile_id: None,
+workspace_root: None,
             sessions: serde_json::json!([
                 { "id": "s:old", "message_count": 1, "updated_at": "2026-06-01T00:00:00Z" },
                 { "id": "s:new", "message_count": 9, "title": "Newest", "updated_at": "2026-07-01T00:00:00Z" },
@@ -21647,6 +21888,178 @@ now analyzing the bus module"
                 .map(|session| session.id.0.as_str()),
             Some("coding:api:other"),
             "focus moved to the resumed session"
+        );
+    }
+
+    /// `/resume` into a session created under a DIFFERENT profile must not
+    /// inherit the outgoing session's profile: a profiled session key
+    /// (`{profile}:{channel}:{chat}`) carries its own immutable profile
+    /// dimension, so the placeholder SessionView is stamped from the key —
+    /// not from the active session being switched away from.
+    #[test]
+    fn resume_stamps_the_resumed_sessions_own_profile() {
+        let mut store = store_with_empty_session(); // active profile: "coding"
+
+        let command = store
+            .dispatch_local_action(
+                LocalAction::ResumeSession("glm:local:tui#research".into()),
+                None,
+            )
+            .into_command();
+
+        assert!(
+            matches!(command, Some(AppUiCommand::HydrateSession(_))),
+            "resume dispatches a hydrate"
+        );
+        let resumed = store
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == SessionKey("glm:local:tui#research".into()))
+            .expect("placeholder session was created");
+        assert_eq!(
+            resumed.profile_id.as_deref(),
+            Some("glm"),
+            "a profiled key stamps its OWN profile, not the outgoing session's"
+        );
+    }
+
+    /// A profile-LESS resumed key (`{channel}:{chat}`) has no profile dimension
+    /// to stamp from — the placeholder keeps the historical fallback: the
+    /// active session's profile.
+    #[test]
+    fn resume_profile_less_key_falls_back_to_active_profile() {
+        let mut store = store_with_empty_session(); // active profile: "coding"
+
+        store.dispatch_local_action(LocalAction::ResumeSession("local:other".into()), None);
+
+        let resumed = store
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == SessionKey("local:other".into()))
+            .expect("placeholder session was created");
+        assert_eq!(resumed.profile_id.as_deref(), Some("coding"));
+    }
+
+    /// The hydrate find-or-create branch (a hydrate result for a session with
+    /// no local SessionView) stamps the same key-derived profile as the
+    /// `/resume` placeholder — both are resume-side creations without a
+    /// server `active_profile_id`.
+    #[test]
+    fn hydrate_find_or_create_stamps_profile_from_the_key() {
+        use crate::client_event::ClientEvent;
+        let mut store = store_with_empty_session(); // active profile: "coding"
+        let session_id = SessionKey("glm:local:tui#research".into());
+
+        store.apply_client_event(ClientEvent::SessionHydrate(SessionHydrateResult {
+            replayed_projection_envelopes: None,
+            projection_thread_sequences: None,
+            session_id: session_id.clone(),
+            cursor: octos_core::ui_protocol::UiCursor {
+                stream: session_id.0.clone(),
+                seq: 1,
+            },
+            context: None,
+            context_state: None,
+            messages: Some(vec![]),
+            threads: None,
+            turns: None,
+            pending_approvals: None,
+            pending_questions: None,
+            replayed_envelopes: None,
+            replayed_tool_envelopes: None,
+        }));
+
+        let created = store
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .expect("hydrate find-or-created the session");
+        assert_eq!(created.profile_id.as_deref(), Some("glm"));
+    }
+
+    /// Wire-level end-to-end of the issue scenario: `/resume` into a session
+    /// created under a DIFFERENT profile, the server answers with a
+    /// `session/hydrate` result (parsed from its raw JSON wire shape — the
+    /// resume path never gets a `session/opened` with `active_profile_id`),
+    /// and the effective profile resolver must then report the RESUMED
+    /// session's own profile, not the launch profile.
+    #[test]
+    fn resume_end_to_end_effective_profile_follows_the_resumed_session() {
+        use crate::client_event::ClientEvent;
+        let mut store = store_with_empty_session(); // launch profile: "coding"
+
+        let command = store
+            .dispatch_local_action(
+                LocalAction::ResumeSession("glm:local:tui#research".into()),
+                None,
+            )
+            .into_command();
+        let Some(AppUiCommand::HydrateSession(params)) = command else {
+            panic!("resume dispatches a hydrate");
+        };
+
+        // The server's wire answer carries no profile field — only the key.
+        let hydrate: SessionHydrateResult = serde_json::from_value(serde_json::json!({
+            "session_id": params.session_id,
+            "cursor": { "stream": params.session_id.0, "seq": 1 },
+            "messages": [],
+        }))
+        .expect("wire-shaped hydrate parses");
+        store.apply_client_event(ClientEvent::SessionHydrate(hydrate));
+
+        assert_eq!(
+            store
+                .state
+                .active_session()
+                .map(|session| session.id.0.as_str()),
+            Some("glm:local:tui#research"),
+            "focus is on the resumed session"
+        );
+        assert_eq!(
+            store.active_profile_id().as_deref(),
+            Some("glm"),
+            "the effective profile follows the RESUMED session's own profile"
+        );
+    }
+
+    /// The key-derived stamp rides `SessionKey`'s profile/channel parse, so
+    /// pin the tricky shapes at THIS integration point (core has its own
+    /// parser tests, but a parser drift there must fail here, not silently
+    /// mislabel a resumed session): colon chat ids (Matrix rooms) with and
+    /// without a profile dimension, and the synthetic `_main` profile prefix.
+    #[test]
+    fn resume_profile_stamp_handles_colon_chat_ids_and_main_prefix() {
+        // Each resume switches focus (and with it the active-profile
+        // fallback), so every case gets its own store.
+        let stamp_after_resume = |id: &str| {
+            let mut store = store_with_empty_session(); // active profile: "coding"
+            store.dispatch_local_action(LocalAction::ResumeSession(id.into()), None);
+            store
+                .state
+                .sessions
+                .iter()
+                .find(|session| session.id == SessionKey(id.into()))
+                .unwrap_or_else(|| panic!("placeholder exists for {id}"))
+                .profile_id
+                .clone()
+        };
+        assert_eq!(
+            stamp_after_resume("weather:matrix:!room:localhost").as_deref(),
+            Some("weather"),
+            "profiled colon-chat key stamps its own profile"
+        );
+        assert_eq!(
+            stamp_after_resume("matrix:!room:elsewhere").as_deref(),
+            Some("coding"),
+            "unprofiled colon-chat key keeps the active-profile fallback"
+        );
+        assert_eq!(
+            stamp_after_resume("_main:local:tui").as_deref(),
+            Some("_main"),
+            "the synthetic main-profile prefix stamps `_main`, like session/opened does"
         );
     }
 
@@ -21989,6 +22402,7 @@ now analyzing the bus module"
         // A's terminal fires while B is active: nothing may submit into B.
         let command = store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: SessionKey("local:a".into()),
                 topic: None,
                 turn_id,
@@ -22076,6 +22490,7 @@ now analyzing the bus module"
         )));
         let command = store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: a.clone(),
                 topic: None,
                 turn_id,
@@ -22465,6 +22880,7 @@ now analyzing the bus module"
         // new turn's TurnStarted.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: a.clone(),
                 topic: None,
                 turn_id: old_turn.clone(),
@@ -22504,6 +22920,7 @@ now analyzing the bus module"
         // The gate's OWN terminal still releases it (FIFO preserved).
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: a.clone(),
                 topic: None,
                 turn_id: new_turn,
@@ -23471,6 +23888,8 @@ now analyzing the bus module"
         store.apply_client_event(ClientEvent::SessionRollback(SessionRollbackResult {
             dropped_turns: 1,
             thread: SessionHydrateResult {
+                replayed_projection_envelopes: None,
+                projection_thread_sequences: None,
                 replayed_tool_envelopes: None,
                 session_id: SessionKey("local:a".into()),
                 cursor: octos_core::ui_protocol::UiCursor {
@@ -23480,6 +23899,9 @@ now analyzing the bus module"
                 context: None,
                 context_state: None,
                 messages: Some(vec![HydratedMessage {
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                    tool_name: None,
                     seq: 1,
                     role: "user".into(),
                     content: "first question".into(),
@@ -23532,6 +23954,8 @@ now analyzing the bus module"
         store.apply_client_event(ClientEvent::SessionRollback(SessionRollbackResult {
             dropped_turns: 1,
             thread: SessionHydrateResult {
+                replayed_projection_envelopes: None,
+                projection_thread_sequences: None,
                 replayed_tool_envelopes: None,
                 session_id: session_id.clone(),
                 cursor: octos_core::ui_protocol::UiCursor {
@@ -23541,6 +23965,9 @@ now analyzing the bus module"
                 context: None,
                 context_state: None,
                 messages: Some(vec![HydratedMessage {
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                    tool_name: None,
                     seq: 1,
                     role: "user".into(),
                     content: "first question".into(),
@@ -23601,6 +24028,8 @@ now analyzing the bus module"
         store.apply_client_event(ClientEvent::SessionRollback(SessionRollbackResult {
             dropped_turns: 2,
             thread: SessionHydrateResult {
+                replayed_projection_envelopes: None,
+                projection_thread_sequences: None,
                 replayed_tool_envelopes: None,
                 session_id: session_id.clone(),
                 cursor: octos_core::ui_protocol::UiCursor {
@@ -23610,6 +24039,9 @@ now analyzing the bus module"
                 context: None,
                 context_state: None,
                 messages: Some(vec![HydratedMessage {
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                    tool_name: None,
                     seq: 1,
                     role: "user".into(),
                     content: "first question".into(),
@@ -23660,6 +24092,8 @@ now analyzing the bus module"
 
         // Server returns zero prior sessions.
         store.apply_client_event(ClientEvent::SessionList(SessionListResult {
+            profile_id: None,
+            workspace_root: None,
             sessions: serde_json::json!([]),
         }));
 
@@ -23836,7 +24270,7 @@ now analyzing the bus module"
         // launch config path and the wheel scroll mode are the same class of
         // local-only setting and must survive the replay too.
         store.state.config_path = Some(std::path::PathBuf::from("/tmp/launch-config.json"));
-        store.state.pinned_scroll = true;
+        store.state.scroll_mode = crate::cli::ScrollMode::Pinned;
         let sessions = store.state.sessions.clone();
         store.apply_event(AppUiEvent::Snapshot(AppUiSnapshot {
             sessions,
@@ -23856,7 +24290,7 @@ now analyzing the bus module"
             "launch config path must survive snapshot replay so /saveconfig keeps targeting it"
         );
         assert!(
-            store.state.pinned_scroll,
+            store.state.scroll_mode == crate::cli::ScrollMode::Pinned,
             "wheel scroll mode must survive snapshot replay"
         );
     }
@@ -24085,6 +24519,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: a.clone(),
                 topic: None,
                 turn_id: turn,
@@ -24160,6 +24595,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: a,
                 topic: None,
                 turn_id: turn,
@@ -24307,6 +24743,7 @@ now analyzing the bus module"
         )));
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: a,
                 topic: None,
                 turn_id: turn,
@@ -24407,6 +24844,7 @@ now analyzing the bus module"
         // …then the turn settles before the event loop reaches the draw.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id,
@@ -24596,6 +25034,7 @@ now analyzing the bus module"
 
     fn turn_completed_event(session_id: &SessionKey, turn_id: &TurnId) -> AppUiEvent {
         AppUiEvent::Protocol(UiNotification::TurnCompleted(TurnCompletedEvent {
+            token_usage: None,
             session_id: session_id.clone(),
             topic: None,
             turn_id: turn_id.clone(),
@@ -24784,6 +25223,120 @@ now analyzing the bus module"
         );
     }
 
+    #[test]
+    fn workspace_launches_are_distinct_but_bootstrap_retry_keeps_identity() {
+        let mut a = protocol_store_with_methods(&[crate::workspace_team::LIST]);
+        let mut b = protocol_store_with_methods(&[crate::workspace_team::LIST]);
+        let Some(AppUiCommand::OpenSession(first)) = a.open_resolved_launch_session("dev".into())
+        else {
+            panic!("open")
+        };
+        let Some(AppUiCommand::OpenSession(retry)) = a.open_resolved_launch_session("dev".into())
+        else {
+            panic!("open")
+        };
+        let Some(AppUiCommand::OpenSession(second)) = b.open_resolved_launch_session("dev".into())
+        else {
+            panic!("open")
+        };
+        assert_eq!(first.session_id, retry.session_id);
+        assert_ne!(first.session_id, second.session_id);
+        let mut legacy = protocol_store_with_methods(&[]);
+        let Some(AppUiCommand::OpenSession(old)) =
+            legacy.open_resolved_launch_session("dev".into())
+        else {
+            panic!("open")
+        };
+        assert_eq!(old.session_id.topic(), Some("coding"));
+    }
+
+    #[test]
+    fn workspace_activation_menus_and_profile_switch_keep_clients_distinct() {
+        use crate::model::{LaunchDecisionKind, LaunchPromptState};
+        fn activate(store: &mut Store, decision: LaunchDecisionKind) -> SessionKey {
+            store.state.workspace.root = "/tmp/shared-new-folder".into();
+            store.state.onboarding.launch_prompt = Some(LaunchPromptState {
+                decision,
+                resolved_profile: "dev".into(),
+                existing_profiles: vec!["other".into()],
+                cwd: "/tmp/shared-new-folder".into(),
+            });
+            store.open_menu(MenuId::from(crate::menu::registry::MENU_LAUNCH_PROMPT));
+            let Some(AppUiCommand::OpenSession(params)) = store.accept_active_menu_item() else {
+                panic!("activation must open the menu's workspace");
+            };
+            assert_eq!(params.cwd.as_deref(), Some("/tmp/shared-new-folder"));
+            params.session_id
+        }
+        let mut a = protocol_store_with_methods(&[crate::workspace_team::LIST]);
+        let mut b = protocol_store_with_methods(&[crate::workspace_team::LIST]);
+        let first = activate(&mut a, LaunchDecisionKind::Activate);
+        let second = activate(&mut b, LaunchDecisionKind::Activate);
+        assert_ne!(
+            first, second,
+            "concurrent first-use confirmations need separate chats"
+        );
+        assert_eq!(first, activate(&mut a, LaunchDecisionKind::CrossProfile));
+        let Some(AppUiCommand::OpenSession(switched)) = a.dispatch_switch_to_profile("dev") else {
+            panic!("profile switch must open a session");
+        };
+        assert_eq!(
+            first, switched.session_id,
+            "switch back stays in this client's chat"
+        );
+        let mut legacy = protocol_store_with_methods(&[]);
+        assert_eq!(
+            activate(&mut legacy, LaunchDecisionKind::Activate).topic(),
+            Some("coding")
+        );
+    }
+
+    #[test]
+    fn workspace_agent_controls_require_capability_revision_and_mutable_client() {
+        use crate::autonomy::AgentsCommand;
+        use crate::workspace_team::{Command, LEADER, LIST, MESSAGE, Snapshot};
+        let mut store = protocol_store_with_methods(&[LIST, LEADER, MESSAGE]);
+        assert!(matches!(
+            store.dispatch_agents_command(AgentsCommand::List),
+            Some(AppUiCommand::WorkspaceTeam(Command::List { .. }))
+        ));
+        assert!(
+            store
+                .dispatch_agents_command(AgentsCommand::Leader("workspace-2".into()))
+                .is_none()
+        );
+        let session = store.state.active_session().unwrap().id.clone();
+        store.state.workspace_teams.insert(
+            session.clone(),
+            Snapshot {
+                session_id: session,
+                workspace: "/repo".into(),
+                revision: 7,
+                leader: "workspace-1".into(),
+                members: vec![],
+            },
+        );
+        assert!(matches!(
+            store.dispatch_agents_command(AgentsCommand::Leader("workspace-2".into())),
+            Some(AppUiCommand::WorkspaceTeam(Command::Leader {
+                expected_revision: 7,
+                ..
+            }))
+        ));
+        store.state.readonly = true;
+        assert!(
+            store
+                .dispatch_agents_command(AgentsCommand::Broadcast("hi".into()))
+                .is_none()
+        );
+        assert!(
+            store
+                .dispatch_agents_command(AgentsCommand::Leader("workspace-2".into()))
+                .is_none()
+        );
+        assert!(store.dispatch_agents_command(AgentsCommand::List).is_some());
+    }
+
     fn protocol_store_with_methods(methods: &[&str]) -> Store {
         let mut store = store_with_empty_session();
         store.state.target = Some("ws://example.test/ui-protocol".into());
@@ -24875,6 +25428,142 @@ now analyzing the bus module"
         );
         assert!(!format!("{params:?}").contains("sk-test-secret"));
         assert!(!format!("{:?}", store.state.onboarding).contains("sk-test-secret"));
+    }
+
+    /// Regression: with no profile resolvable anywhere, the wizard used to
+    /// dispatch an upsert whose `profile_id` was omitted from the wire. The
+    /// server defaults that to `MAIN_PROFILE_ID` (`_main`), whose underscore
+    /// its own profile-id slug validator rejects, so the save came back as an
+    /// opaque `-32603 … profile ID must contain only lowercase letters, digits,
+    /// and hyphens` — and onboarding could never leave the provider step.
+    #[test]
+    fn onboarding_save_refuses_to_dispatch_without_a_resolved_profile() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT]);
+        store.state.sessions[0].profile_id = None;
+        assert!(
+            store.current_profile_for_onboarding().is_none(),
+            "test fixture must have no resolvable profile"
+        );
+
+        store.state.composer =
+            "/onboard select moonshot kimi-k2.5 autodl https://example.test/v1 AUTODL_API_KEY"
+                .into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/onboard key sk-test-secret".into();
+        assert!(store.compose_command().is_none());
+
+        store.state.composer = "/onboard save".into();
+        assert!(
+            store.compose_command().is_none(),
+            "save must not dispatch an upsert with no profile id"
+        );
+        assert_eq!(
+            store.state.status,
+            t!("status.onboarding_profile_unresolved").into_owned()
+        );
+        assert!(
+            store.state.onboarding.provider_pending.is_none(),
+            "a refused save must not leave the wizard spinning"
+        );
+    }
+
+    /// The fallback (`/provider add-fallback`) save shares the dispatch shape,
+    /// and therefore the same failure.
+    #[test]
+    fn provider_fallback_save_refuses_to_dispatch_without_a_resolved_profile() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT]);
+        store.state.sessions[0].profile_id = None;
+
+        store.state.composer =
+            "/provider select minimax MiniMax-M2.5-highspeed wisemodel https://example.test/v1 WISEMODEL_API_KEY"
+                .into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/provider key sk-fallback-secret".into();
+        assert!(store.compose_command().is_none());
+
+        store.state.composer = "/provider add-fallback".into();
+        assert!(
+            store.compose_command().is_none(),
+            "fallback save must not dispatch an upsert with no profile id"
+        );
+        assert_eq!(
+            store.state.status,
+            t!("status.onboarding_profile_unresolved").into_owned()
+        );
+        assert!(store.state.onboarding.provider_pending.is_none());
+    }
+
+    /// Residual scope gap on the `Some(_)` guard: a `profile/llm/list`
+    /// response naming the server's RUNTIME profile (`_main`) seeds
+    /// `profile_llm_state`, so `current_profile_for_onboarding` starts
+    /// returning `Some("_main")`. A present-but-unpersistable id then passed
+    /// the guard and the upsert reached the same invalid-slug boundary the
+    /// omitted-field case did — `_main` fails the server's `[a-z0-9-]` slug
+    /// validator either way. Unlike the test-result path, this one needs no
+    /// non-empty provider state to seed.
+    #[test]
+    fn onboarding_save_refuses_a_runtime_only_profile_id_from_the_list_response() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT]);
+        store.state.sessions[0].profile_id = None;
+        assert!(store.current_profile_for_onboarding().is_none());
+
+        store.apply_client_event(ClientEvent::ProfileLlmList(ProfileLlmListClientEvent {
+            result: crate::model::ProfileLlmListResult {
+                profile_id: Some(MAIN_RUNTIME_PROFILE_ID.into()),
+                primary: None,
+                fallbacks: Vec::new(),
+                llm: None,
+                runtime_policy_stamp: None,
+            },
+            message: "Loaded profile LLM settings".into(),
+        }));
+        assert_eq!(
+            store.current_profile_for_onboarding().as_deref(),
+            Some(MAIN_RUNTIME_PROFILE_ID),
+            "the list response seeds the runtime id as the onboarding profile"
+        );
+
+        store.state.composer =
+            "/onboard select moonshot kimi-k2.5 autodl https://example.test/v1 AUTODL_API_KEY"
+                .into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/onboard key sk-test-secret".into();
+        assert!(store.compose_command().is_none());
+
+        store.state.composer = "/onboard save".into();
+        assert!(
+            store.compose_command().is_none(),
+            "a runtime-only profile id must not be persisted"
+        );
+        assert_eq!(
+            store.state.status,
+            t!("status.onboarding_profile_unresolved").into_owned()
+        );
+        assert!(store.state.onboarding.provider_pending.is_none());
+    }
+
+    #[test]
+    fn persistable_profile_id_rejects_runtime_and_malformed_slugs() {
+        for ok in ["alan", "coding", "agent-1", "a", "x9"] {
+            assert!(is_persistable_profile_id(ok), "{ok} is a persistable slug");
+        }
+        for bad in [
+            "",                      // no id at all
+            MAIN_RUNTIME_PROFILE_ID, // runtime identity, not a profile
+            "_other",                // any underscore-prefixed runtime id
+            "Alan",                  // uppercase fails the server slug rule
+            "has space",
+            "has_underscore",
+            "dot.ted",
+        ] {
+            assert!(
+                !is_persistable_profile_id(bad),
+                "{bad:?} must not reach the write boundary"
+            );
+        }
     }
 
     #[test]
@@ -25133,6 +25822,7 @@ now analyzing the bus module"
 
         store.apply_client_event(ClientEvent::ProfileLlmMutation(
             ProfileLlmMutationClientEvent {
+                kind: ProfileLlmMutationKind::Test,
                 result: applied_profile_llm_result(),
                 message: "Provider connection verified".into(),
             },
@@ -25165,6 +25855,7 @@ now analyzing the bus module"
 
         store.apply_client_event(ClientEvent::ProfileLlmMutation(
             ProfileLlmMutationClientEvent {
+                kind: ProfileLlmMutationKind::Test,
                 result: failed_profile_llm_result("Provider connection failed", "invalid API key"),
                 message: "Provider connection failed: invalid API key".into(),
             },
@@ -25203,6 +25894,7 @@ now analyzing the bus module"
 
         store.apply_client_event(ClientEvent::ProfileLlmMutation(
             ProfileLlmMutationClientEvent {
+                kind: ProfileLlmMutationKind::Upsert,
                 result: applied_profile_llm_result(),
                 message: "Provider profile updated".into(),
             },
@@ -25234,6 +25926,7 @@ now analyzing the bus module"
         );
         store.apply_client_event(ClientEvent::ProfileLlmMutation(
             ProfileLlmMutationClientEvent {
+                kind: ProfileLlmMutationKind::Upsert,
                 result: applied_profile_llm_result(),
                 message: "Primary provider saved".into(),
             },
@@ -25266,6 +25959,7 @@ now analyzing the bus module"
 
         store.apply_client_event(ClientEvent::ProfileLlmMutation(
             ProfileLlmMutationClientEvent {
+                kind: ProfileLlmMutationKind::Upsert,
                 result: applied_profile_llm_result(),
                 message: "Fallback provider saved".into(),
             },
@@ -27629,6 +28323,304 @@ now analyzing the bus module"
         assert_eq!(store.state.onboarding.provider.family_id, "deepseek");
     }
 
+    /// A successful `profile/llm/delete` is not a provider save. The generic
+    /// mutation reducer used to treat it as the legacy "save with no pending
+    /// marker" case, retaining `saved_primary_provider_label`. Re-adding the
+    /// same family/model/route was then mistaken for an already-saved primary,
+    /// so model-config collapsed straight back to "Add a model" forever.
+    #[test]
+    fn deleting_primary_then_readding_same_model_expands_model_config() {
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+            crate::model::APPUI_METHOD_PROFILE_LLM_DELETE,
+        ]);
+        let selection = sample_selection("moonshot-coding", "k3");
+        let saved_label = "moonshot-coding / k3 via official";
+        store.state.onboarding.profile_id = Some("coding".into());
+        store.state.onboarding.provider = selection.clone();
+        store.state.onboarding.provider_saved = true;
+        store.state.onboarding.saved_primary_provider_label = Some(saved_label.into());
+        store.state.profile_llm_state = Some(crate::model::ProfileLlmListResult {
+            profile_id: Some("coding".into()),
+            primary: Some(crate::model::LlmConfiguredProvider {
+                provider: "moonshot-coding".into(),
+                model: "k3".into(),
+                family_id: Some("moonshot-coding".into()),
+                model_id: Some("k3".into()),
+                route_id: Some("official".into()),
+                has_api_key: true,
+                selected: true,
+                route: None,
+                base_url: None,
+                api_key_env: Some("KIMI_API_KEY".into()),
+                available: Some(true),
+                model_hints: None,
+                cost_per_m: None,
+                strong: None,
+            }),
+            fallbacks: Vec::new(),
+            llm: None,
+            runtime_policy_stamp: None,
+        });
+        store.state.onboarding.pending_model_removal = Some(crate::model::ModelRemovalRequest {
+            family_id: "moonshot-coding".into(),
+            model_id: "k3".into(),
+            route_id: "official".into(),
+            label: saved_label.into(),
+        });
+
+        store.apply_client_event(ClientEvent::ProfileLlmMutation(
+            ProfileLlmMutationClientEvent {
+                kind: ProfileLlmMutationKind::Delete,
+                result: crate::model::ProfileLlmMutationResult {
+                    profile_id: Some("coding".into()),
+                    primary: None,
+                    fallbacks: Vec::new(),
+                    applied: true,
+                    llm: None,
+                    runtime_policy_stamp: None,
+                    message: Some("Model removed".into()),
+                    error: None,
+                },
+                message: "Model removed".into(),
+            },
+        ));
+
+        assert!(store.state.onboarding.pending_model_removal.is_none());
+        assert!(!store.state.onboarding.provider_saved);
+        assert!(
+            store
+                .state
+                .onboarding
+                .saved_primary_provider_label
+                .is_none()
+        );
+        assert!(
+            store
+                .state
+                .profile_llm_state
+                .as_ref()
+                .is_some_and(|state| state.primary_provider().is_none()),
+            "an authoritative empty delete result must replace the old primary"
+        );
+
+        store.close_all_menus();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_MODEL));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_ROUTE));
+        store.dispatch_onboarding_action(
+            crate::model::OnboardingAction::SetProviderSelection(Box::new(selection)),
+            None,
+        );
+
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_MODEL_CONFIG));
+        assert_active_menu_has_row(&store, "onboard.provider.family");
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected expanded model-config menu");
+        };
+        assert!(
+            !spec
+                .items
+                .iter()
+                .any(|item| item.id == "onboard.provider.add_model"),
+            "the re-added model must expose key/test/save instead of looping"
+        );
+    }
+
+    #[test]
+    fn server_primary_outweighs_stale_saved_label_when_readding_removed_model() {
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+            crate::model::APPUI_METHOD_PROFILE_LLM_DELETE,
+        ]);
+        let removed_selection = sample_selection("moonshot-coding", "k3");
+        store.state.onboarding.profile_id = Some("coding".into());
+        store.state.onboarding.provider = removed_selection.clone();
+        store.state.onboarding.saved_primary_provider_label =
+            Some("moonshot-coding / k3 via official".into());
+        store.state.profile_llm_state = Some(crate::model::ProfileLlmListResult {
+            profile_id: Some("coding".into()),
+            primary: Some(crate::model::LlmConfiguredProvider {
+                provider: "deepseek".into(),
+                model: "deepseek-reasoner".into(),
+                family_id: Some("deepseek".into()),
+                model_id: Some("deepseek-reasoner".into()),
+                route_id: Some("official".into()),
+                has_api_key: true,
+                selected: true,
+                route: None,
+                base_url: None,
+                api_key_env: Some("DEEPSEEK_API_KEY".into()),
+                available: Some(true),
+                model_hints: None,
+                cost_per_m: None,
+                strong: None,
+            }),
+            fallbacks: Vec::new(),
+            llm: None,
+            runtime_policy_stamp: None,
+        });
+
+        store.close_all_menus();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_MODEL));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_FAMILY));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_MODEL));
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_ROUTE));
+        store.dispatch_onboarding_action(
+            crate::model::OnboardingAction::SetProviderSelection(Box::new(removed_selection)),
+            None,
+        );
+
+        assert!(store.active_menu_id_is(crate::menu::registry::MENU_MODEL_CONFIG));
+        assert_active_menu_has_row(&store, "onboard.provider.family");
+    }
+
+    #[test]
+    fn synthetic_official_route_matches_server_default_primary() {
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+            crate::model::APPUI_METHOD_PROFILE_LLM_DELETE,
+        ]);
+        store.state.onboarding.profile_id = Some("coding".into());
+        store.state.onboarding.provider = sample_selection("moonshot-coding", "k3");
+        store.state.profile_llm_state = Some(crate::model::ProfileLlmListResult {
+            profile_id: Some("coding".into()),
+            primary: Some(crate::model::LlmConfiguredProvider {
+                provider: "moonshot-coding".into(),
+                model: "k3".into(),
+                family_id: Some("moonshot-coding".into()),
+                model_id: Some("k3".into()),
+                route_id: None,
+                has_api_key: true,
+                selected: true,
+                route: None,
+                base_url: None,
+                api_key_env: Some("KIMI_API_KEY".into()),
+                available: Some(true),
+                model_hints: None,
+                cost_per_m: None,
+                strong: None,
+            }),
+            fallbacks: Vec::new(),
+            llm: None,
+            runtime_policy_stamp: None,
+        });
+
+        store.close_all_menus();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_MODEL_CONFIG));
+
+        assert_active_menu_has_row(&store, "onboard.provider.add_model");
+        let Some(MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+            panic!("expected collapsed model-config menu");
+        };
+        assert!(
+            !spec
+                .items
+                .iter()
+                .any(|item| item.id == "onboard.provider.family"),
+            "an omitted saved route and synthetic official route are the same address"
+        );
+    }
+
+    #[test]
+    fn deleting_fallback_preserves_remaining_primary_state() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_DELETE]);
+        store.state.onboarding.provider_saved = true;
+        store.state.onboarding.saved_primary_provider_label =
+            Some("deepseek / deepseek-reasoner via official".into());
+        store.state.onboarding.pending_model_removal = Some(crate::model::ModelRemovalRequest {
+            family_id: "moonshot-coding".into(),
+            model_id: "k3".into(),
+            route_id: "official".into(),
+            label: "moonshot-coding / k3".into(),
+        });
+        let remaining_primary = crate::model::LlmConfiguredProvider {
+            provider: "deepseek".into(),
+            model: "deepseek-reasoner".into(),
+            family_id: Some("deepseek".into()),
+            model_id: Some("deepseek-reasoner".into()),
+            route_id: Some("official".into()),
+            has_api_key: true,
+            selected: true,
+            route: None,
+            base_url: None,
+            api_key_env: Some("DEEPSEEK_API_KEY".into()),
+            available: Some(true),
+            model_hints: None,
+            cost_per_m: None,
+            strong: None,
+        };
+
+        store.apply_client_event(ClientEvent::ProfileLlmMutation(
+            ProfileLlmMutationClientEvent {
+                kind: ProfileLlmMutationKind::Delete,
+                result: crate::model::ProfileLlmMutationResult {
+                    profile_id: Some("coding".into()),
+                    primary: Some(remaining_primary),
+                    fallbacks: Vec::new(),
+                    applied: true,
+                    llm: None,
+                    runtime_policy_stamp: None,
+                    message: Some("Fallback removed".into()),
+                    error: None,
+                },
+                message: "Fallback removed".into(),
+            },
+        ));
+
+        assert!(store.state.onboarding.pending_model_removal.is_none());
+        assert!(store.state.onboarding.provider_saved);
+        assert_eq!(
+            store
+                .state
+                .onboarding
+                .saved_primary_provider_label
+                .as_deref(),
+            Some("deepseek / deepseek-reasoner via official")
+        );
+        assert!(
+            store
+                .state
+                .profile_llm_state
+                .as_ref()
+                .is_some_and(|state| state.primary_provider().is_some()),
+            "deleting a fallback must keep the server-confirmed primary"
+        );
+    }
+
+    #[test]
+    fn stale_removal_marker_cannot_reclassify_upsert_response() {
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_LLM_DELETE,
+            crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT,
+        ]);
+        store.state.onboarding.pending_model_removal = Some(crate::model::ModelRemovalRequest {
+            family_id: "moonshot-coding".into(),
+            model_id: "k3".into(),
+            route_id: "official".into(),
+            label: "moonshot-coding / k3".into(),
+        });
+        store.state.onboarding.provider_pending =
+            Some(crate::model::OnboardingProviderPending::Save);
+
+        store.apply_client_event(ClientEvent::ProfileLlmMutation(
+            ProfileLlmMutationClientEvent {
+                kind: ProfileLlmMutationKind::Upsert,
+                result: applied_profile_llm_result(),
+                message: "Provider profile updated".into(),
+            },
+        ));
+
+        assert!(store.state.onboarding.provider_pending.is_none());
+        assert!(store.state.onboarding.provider_saved);
+        assert!(
+            store.state.onboarding.pending_model_removal.is_some(),
+            "a non-delete response must not consume an unrelated delete intent"
+        );
+    }
+
     /// The mini4 wedge: `profile/llm/test` failed with an RPC error
     /// (`auth_scope_violation`) but nothing cleared `provider_pending`, so the
     /// staged surface froze on "Testing connection…" and blocked every retry
@@ -28157,6 +29149,7 @@ now analyzing the bus module"
 
         store.apply_client_event(ClientEvent::ProfileLlmMutation(
             ProfileLlmMutationClientEvent {
+                kind: ProfileLlmMutationKind::Test,
                 result: crate::model::ProfileLlmMutationResult {
                     profile_id: Some("alice".into()),
                     primary: None,
@@ -28206,6 +29199,7 @@ now analyzing the bus module"
 
         store.apply_client_event(ClientEvent::ProfileLlmMutation(
             ProfileLlmMutationClientEvent {
+                kind: ProfileLlmMutationKind::Upsert,
                 result: applied_profile_llm_result(),
                 message: "profile/llm/upsert saved".into(),
             },
@@ -28256,6 +29250,7 @@ now analyzing the bus module"
     fn provider_failure_reason_strips_echoed_api_key() {
         let staged = crate::model::SecretString::new("sk-leaked-12345");
         let event = ProfileLlmMutationClientEvent {
+            kind: ProfileLlmMutationKind::Test,
             result: crate::model::ProfileLlmMutationResult {
                 profile_id: Some("alice".into()),
                 primary: None,
@@ -28640,7 +29635,7 @@ now analyzing the bus module"
             other => panic!("expected Valid validation for '.', got: {other:?}"),
         };
         assert!(
-            canonical.starts_with('/'),
+            std::path::Path::new(&canonical).is_absolute(),
             "canonical path must be absolute, got: {canonical}"
         );
 
@@ -31098,6 +32093,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: turn_id.clone(),
@@ -31115,6 +32111,68 @@ now analyzing the bus module"
         );
         assert!(store.state.sessions[0].live_reply.is_none());
         assert_eq!(store.state.run_state.label(), "done");
+    }
+
+    #[test]
+    fn model_select_keeps_saved_and_runtime_models_distinct() {
+        for disposition in [
+            "restart_required",
+            "deferred",
+            "persisted_but_not_live",
+            "legacy",
+            "reloaded",
+        ] {
+            let mut store = store_with_two_sessions("local:a", "local:b");
+            let session = SessionKey("local:a".into());
+            let status: crate::model::SessionStatusReadResult = serde_json::from_value(serde_json::json!({
+                "session_id": "local:a", "model": {"model":"old", "provider":"openai", "selected":true}
+            })).unwrap();
+            store.state.session_runtime_statuses.push(status.into());
+            store
+                .state
+                .set_model_catalog(crate::model::SessionModelCatalog {
+                    session_id: session.clone(),
+                    models: vec![],
+                });
+            let mut raw = serde_json::json!({
+                "session_id":"local:a", "selected":{"model":"new", "provider":"openai", "selected":true},
+                "applied":true,
+                "runtime_policy_stamp":{"model": if disposition == "reloaded" {"new"} else {"old"}, "provider":"openai"}
+            });
+            if disposition != "legacy" {
+                raw["runtime_disposition"] = disposition.into();
+            }
+            store.apply_client_event(ClientEvent::ModelSelect(
+                crate::client_event::ModelSelectClientEvent {
+                    result: serde_json::from_value(raw).unwrap(),
+                    message: "saved".into(),
+                    initiating_session: Some(session.clone()),
+                },
+            ));
+            let expected = if disposition == "reloaded" {
+                "new"
+            } else {
+                "old"
+            };
+            assert_eq!(
+                store.state.session_runtime_statuses[0]
+                    .model
+                    .as_ref()
+                    .unwrap()
+                    .model,
+                expected,
+                "{disposition}"
+            );
+            let models = &store.state.model_catalog_for(&session).unwrap().models;
+            if disposition == "restart_required" {
+                assert!(
+                    models.is_empty(),
+                    "pending restart waits for catalog readback"
+                );
+            } else {
+                assert_eq!(models[0].model, "new");
+            }
+        }
     }
 
     /// A select result carries its initiating session (correlated by request
@@ -31174,6 +32232,8 @@ now analyzing the bus module"
                     },
                     applied: true,
                     restart_required: false,
+                    runtime_disposition: Some("reloaded".into()),
+                    runtime_error: None,
                     runtime_policy_stamp: None,
                 },
                 message: "Model selected".into(),
@@ -31273,6 +32333,8 @@ now analyzing the bus module"
                     },
                     applied: true,
                     restart_required: true,
+                    runtime_disposition: None,
+                    runtime_error: None,
                     runtime_policy_stamp: Some(RuntimePolicyStamp {
                         model: Some("deepseek-chat".into()),
                         provider: Some("deepseek".into()),
@@ -31388,6 +32450,8 @@ now analyzing the bus module"
                     },
                     applied: true,
                     restart_required: false,
+                    runtime_disposition: Some("reloaded".into()),
+                    runtime_error: None,
                     runtime_policy_stamp: None,
                 },
                 message: "Model selected".into(),
@@ -31790,6 +32854,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_id.clone(),
@@ -32096,6 +33161,7 @@ now analyzing the bus module"
         assert_eq!(store.state.selected_session, 0);
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: background_id.clone(),
                 topic: None,
                 turn_id: turn_id.clone(),
@@ -32169,6 +33235,7 @@ now analyzing the bus module"
         // Original user turn completes first and clears live_reply.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: original_turn,
@@ -32200,6 +33267,7 @@ now analyzing the bus module"
         }
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: continuation,
@@ -32262,6 +33330,7 @@ now analyzing the bus module"
         )));
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_id.clone(),
@@ -32302,6 +33371,7 @@ now analyzing the bus module"
         )));
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_id.clone(),
@@ -32533,6 +33603,7 @@ now analyzing the bus module"
         let mut store = store_with_live_reply(turn_id.clone(), "the answer");
         let session_id = store.state.sessions[0].id.clone();
         let completed = TurnCompletedEvent {
+            token_usage: None,
             session_id: session_id.clone(),
             topic: None,
             turn_id: turn_id.clone(),
@@ -32575,6 +33646,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_id.clone(),
@@ -32623,6 +33695,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: original_turn,
@@ -32647,6 +33720,7 @@ now analyzing the bus module"
         }
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: continuation,
@@ -32690,6 +33764,7 @@ now analyzing the bus module"
         )));
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: continuation,
@@ -32726,6 +33801,7 @@ now analyzing the bus module"
             )));
             store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
                 TurnCompletedEvent {
+                    token_usage: None,
                     session_id: session_id.clone(),
                     topic: None,
                     turn_id: turn.clone(),
@@ -32777,6 +33853,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: turn_id.clone(),
@@ -32828,6 +33905,7 @@ now analyzing the bus module"
         );
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_a.clone(),
@@ -32857,6 +33935,7 @@ now analyzing the bus module"
         );
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: turn_b.clone(),
@@ -32910,6 +33989,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: turn_id.clone(),
@@ -33002,6 +34082,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -33032,6 +34113,7 @@ now analyzing the bus module"
                 ));
             store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
                 TurnCompletedEvent {
+                    token_usage: None,
                     session_id,
                     topic: None,
                     turn_id: turn,
@@ -33083,6 +34165,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -33112,6 +34195,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -33147,6 +34231,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: peer.clone(),
                 topic: None,
                 turn_id,
@@ -33177,6 +34262,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -33208,6 +34294,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -33268,6 +34355,7 @@ now analyzing the bus module"
         )));
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -33305,6 +34393,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -33333,6 +34422,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: TurnId::new(),
@@ -33426,6 +34516,7 @@ now analyzing the bus module"
         // B completes — live_reply is now None.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_b.clone(),
@@ -33451,6 +34542,7 @@ now analyzing the bus module"
         // LATE TurnCompleted{A} arrives after B already committed.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: turn_a.clone(),
@@ -33515,6 +34607,7 @@ now analyzing the bus module"
         // Turn B completes — live_reply is now None.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_b.clone(),
@@ -33546,6 +34639,7 @@ now analyzing the bus module"
         // LATE TurnCompleted{A} arrives after B has completed (live_reply None).
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: turn_a.clone(),
@@ -33600,6 +34694,7 @@ now analyzing the bus module"
         )));
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_a.clone(),
@@ -33638,6 +34733,7 @@ now analyzing the bus module"
         // B completes normally; with the fix nothing latched → back to idle.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: turn_b.clone(),
@@ -33694,6 +34790,7 @@ now analyzing the bus module"
         // B completes — live_reply is now None.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_b.clone(),
@@ -33918,6 +35015,7 @@ now analyzing the bus module"
         let logs_before = store.state.turn_activity_logs.len();
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: turn_a.clone(),
@@ -34016,6 +35114,7 @@ now analyzing the bus module"
         // B completes — live_reply is now None.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_b.clone(),
@@ -34094,6 +35193,7 @@ now analyzing the bus module"
         )));
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id: turn_a,
@@ -34139,22 +35239,45 @@ now analyzing the bus module"
         })
     }
 
-    fn envelope_v1_notification(
+    enum LegacyPayload {
+        AssistantDelta {
+            text: String,
+        },
+        TurnCompleted {
+            token_usage: octos_core::ui_protocol::EnvelopeTokenUsage,
+        },
+    }
+
+    fn legacy_notification(
         session_id: SessionKey,
-        seq: u64,
+        _seq: u64,
         thread_id: &str,
-        payload: Payload,
+        payload: LegacyPayload,
     ) -> UiNotification {
-        UiNotification::Envelope(EnvelopeNotification {
-            session_id,
-            topic: None,
-            envelope: Envelope {
-                thread_id: thread_id.into(),
-                seq,
-                client_message_id: None,
-                payload,
-            },
-        })
+        let turn_id: TurnId =
+            serde_json::from_value(serde_json::json!(thread_id)).expect("legacy turn id is a UUID");
+        match payload {
+            LegacyPayload::AssistantDelta { text } => {
+                UiNotification::MessageDelta(MessageDeltaEvent {
+                    session_id,
+                    topic: None,
+                    turn_id,
+                    text,
+                })
+            }
+            LegacyPayload::TurnCompleted { token_usage } => {
+                UiNotification::TurnCompleted(TurnCompletedEvent {
+                    token_usage: None,
+                    session_id,
+                    topic: None,
+                    turn_id,
+                    cursor: None,
+                    tokens_in: u32::try_from(token_usage.input_tokens).ok(),
+                    tokens_out: u32::try_from(token_usage.output_tokens).ok(),
+                    session_result: None,
+                })
+            }
+        }
     }
 
     #[test]
@@ -34728,6 +35851,7 @@ now analyzing the bus module"
         let command = store
             .apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
                 TurnCompletedEvent {
+                    token_usage: None,
                     session_id: session_id.clone(),
                     topic: None,
                     turn_id,
@@ -34765,6 +35889,7 @@ now analyzing the bus module"
         let command = store
             .apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
                 TurnCompletedEvent {
+                    token_usage: None,
                     session_id,
                     topic: None,
                     turn_id,
@@ -34851,6 +35976,7 @@ now analyzing the bus module"
         let command = store
             .apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
                 TurnCompletedEvent {
+                    token_usage: None,
                     session_id: session_id.clone(),
                     topic: None,
                     turn_id,
@@ -35419,6 +36545,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -35564,6 +36691,7 @@ now analyzing the bus module"
         );
         event.approval_kind = Some(approval_kinds::DIFF.into());
         event.typed_details = Some(ApprovalTypedDetails {
+            host_tool: None,
             kind: approval_kinds::DIFF.into(),
             command: None,
             sandbox: None,
@@ -35639,6 +36767,7 @@ now analyzing the bus module"
         )));
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -36574,6 +37703,7 @@ now analyzing the bus module"
         // …and then finishes NORMALLY — the interrupt never landed.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_id.clone(),
@@ -36623,6 +37753,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -37184,6 +38315,7 @@ now analyzing the bus module"
         // Some servers settle an interrupted turn with a normal completion.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id,
                 topic: None,
                 turn_id,
@@ -37757,6 +38889,8 @@ now analyzing the bus module"
         assert!(store.state.composer.is_empty());
 
         let result = SessionHydrateResult {
+            replayed_projection_envelopes: None,
+            projection_thread_sequences: None,
             replayed_tool_envelopes: None,
             session_id: session_id.clone(),
             cursor: octos_core::ui_protocol::UiCursor {
@@ -37971,6 +39105,20 @@ now analyzing the bus module"
                 .and_then(|activity| activity.detail.as_deref()),
             Some("modify src/lib.rs | diff preview ready")
         );
+    }
+
+    #[test]
+    fn image_prompt_stays_queued_when_mid_turn_steering_is_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("shot.png");
+        std::fs::write(&img, b"image bytes").unwrap();
+        let mut store = steer_capable_store();
+        start_live_turn(&mut store, "work");
+        let prompt = format!("inspect @{}", img.display());
+        store.state.set_composer_text(&prompt);
+        assert!(store.compose_command().is_none());
+        assert_eq!(store.state.pending_messages, vec![prompt]);
+        assert!(store.state.pending_turn_steers.is_empty());
     }
 
     #[test]
@@ -38656,6 +39804,7 @@ now analyzing the bus module"
         );
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: TurnId::new(),
@@ -38673,6 +39822,7 @@ now analyzing the bus module"
         // The OWNING turn's terminal clears it.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: owner_turn.clone(),
@@ -39316,6 +40466,7 @@ now analyzing the bus module"
         // …so the turn's terminal archives it with the turn.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn_id.clone(),
@@ -39772,6 +40923,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id,
@@ -39841,6 +40993,7 @@ now analyzing the bus module"
 
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: stale_turn,
@@ -41797,9 +42950,9 @@ now analyzing the bus module"
     #[test]
     fn session_scoped_turnless_events_stamp_their_owning_session() {
         use octos_core::ui_protocol::{
-            AgentArtifactUpdatedEvent, AgentOutputDeltaEvent, LoopCompletedEvent, LoopFiredEvent,
-            LoopUpdatedEvent, RouterFailoverEvent, SessionEventBridgedEvent,
-            TurnSpawnCompleteEvent, UiLoopRecord, WarningEvent,
+            AgentArtifactUpdatedEvent, AgentOutputDeltaEvent, LoopFiredEvent, LoopUpdatedEvent,
+            RouterFailoverEvent, SessionEventBridgedEvent, TurnSpawnCompleteEvent, UiLoopRecord,
+            WarningEvent,
         };
         let mut store = store_with_two_sessions("local:focused", "local:background");
         let background_id = SessionKey("local:background".into());
@@ -41857,19 +43010,6 @@ now analyzing the bus module"
                     fire: None,
                     ok: Some(true),
                     status: Some("fired".into()),
-                }),
-            ),
-            (
-                "loop/completed",
-                UiNotification::LoopCompleted(LoopCompletedEvent {
-                    session_id: background_id.clone(),
-                    profile_id: None,
-                    loop_id: "loop_01".into(),
-                    loop_state: None,
-                    status: Some("completed".into()),
-                    completed_at_ms: Some(3),
-                    result: None,
-                    error: None,
                 }),
             ),
             (
@@ -42751,6 +43891,7 @@ now analyzing the bus module"
         let turn_id = TurnId::new();
         store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
             result: AutonomyResult::TurnState(TurnStateGetResult {
+                running: None,
                 session_id: SessionKey("local:test".into()),
                 turn_id: turn_id.clone(),
                 state: TurnLifecycleState::Active,
@@ -42824,6 +43965,9 @@ now analyzing the bus module"
         // a tool turn went 2 live msgs -> 4 on hydrate before this filter).
         let now = chrono::Utc::now();
         let row = |role: &str, content: &str| HydratedMessage {
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+            tool_name: None,
             seq: 1,
             role: role.into(),
             content: content.into(),
@@ -42865,6 +44009,8 @@ now analyzing the bus module"
         let session_id = store.state.sessions[0].id.clone();
 
         let result = SessionHydrateResult {
+            replayed_projection_envelopes: None,
+            projection_thread_sequences: None,
             replayed_tool_envelopes: None,
             session_id: session_id.clone(),
             cursor: octos_core::ui_protocol::UiCursor {
@@ -42874,6 +44020,9 @@ now analyzing the bus module"
             context: None,
             context_state: None,
             messages: Some(vec![HydratedMessage {
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+                tool_name: None,
                 seq: 1,
                 role: "user".into(),
                 content: "earlier committed prompt".into(),
@@ -42928,6 +44077,8 @@ now analyzing the bus module"
         store.state.pending_autonomy_hydration.clear();
 
         store.apply_client_event(ClientEvent::SessionHydrate(SessionHydrateResult {
+            replayed_projection_envelopes: None,
+            projection_thread_sequences: None,
             session_id: session_id.clone(),
             cursor: octos_core::ui_protocol::UiCursor {
                 stream: session_id.0.clone(),
@@ -42978,6 +44129,9 @@ now analyzing the bus module"
                     .iter()
                     .enumerate()
                     .map(|(i, (role, content))| HydratedMessage {
+                        tool_call_id: None,
+                        tool_calls: Vec::new(),
+                        tool_name: None,
                         seq: i as u64 + 1,
                         role: (*role).into(),
                         content: (*content).into(),
@@ -42994,6 +44148,8 @@ now analyzing the bus module"
             )
         };
         let result_for = |sid: &SessionKey, msgs| SessionHydrateResult {
+            replayed_projection_envelopes: None,
+            projection_thread_sequences: None,
             replayed_tool_envelopes: None,
             session_id: sid.clone(),
             cursor: UiCursor {
@@ -44259,6 +45415,77 @@ now analyzing the bus module"
     }
 
     #[test]
+    fn stale_hydrate_reply_after_dispatch_releases_in_flight_marker() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(hydrate_capabilities());
+        let session = store.state.sessions[0].id.clone();
+        let turn = TurnId::new();
+        for (seq, payload) in [
+            PayloadV2::UserMessage {
+                text: "actual prompt".into(),
+                files: Vec::new(),
+            },
+            PayloadV2::AssistantPersisted {
+                text: "Actual completed answer.".into(),
+                assistant_segment_id: "segment-1".into(),
+                meta: octos_core::ui_protocol::MessageMeta {
+                    message_id: "actual-message".into(),
+                    persisted_at: chrono::Utc::now(),
+                    media: Vec::new(),
+                },
+            },
+            PayloadV2::TurnTerminal {
+                outcome: octos_core::ui_protocol::TurnTerminalOutcome::Completed,
+                error: None,
+                token_usage: None,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store.apply_event(AppUiEvent::Protocol(envelope_v2_notification(
+                session.clone(),
+                seq as u64 + 1,
+                &turn.0.to_string(),
+                payload,
+            )));
+        }
+        // Production order: a hydrate is dispatched first (resume, open,
+        // phantom probe), arming the in-flight marker that dedupes every
+        // later producer — the test above applies the reply directly and
+        // never exercises this ordering.
+        let dispatched = store.hydrate_session_state_command(&session);
+        assert!(matches!(dispatched, Some(AppUiCommand::HydrateSession(_))));
+        assert!(store.state.hydrate_in_flight.contains(&session));
+        let snapshot = |state: &str| {
+            serde_json::from_value(serde_json::json!({
+            "session_id": session, "cursor": {"stream": "different-noncomparable-scope", "seq": 1000},
+            "messages": [], "turns": [{"turn_id": turn, "state": state}],
+        }))
+            .unwrap()
+        };
+        // The delayed reply still calls the completed turn active: the stale
+        // branch must release the answered hydrate's marker and emit the
+        // one-shot refresh instead of being dedup-rejected by it.
+        let command = store.apply_client_event(ClientEvent::SessionHydrate(snapshot("active")));
+        assert!(matches!(command, Some(AppUiCommand::HydrateSession(_))));
+        assert!(
+            store.state.hydrate_in_flight.contains(&session),
+            "the refresh dispatch re-arms the marker"
+        );
+        assert_eq!(store.state.stale_hydrate_refreshes.len(), 1);
+        // The once-guard still holds: a second stale reply for the same turn
+        // emits nothing, and it just answered the in-flight refresh — the
+        // marker must not strand.
+        assert!(
+            store
+                .apply_client_event(ClientEvent::SessionHydrate(snapshot("active")))
+                .is_none()
+        );
+        assert!(!store.state.hydrate_in_flight.contains(&session));
+    }
+
+    #[test]
     fn late_canonical_empty_phase_does_not_close_next_native_indentation() {
         let mut store = store_with_empty_session();
         let session = store.state.sessions[0].id.clone();
@@ -44888,8 +46115,8 @@ now analyzing the bus module"
         use crate::viewport::ScrollbackTracker;
         use octos_core::ui_protocol::{MessageMeta, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2};
 
-        const WIRE_TURN: &str = "reconnect-report-turn";
-        const SEGMENT: &str = "reconnect-report-turn:assistant:1";
+        const WIRE_TURN: &str = "9b510fb5-232c-4e9a-910e-409f07415962";
+        const SEGMENT: &str = "9b510fb5-232c-4e9a-910e-409f07415962:assistant:1";
         const REPORT: &str = "Fleet Synthesis Report\n\nOne canonical answer.";
 
         let mut store = store_with_empty_session();
@@ -44921,11 +46148,11 @@ now analyzing the bus module"
 
         // Compatibility v1 starts first, but remains provisional because v2
         // was negotiated. Canonical persistence then takes ownership.
-        store.apply_event(AppUiEvent::Protocol(envelope_v1_notification(
+        store.apply_event(AppUiEvent::Protocol(legacy_notification(
             session_id.clone(),
             1,
             WIRE_TURN,
-            Payload::AssistantDelta {
+            LegacyPayload::AssistantDelta {
                 text: REPORT.into(),
             },
         )));
@@ -44968,6 +46195,8 @@ now analyzing the bus module"
             .expect("session/opened shape");
         store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
         store.apply_client_event(ClientEvent::SessionHydrate(SessionHydrateResult {
+            replayed_projection_envelopes: None,
+            projection_thread_sequences: None,
             replayed_tool_envelopes: None,
             session_id: session_id.clone(),
             cursor: UiCursor {
@@ -44977,6 +46206,9 @@ now analyzing the bus module"
             context: None,
             context_state: None,
             messages: Some(vec![HydratedMessage {
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+                tool_name: None,
                 seq: 1,
                 role: "assistant".into(),
                 content: REPORT.into(),
@@ -45025,6 +46257,8 @@ now analyzing the bus module"
             "Allow write_file",
         );
         let result = SessionHydrateResult {
+            replayed_projection_envelopes: None,
+            projection_thread_sequences: None,
             replayed_tool_envelopes: None,
             session_id: session_id.clone(),
             cursor: UiCursor {
@@ -45049,6 +46283,9 @@ now analyzing the bus module"
             }),
             messages: Some(vec![
                 HydratedMessage {
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                    tool_name: None,
                     seq: 1,
                     role: "user".into(),
                     content: "build this".into(),
@@ -45062,6 +46299,9 @@ now analyzing the bus module"
                     reasoning_content: None,
                 },
                 HydratedMessage {
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                    tool_name: None,
                     seq: 2,
                     role: "assistant".into(),
                     content: "legacy companion".into(),
@@ -45075,6 +46315,9 @@ now analyzing the bus module"
                     reasoning_content: None,
                 },
                 HydratedMessage {
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                    tool_name: None,
                     seq: 3,
                     role: "assistant".into(),
                     content: "legacy ack".into(),
@@ -45176,6 +46419,8 @@ now analyzing the bus module"
         );
 
         let result = SessionHydrateResult {
+            replayed_projection_envelopes: None,
+            projection_thread_sequences: None,
             replayed_tool_envelopes: None,
             session_id: session_id.clone(),
             cursor: octos_core::ui_protocol::UiCursor {
@@ -45225,6 +46470,8 @@ now analyzing the bus module"
         let mut store = store_with_empty_session();
         let session_id = store.state.sessions[0].id.clone();
         let result = SessionHydrateResult {
+            replayed_projection_envelopes: None,
+            projection_thread_sequences: None,
             session_id: session_id.clone(),
             cursor: octos_core::ui_protocol::UiCursor {
                 stream: session_id.0.clone(),
@@ -45234,6 +46481,9 @@ now analyzing the bus module"
             context_state: None,
             messages: Some(vec![
                 HydratedMessage {
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                    tool_name: None,
                     seq: 0,
                     role: "user".into(),
                     content: "which is larger, 9.11 or 9.9?".into(),
@@ -45247,6 +46497,9 @@ now analyzing the bus module"
                     reasoning_content: None,
                 },
                 HydratedMessage {
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                    tool_name: None,
                     seq: 1,
                     role: "assistant".into(),
                     content: "9.9 is larger.".into(),
@@ -45550,6 +46803,8 @@ now analyzing the bus module"
             payload,
         };
         let result = SessionHydrateResult {
+            replayed_projection_envelopes: None,
+            projection_thread_sequences: None,
             session_id: session_id.clone(),
             cursor: octos_core::ui_protocol::UiCursor {
                 stream: session_id.0.clone(),
@@ -45655,6 +46910,8 @@ now analyzing the bus module"
             payload,
         };
         let make_result = || SessionHydrateResult {
+            replayed_projection_envelopes: None,
+            projection_thread_sequences: None,
             session_id: session_id.clone(),
             cursor: octos_core::ui_protocol::UiCursor {
                 stream: session_id.0.clone(),
@@ -45739,6 +46996,8 @@ now analyzing the bus module"
         );
 
         let result = SessionHydrateResult {
+            replayed_projection_envelopes: None,
+            projection_thread_sequences: None,
             replayed_tool_envelopes: None,
             session_id: session_id.clone(),
             cursor: octos_core::ui_protocol::UiCursor {
@@ -45791,6 +47050,8 @@ now analyzing the bus module"
             );
 
             let result = SessionHydrateResult {
+                replayed_projection_envelopes: None,
+                projection_thread_sequences: None,
                 replayed_tool_envelopes: None,
                 session_id: session_id.clone(),
                 cursor: octos_core::ui_protocol::UiCursor {
@@ -45922,6 +47183,7 @@ now analyzing the bus module"
 
     fn completed_terminal(session_id: &SessionKey, turn_id: &TurnId) -> AppUiEvent {
         AppUiEvent::Protocol(UiNotification::TurnCompleted(TurnCompletedEvent {
+            token_usage: None,
             session_id: session_id.clone(),
             topic: None,
             turn_id: turn_id.clone(),
@@ -45945,6 +47207,8 @@ now analyzing the bus module"
         turns: Vec<HydratedTurn>,
     ) -> SessionHydrateResult {
         SessionHydrateResult {
+            replayed_projection_envelopes: None,
+            projection_thread_sequences: None,
             replayed_tool_envelopes: None,
             session_id: session_id.clone(),
             cursor: octos_core::ui_protocol::UiCursor {
@@ -46348,6 +47612,8 @@ now analyzing the bus module"
                 .push("queued behind dead turn".into());
 
             let result = SessionHydrateResult {
+                replayed_projection_envelopes: None,
+                projection_thread_sequences: None,
                 replayed_tool_envelopes: None,
                 session_id: session_id.clone(),
                 cursor: octos_core::ui_protocol::UiCursor {
@@ -46717,6 +47983,8 @@ now analyzing the bus module"
         // a full transcript snapshot; a second apply was the double scrollback
         // insert the operator saw).
         let hydrate = SessionHydrateResult {
+            replayed_projection_envelopes: None,
+            projection_thread_sequences: None,
             replayed_tool_envelopes: None,
             session_id: session_id.clone(),
             cursor: octos_core::ui_protocol::UiCursor {
@@ -46726,6 +47994,9 @@ now analyzing the bus module"
             context: None,
             context_state: None,
             messages: Some(vec![HydratedMessage {
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+                tool_name: None,
                 seq: 1,
                 role: "user".into(),
                 content: "earlier committed prompt".into(),
@@ -47189,6 +48460,8 @@ now analyzing the bus module"
         );
         let hydrate = hydrate_result_with_turns(&session_id, vec![]);
         let hydrate = octos_core::ui_protocol::SessionHydrateResult {
+            replayed_projection_envelopes: None,
+            projection_thread_sequences: None,
             pending_questions: Some(vec![question]),
             ..hydrate
         };
@@ -47783,11 +49056,11 @@ now analyzing the bus module"
         };
 
         // The first lane to produce assistant content is v1 streaming.
-        store.apply_event(AppUiEvent::Protocol(envelope_v1_notification(
+        store.apply_event(AppUiEvent::Protocol(legacy_notification(
             session_id.clone(),
             1,
             WIRE_TURN,
-            Payload::AssistantDelta {
+            LegacyPayload::AssistantDelta {
                 text: REPORT_PARTIAL.into(),
             },
         )));
@@ -47816,20 +49089,20 @@ now analyzing the bus module"
             sync(&mut tracker, &store, &mut emitted);
         }
 
-        store.apply_event(AppUiEvent::Protocol(envelope_v1_notification(
+        store.apply_event(AppUiEvent::Protocol(legacy_notification(
             session_id.clone(),
             4,
             WIRE_TURN,
-            Payload::AssistantDelta {
+            LegacyPayload::AssistantDelta {
                 text: REPORT_TAIL.into(),
             },
         )));
         sync(&mut tracker, &store, &mut emitted);
-        store.apply_event(AppUiEvent::Protocol(envelope_v1_notification(
+        store.apply_event(AppUiEvent::Protocol(legacy_notification(
             session_id,
             5,
             WIRE_TURN,
-            Payload::TurnCompleted {
+            LegacyPayload::TurnCompleted {
                 token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
             },
         )));
@@ -47897,11 +49170,11 @@ now analyzing the bus module"
         };
 
         // The recovered continuation streams over v1 before capabilities land.
-        store.apply_event(AppUiEvent::Protocol(envelope_v1_notification(
+        store.apply_event(AppUiEvent::Protocol(legacy_notification(
             session_id.clone(),
             1,
             WIRE_TURN,
-            Payload::AssistantDelta {
+            LegacyPayload::AssistantDelta {
                 text: REPORT_PARTIAL.into(),
             },
         )));
@@ -47941,20 +49214,20 @@ now analyzing the bus module"
             sync(&mut tracker, &store, &mut emitted);
         }
 
-        store.apply_event(AppUiEvent::Protocol(envelope_v1_notification(
+        store.apply_event(AppUiEvent::Protocol(legacy_notification(
             session_id.clone(),
             4,
             WIRE_TURN,
-            Payload::AssistantDelta {
+            LegacyPayload::AssistantDelta {
                 text: REPORT_TAIL.into(),
             },
         )));
         sync(&mut tracker, &store, &mut emitted);
-        store.apply_event(AppUiEvent::Protocol(envelope_v1_notification(
+        store.apply_event(AppUiEvent::Protocol(legacy_notification(
             session_id,
             5,
             WIRE_TURN,
-            Payload::TurnCompleted {
+            LegacyPayload::TurnCompleted {
                 token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
             },
         )));
@@ -47993,11 +49266,11 @@ now analyzing the bus module"
                 },
             },
         )));
-        store.apply_event(AppUiEvent::Protocol(envelope_v1_notification(
+        store.apply_event(AppUiEvent::Protocol(legacy_notification(
             session_id,
             2,
             WIRE_TURN,
-            Payload::AssistantDelta {
+            LegacyPayload::AssistantDelta {
                 text: "duplicate legacy answer".into(),
             },
         )));
@@ -48091,6 +49364,7 @@ now analyzing the bus module"
         // `finalized_history_lines_range_dedup_live` call in viewport.rs).
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn.clone(),
@@ -48153,6 +49427,7 @@ now analyzing the bus module"
         // The legacy terminal must still commit — not be deduped away.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: session_id.clone(),
                 topic: None,
                 turn_id: turn.clone(),
@@ -48220,6 +49495,7 @@ now analyzing the bus module"
         // A is focused; B's turn completes in the background.
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: b.clone(),
                 topic: None,
                 turn_id: TurnId::new(),
@@ -48235,6 +49511,7 @@ now analyzing the bus module"
         let a = SessionKey("local:a".into());
         store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
             TurnCompletedEvent {
+                token_usage: None,
                 session_id: a.clone(),
                 topic: None,
                 turn_id: TurnId::new(),

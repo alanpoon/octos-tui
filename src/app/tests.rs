@@ -6,6 +6,30 @@
 
 use super::*;
 
+#[test]
+fn activity_navigator_localizes_known_values_without_rewriting_english_protocol_values() {
+    assert_eq!(
+        activity_navigator_value_label_for_locale("modify", "en"),
+        "modify"
+    );
+    assert_eq!(
+        activity_navigator_value_label_for_locale("completed", "en"),
+        "completed"
+    );
+    assert_eq!(
+        activity_navigator_value_label_for_locale("modify", "zh"),
+        "修改"
+    );
+    assert_eq!(
+        activity_navigator_value_label_for_locale("completed", "zh"),
+        "完成"
+    );
+    assert_eq!(
+        activity_navigator_value_label_for_locale("server_custom", "zh"),
+        "server_custom"
+    );
+}
+
 /// #324: the session strip costs a row only with 2+ open sessions.
 #[test]
 fn session_strip_row_appears_only_with_multiple_sessions() {
@@ -5656,7 +5680,7 @@ mod tests {
     fn agent_task_bash_row_extracts_command_from_truncated_detail_echo() {
         let item = ActivityItem::new(ActivityKind::Tool, "bash", "complete")
             .with_detail(
-                r#"{"cmd":"grep -n '<img' /Users/yuechen/dev/2026-world-cup/client/src/pages/HomePage.tsx /Users/yuechen/dev/2026-world-cup/client/s"#,
+                r#"{"cmd":"grep -n '<img' /Users/me/dev/2026-world-cup/client/src/pages/HomePage.tsx /Users/me/dev/2026-world-cup/client/s"#,
             )
             .with_tool_call("call_01_ABCDEFGHIJKLMNOP")
             .with_success(true)

@@ -24,6 +24,9 @@ use crate::model::{
 
 #[derive(Debug, Clone)]
 pub enum ClientEvent {
+    WorkspaceTeam(crate::workspace_team::Snapshot),
+    WorkspaceTeamUpdated(crate::workspace_team::Snapshot),
+    WorkspaceMessage(crate::workspace_team::MessageResult),
     App(Box<AppUiEvent>),
     /// A normal typed lifecycle notification plus additive `context_state`
     /// fields unknown to the pinned `octos-core`. Keeping the typed event in
@@ -277,8 +280,16 @@ pub struct ProfileLlmListClientEvent {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProfileLlmMutationClientEvent {
+    pub kind: ProfileLlmMutationKind,
     pub result: ProfileLlmMutationResult,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileLlmMutationKind {
+    Upsert,
+    Delete,
+    Test,
 }
 
 /// #1768 snapshot undo list (also carries restore acknowledgements).
