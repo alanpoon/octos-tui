@@ -828,9 +828,9 @@ pub struct SessionAutonomyState {
     pub last_goal_event_generation: u64,
     pub loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
     /// octos#1977 monitor mirror, populated by `monitor/list` responses and
-    /// the `monitor/updated|fired` notifications. Kept beside `loops` because
-    /// a monitor is the zero-token sibling of a loop and the two surfaces are
-    /// read together.
+    /// kept live by the `monitor/updated` (upsert) and `monitor/expired`
+    /// (removal) notifications. Kept beside `loops` because a monitor is the
+    /// zero-token sibling of a loop and the two surfaces are read together.
     pub monitors: Vec<octos_core::ui_protocol::UiMonitorRecord>,
     /// Latest model-authored plan/todo checklist (`plan/updated`). `None` until
     /// the agent calls `update_plan` this session.

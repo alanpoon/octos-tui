@@ -254,6 +254,11 @@ pub enum AutonomyParseError {
     MonitorEmptyCommand,
     /// `/monitor watch|poll` with no name before the separator.
     MonitorMissingName,
+    /// `/monitor watch|poll` with a `match` keyword but no pattern after it.
+    MonitorMissingPattern,
+    /// `/monitor watch` with an `every <interval>`: stream monitors have no
+    /// cadence and the server silently ignores the interval.
+    MonitorEveryInStream,
     /// `/monitor <verb>` where verb is not a known verb and not a create form.
     UnknownMonitorVerb(String),
     /// `/goal <objective>` with empty objective (after stripping
@@ -295,6 +300,12 @@ impl std::fmt::Display for AutonomyParseError {
             ),
             Self::MonitorEmptyCommand => f.write_str("/monitor create needs a command after `--`"),
             Self::MonitorMissingName => f.write_str("/monitor create needs a name before `--`"),
+            Self::MonitorMissingPattern => {
+                f.write_str("/monitor create needs a pattern after `match`")
+            }
+            Self::MonitorEveryInStream => f.write_str(
+                "/monitor watch takes no interval — `every` is only for `poll` monitors",
+            ),
             Self::UnknownMonitorVerb(verb) => {
                 write!(f, "unknown /monitor verb `{verb}`")
             }
@@ -766,8 +777,17 @@ fn parse_monitor_create(
     mode: Option<MonitorMode>,
 ) -> Result<MonitorCommand, AutonomyParseError> {
     let body = body.trim();
-    let (header, command) =
-        split_monitor_separator(body).ok_or(AutonomyParseError::MonitorMissingCommand)?;
+    // A body that STARTS with `--` has the separator but nothing before it:
+    // the defect is the missing NAME, not the missing `--` (which the user
+    // did supply). `split_monitor_separator` only matches the SPACE-separated
+    // ` -- ` form, so catch the leading form here — otherwise the misleading
+    // `MonitorMissingCommand` is reported and `MonitorMissingName` can never
+    // fire after the leading trim.
+    let (header, command) = if let Some(rest) = body.strip_prefix("--") {
+        ("", rest.trim())
+    } else {
+        split_monitor_separator(body).ok_or(AutonomyParseError::MonitorMissingCommand)?
+    };
     let argv: Vec<String> = command.split_whitespace().map(str::to_string).collect();
     if argv.is_empty() {
         return Err(AutonomyParseError::MonitorEmptyCommand);
@@ -779,6 +799,7 @@ fn parse_monitor_create(
     }
 
     let mut interval = None;
+    let mut interval_raw: Option<String> = None;
     let mut filter_regex = None;
     // `match` is greedy to the end of the header, so it must be parsed last;
     // `every` is a fixed two-token form and is parsed first when present.
@@ -790,13 +811,27 @@ fn parse_monitor_create(
                 if raw.is_empty() {
                     return Err(AutonomyParseError::InvalidInterval(String::new()));
                 }
+                // Stream monitors have no cadence: the server silently
+                // ignores the interval, so accepting one here would tell the
+                // user a schedule was armed when none was. Poll only.
+                if mode == Some(MonitorMode::Stream) {
+                    return Err(AutonomyParseError::MonitorEveryInStream);
+                }
+                // One `every` only — a duplicate would silently win over the
+                // first, the same footgun `/loop` rejects outright.
+                if let Some(first) = interval_raw.as_deref() {
+                    return Err(AutonomyParseError::InvalidInterval(format!(
+                        "every {first} every {raw}"
+                    )));
+                }
+                interval_raw = Some(raw.to_string());
                 interval = Some(parse_interval(raw)?);
                 rest = remainder;
             }
             "match" => {
                 let pattern = tail.trim();
                 if pattern.is_empty() {
-                    return Err(AutonomyParseError::UnknownMonitorVerb("match".into()));
+                    return Err(AutonomyParseError::MonitorMissingPattern);
                 }
                 filter_regex = Some(pattern.to_string());
                 rest = "";
@@ -1487,8 +1522,9 @@ mod tests {
         assert_eq!(filter_regex.as_deref(), Some("error: .* failed"));
     }
 
-    /// Split on the LAST separator: `cargo test -- --nocapture` is the common
-    /// probe shape, and splitting on the first would silently drop its tail.
+    /// Split on the FIRST separator: `cargo test -- --nocapture` is the common
+    /// probe shape, and splitting on the last instead would strand
+    /// `--nocapture` as the whole command.
     #[test]
     fn monitor_command_may_itself_contain_a_separator() {
         let MonitorCommand::Create { argv, name, .. } =
@@ -1509,6 +1545,53 @@ mod tests {
         assert_eq!(
             parse_autonomy_slash("/monitor watch build --").unwrap_err(),
             AutonomyParseError::MonitorEmptyCommand
+        );
+    }
+
+    /// `/monitor watch -- cargo build` supplies the separator but no NAME:
+    /// the defect is the missing name, so it must report `MonitorMissingName`
+    /// — not the misleading "needs `-- <command>`" that describes a missing
+    /// separator the user did provide.
+    #[test]
+    fn monitor_watch_with_leading_separator_reports_missing_name() {
+        assert_eq!(
+            parse_autonomy_slash("/monitor watch -- cargo build").unwrap_err(),
+            AutonomyParseError::MonitorMissingName
+        );
+        assert_eq!(
+            parse_autonomy_slash("/monitor poll -- tail -f app.log").unwrap_err(),
+            AutonomyParseError::MonitorMissingName
+        );
+    }
+
+    /// A duplicate `every` must reject like `/loop` does, rather than let the
+    /// last one silently win over the first.
+    #[test]
+    fn monitor_duplicate_every_is_rejected() {
+        assert_eq!(
+            parse_autonomy_slash("/monitor poll d every 30s every 1m -- cmd").unwrap_err(),
+            AutonomyParseError::InvalidInterval("every 30s every 1m".into())
+        );
+    }
+
+    /// `match` is a known keyword; a bare `match` is a missing PATTERN, not an
+    /// unknown verb.
+    #[test]
+    fn monitor_match_without_pattern_is_rejected_as_missing_pattern() {
+        assert_eq!(
+            parse_autonomy_slash("/monitor poll d match -- tail -f app.log").unwrap_err(),
+            AutonomyParseError::MonitorMissingPattern
+        );
+    }
+
+    /// `every` is documented for `poll` only: stream monitors have no cadence
+    /// and the server silently ignores it, so the user must not be told a
+    /// schedule was armed when none was.
+    #[test]
+    fn monitor_every_in_watch_mode_is_rejected() {
+        assert_eq!(
+            parse_autonomy_slash("/monitor watch d every 30s -- tail -f app.log").unwrap_err(),
+            AutonomyParseError::MonitorEveryInStream
         );
     }
 

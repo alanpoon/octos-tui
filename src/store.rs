@@ -9324,9 +9324,9 @@ impl Store {
                 let monitor = result.monitor_state;
                 let name = monitor.name.clone();
                 let monitor_id = monitor.monitor_id.clone();
-                // Prefer the record's own session over the echoed one: a
-                // create scopes to the session that armed it, and the echo is
-                // optional on the wire.
+                // Prefer the echoed session over the record's own: the echo is
+                // the session that armed the create, and the record's session
+                // is the fallback when the echo is absent on the wire.
                 let session_id = result
                     .session_id
                     .unwrap_or_else(|| monitor.session_id.clone());
@@ -9391,14 +9391,21 @@ impl Store {
                 self.state
                     .activity
                     .retain(|item| !(item.kind == ActivityKind::Report && item.title == title));
-                self.state.push_activity(
-                    ActivityItem::new(
-                        ActivityKind::Report,
-                        title,
-                        t!("status.monitor_list_refreshed", count = count).into_owned(),
-                    )
-                    .with_detail(block),
-                );
+                let mut report = ActivityItem::new(
+                    ActivityKind::Report,
+                    title,
+                    t!("status.monitor_list_refreshed", count = count).into_owned(),
+                )
+                .with_detail(block);
+                // A SCOPED query is authoritative for its one session, so the
+                // report is attributed to it — without this, running
+                // `/monitor list` in session A pins the block under unrelated
+                // sessions' transcripts too (the loop-list block applies the
+                // same attribution).
+                if let Some(session_id) = result.session_id.as_ref() {
+                    report = report.with_session(session_id.clone());
+                }
+                self.state.push_activity(report);
             }
             AutonomyResult::MonitorMutation { method, result } => {
                 let monitor_id = result
@@ -9569,6 +9576,14 @@ impl Store {
             commands.push(AppUiCommand::GetSessionGoal(
                 crate::model::SessionGoalGetParams {
                     session_id: session_id.clone(),
+                    profile_id: profile_id.clone(),
+                },
+            ));
+        }
+        if capabilities.supports_method(crate::model::APPUI_METHOD_MONITOR_LIST) {
+            commands.push(AppUiCommand::ListMonitors(
+                crate::model::MonitorListParams {
+                    session_id: Some(session_id.clone()),
                     profile_id: profile_id.clone(),
                 },
             ));
@@ -13453,6 +13468,13 @@ impl Store {
                     &event.monitor_state.monitor_id,
                     Some(&event.monitor_state.name),
                 );
+                // Keep the mirror live, the same discipline `loop/updated`
+                // applies: the record carries the server-side status, so an
+                // auto-pause on the flood cap lands in the mirror as `paused`
+                // rather than leaving it claiming `active` forever. A
+                // deleted-status record is removed by the upsert helper.
+                self.state
+                    .upsert_session_monitor(&event.session_id, event.monitor_state.clone());
                 self.state.push_activity(
                     ActivityItem::new(ActivityKind::Progress, title, status)
                         .with_detail("monitor")
@@ -13496,6 +13518,10 @@ impl Store {
                         .as_ref()
                         .map(|monitor| monitor.name.as_str()),
                 );
+                // The monitor is gone: without this the mirror keeps a ghost
+                // entry claiming an active monitor that no longer exists.
+                self.state
+                    .remove_session_monitor(&event.session_id, &event.monitor_id);
                 self.state.push_activity(
                     ActivityItem::new(ActivityKind::Progress, title, status)
                         .with_detail("monitor")
@@ -47873,6 +47899,121 @@ workspace_root: None,
                 .expect("mirror")
                 .monitors
                 .is_empty()
+        );
+    }
+
+    /// The lifecycle notification must keep the mirror live: an auto-pause on
+    /// the per-hour flood cap arrives as `monitor/updated` with the full
+    /// paused record, and the mirror has to reflect `paused` — not keep
+    /// claiming `active` forever.
+    #[test]
+    fn monitor_updated_upserts_into_the_mirror() {
+        let mut store = store_with_empty_session();
+        let sid = store.state.sessions[0].id.0.clone();
+        let monitor = serde_json::json!({
+            "monitor_id": "m1", "session_id": sid, "name": "logs", "argv": ["tail"],
+            "mode": "stream", "batch_ms": 100, "max_events_per_hour": 10, "persistent": false,
+            "status": "paused", "pause_reason": "max_events_per_hour exceeded",
+            "fires_used": 60, "created_at_ms": 0, "updated_at_ms": 0
+        });
+        let notification = UiNotification::from_method_and_params(
+            "monitor/updated",
+            serde_json::json!({"session_id": sid, "monitor": monitor}),
+        )
+        .expect("monitor/updated decodes");
+        store.apply_event(AppUiEvent::Protocol(notification));
+        let session_key = SessionKey(sid);
+        let mirror = store
+            .state
+            .session_autonomy_for(&session_key)
+            .expect("mirror");
+        assert_eq!(mirror.monitors.len(), 1);
+        assert_eq!(mirror.monitors[0].status, "paused");
+        assert_eq!(
+            mirror.monitors[0].pause_reason.as_deref(),
+            Some("max_events_per_hour exceeded")
+        );
+    }
+
+    /// An expired monitor no longer exists: without removal the mirror keeps
+    /// a ghost entry claiming an active monitor.
+    #[test]
+    fn monitor_expired_removes_the_mirror_entry() {
+        let mut store = store_with_empty_session();
+        let sid = store.state.sessions[0].id.0.clone();
+        let session_key = SessionKey(sid.clone());
+        store
+            .state
+            .upsert_session_monitor(&session_key, monitor_record("m1", &session_key));
+        let notification = UiNotification::from_method_and_params(
+            "monitor/expired",
+            serde_json::json!({"session_id": sid, "monitor_id": "m1",
+                               "reason": "stream process exited"}),
+        )
+        .expect("monitor/expired decodes");
+        store.apply_event(AppUiEvent::Protocol(notification));
+        assert!(
+            store
+                .state
+                .session_autonomy_for(&session_key)
+                .expect("mirror")
+                .monitors
+                .is_empty()
+        );
+    }
+
+    /// Session-open/reconnect hydration must refresh the monitor mirror the
+    /// same way it refreshes agents/goals/loops — otherwise the mirror is only
+    /// ever populated by a user-typed `/monitor list` or a create echo.
+    #[test]
+    fn autonomy_hydration_enqueues_monitor_list_when_supported() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [
+                crate::model::APPUI_METHOD_AGENT_LIST,
+                crate::model::APPUI_METHOD_MONITOR_LIST,
+            ],
+            [
+                crate::model::APPUI_FEATURE_CODING_AUTONOMY_V1,
+                crate::model::APPUI_FEATURE_CODING_MONITOR_RUNTIME_V1,
+            ],
+        ));
+        let commands = store.hydrate_autonomy_state_commands(&SessionKey("local:test".into()));
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            AppUiCommand::ListMonitors(crate::model::MonitorListParams {
+                session_id: Some(_),
+                ..
+            })
+        )));
+    }
+
+    /// A SCOPED list query is authoritative for its one session, so its
+    /// transcript report must be attributed to that session — an unattributed
+    /// block pins under every unrelated session's transcript too.
+    #[test]
+    fn scoped_monitor_list_report_is_session_attributed() {
+        use crate::client_event::{AutonomyClientEvent, AutonomyResult, ClientEvent};
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        store.state.pending_monitor_list_menu = true;
+        store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
+            result: AutonomyResult::MonitorList(crate::model::MonitorListResult {
+                session_id: Some(session_id.clone()),
+                profile_id: None,
+                monitors: vec![monitor_record("mon_a", &session_id)],
+            }),
+        }));
+        let report = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.kind == ActivityKind::Report)
+            .expect("a monitor list report");
+        assert_eq!(
+            report.session_id.as_ref(),
+            Some(&session_id),
+            "scoped report must be attributed to its session: {report:?}"
         );
     }
 
